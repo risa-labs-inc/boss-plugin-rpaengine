@@ -12,7 +12,7 @@ import ai.rever.boss.plugin.api.PluginContext
 class RpaengineDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.rpaengine"
     override val displayName: String = "RPA Engine (Dynamic)"
-    override val version: String = "1.0.2"
+    override val version: String = "1.0.3"
     override val description: String = "Execute recorded RPA workflows"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-rpaengine"
