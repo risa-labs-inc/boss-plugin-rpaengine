@@ -8,7 +8,12 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.4"
+version = "1.0.5"
+
+// Local BossConsole path for development builds
+val bossConsolePath = "${System.getProperty("user.home")}/Development/BossConsole"
+val useLocalBuild = file(bossConsolePath).exists() &&
+    file("$bossConsolePath/plugins/plugin-api/build/libs/plugin-api-desktop-1.0.9.jar").exists()
 
 java {
     toolchain {
@@ -23,16 +28,35 @@ kotlin {
 }
 
 repositories {
+    if (useLocalBuild) {
+        flatDir {
+            dirs(
+                "$bossConsolePath/plugins/plugin-api/build/libs",
+                "$bossConsolePath/plugins/plugin-api-browser/build/libs",
+                "$bossConsolePath/plugins/plugin-ui-core/build/libs",
+                "$bossConsolePath/plugins/plugin-scrollbar/build/libs",
+                "$bossConsolePath/plugins/plugin-bookmark-types/build/libs"
+            )
+        }
+    }
     google()
     mavenCentral()
     maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
 }
 
 dependencies {
-    // Plugin API from Maven Central
-    implementation("com.risaboss:plugin-api-desktop:1.0.5")
-    implementation("com.risaboss:plugin-ui-core-desktop:1.0.4")
-    implementation("com.risaboss:plugin-scrollbar-desktop:1.0.4")
+    // Plugin API - use local build if available, otherwise Maven Central
+    if (useLocalBuild) {
+        implementation(files("$bossConsolePath/plugins/plugin-api/build/libs/plugin-api-desktop-1.0.9.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-api-browser/build/libs/plugin-api-browser-desktop-1.0.4.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-ui-core/build/libs/plugin-ui-core-desktop-1.0.4.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-scrollbar/build/libs/plugin-scrollbar-desktop-1.0.4.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-bookmark-types/build/libs/plugin-bookmark-types-desktop-1.0.4.jar"))
+    } else {
+        implementation("com.risaboss:plugin-api-desktop:1.0.5")
+        implementation("com.risaboss:plugin-ui-core-desktop:1.0.4")
+        implementation("com.risaboss:plugin-scrollbar-desktop:1.0.4")
+    }
 
     // Compose dependencies
     implementation(compose.desktop.currentOs)

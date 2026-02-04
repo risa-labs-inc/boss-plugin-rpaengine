@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.rpaengine
 
+import ai.rever.boss.plugin.api.ActiveTabsProvider
+import ai.rever.boss.plugin.api.BrowserIntegration
 import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.browser.BrowserService
@@ -27,7 +29,8 @@ import kotlin.time.Clock
 class RpaengineComponent(
     ctx: ComponentContext,
     override val panelInfo: PanelInfo,
-    private val browserService: BrowserService? = null
+    private val browserService: BrowserService? = null,
+    private val activeTabsProvider: ActiveTabsProvider? = null
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -68,8 +71,15 @@ class RpaengineComponent(
     private val _executionSummary = MutableStateFlow<ExecutionSummary?>(null)
     val executionSummary: StateFlow<ExecutionSummary?> = _executionSummary.asStateFlow()
 
+    // Browser tab and integration for real execution
+    private var currentTabId: String? = null
+    private var browserIntegration: BrowserIntegration? = null
+
     // Browser service availability
     val hasBrowserService: Boolean get() = browserService != null
+
+    // Active tabs provider availability
+    val hasActiveTabsProvider: Boolean get() = activeTabsProvider != null
 
     init {
         lifecycle.doOnDestroy {
@@ -163,9 +173,12 @@ class RpaengineComponent(
             // Resume from paused state
             _executionStatus.value = ExecutionStatus.EXECUTING
             addLog(LogLevel.INFO, "Resuming execution from action ${_currentActionIndex.value + 1}")
+            executionJob = scope.launch {
+                executeActions()
+            }
         } else {
-            // Start fresh
-            _executionStatus.value = ExecutionStatus.EXECUTING
+            // Start fresh - create a browser tab first
+            _executionStatus.value = ExecutionStatus.LOADING
             _currentActionIndex.value = 0
             _executionResults.value = emptyList()
             _executionSummary.value = ExecutionSummary(
@@ -176,11 +189,43 @@ class RpaengineComponent(
                 totalDuration = 0,
                 startTime = Clock.System.now().toEpochMilliseconds()
             )
-            addLog(LogLevel.INFO, "Starting execution of ${config.name} (${config.actions.size} actions)")
-        }
 
-        executionJob = scope.launch {
-            executeActions()
+            executionJob = scope.launch {
+                // Create a browser tab for execution
+                val provider = activeTabsProvider
+                if (provider != null) {
+                    val firstNavUrl = config.actions.firstOrNull { it.type == ActionTypes.NAVIGATE }?.value ?: "about:blank"
+                    val tabTitle = "RPA: ${config.name}"
+
+                    addLog(LogLevel.INFO, "Creating browser tab for RPA execution...")
+
+                    val tabId = provider.createBrowserTab(firstNavUrl, tabTitle)
+                    if (tabId != null) {
+                        currentTabId = tabId
+                        addLog(LogLevel.SUCCESS, "Browser tab created: $tabTitle")
+
+                        // Wait for the tab to initialize
+                        delay(1000)
+
+                        // Get browser integration for the tab
+                        val integration = provider.getBrowserIntegration(tabId)
+                        if (integration != null && integration.isBrowserAvailable()) {
+                            browserIntegration = integration
+                            addLog(LogLevel.SUCCESS, "Browser connection established")
+                        } else {
+                            addLog(LogLevel.WARNING, "Could not connect to browser - running in simulation mode")
+                        }
+                    } else {
+                        addLog(LogLevel.WARNING, "Could not create browser tab - running in simulation mode")
+                    }
+                } else {
+                    addLog(LogLevel.WARNING, "No ActiveTabsProvider available - running in simulation mode")
+                }
+
+                _executionStatus.value = ExecutionStatus.EXECUTING
+                addLog(LogLevel.INFO, "Starting execution of ${config.name} (${config.actions.size} actions)")
+                executeActions()
+            }
         }
     }
 
@@ -311,9 +356,127 @@ class RpaengineComponent(
     }
 
     /**
-     * Execute a single action (simulation mode)
+     * Execute a single action
      */
     private suspend fun executeAction(action: RpaActionConfig, index: Int): Pair<Boolean, String?> {
+        val browser = browserIntegration
+
+        // If we have browser integration, execute real actions
+        if (browser != null && browser.isBrowserAvailable()) {
+            return executeRealAction(browser, action)
+        }
+
+        // Otherwise, fall back to simulation mode
+        return executeSimulatedAction(action)
+    }
+
+    /**
+     * Execute a real action in the browser
+     */
+    private suspend fun executeRealAction(browser: BrowserIntegration, action: RpaActionConfig): Pair<Boolean, String?> {
+        return try {
+            when (action.type) {
+                ActionTypes.NAVIGATE -> {
+                    val url = action.value ?: return Pair(false, "No URL specified")
+                    // Navigate by setting window.location
+                    browser.executeJavaScript("window.location.href = '$url';")
+                    delay(1000) // Wait for navigation
+                    Pair(true, null)
+                }
+                ActionTypes.CLICK -> {
+                    val selector = action.selector
+                    val script = when (selector.type) {
+                        SelectorTypes.ID -> "document.getElementById('${selector.value}')?.click();"
+                        SelectorTypes.CSS -> "document.querySelector('${selector.value}')?.click();"
+                        SelectorTypes.XPATH -> """
+                            var element = document.evaluate('${selector.value}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                            if (element) element.click();
+                        """.trimIndent()
+                        else -> "// No selector specified"
+                    }
+                    browser.executeJavaScript(script)
+                    delay(300)
+                    Pair(true, null)
+                }
+                ActionTypes.INPUT -> {
+                    val selector = action.selector
+                    val value = action.value?.replace("'", "\\'") ?: ""
+                    val script = when (selector.type) {
+                        SelectorTypes.ID -> """
+                            var el = document.getElementById('${selector.value}');
+                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('input', { bubbles: true })); }
+                        """.trimIndent()
+                        SelectorTypes.CSS -> """
+                            var el = document.querySelector('${selector.value}');
+                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('input', { bubbles: true })); }
+                        """.trimIndent()
+                        else -> "// No selector specified"
+                    }
+                    browser.executeJavaScript(script)
+                    delay(200)
+                    Pair(true, null)
+                }
+                ActionTypes.SELECT -> {
+                    val selector = action.selector
+                    val value = action.value?.replace("'", "\\'") ?: ""
+                    val script = when (selector.type) {
+                        SelectorTypes.ID -> """
+                            var el = document.getElementById('${selector.value}');
+                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('change', { bubbles: true })); }
+                        """.trimIndent()
+                        SelectorTypes.CSS -> """
+                            var el = document.querySelector('${selector.value}');
+                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('change', { bubbles: true })); }
+                        """.trimIndent()
+                        else -> "// No selector specified"
+                    }
+                    browser.executeJavaScript(script)
+                    delay(200)
+                    Pair(true, null)
+                }
+                ActionTypes.WAIT -> {
+                    val waitTime = action.value?.toLongOrNull() ?: 1000L
+                    delay(waitTime)
+                    Pair(true, null)
+                }
+                ActionTypes.SCROLL -> {
+                    val coords = action.value?.split(",")?.map { it.trim().toIntOrNull() ?: 0 }
+                    val x = coords?.getOrNull(0) ?: 0
+                    val y = coords?.getOrNull(1) ?: 0
+                    browser.executeJavaScript("window.scrollTo($x, $y);")
+                    delay(200)
+                    Pair(true, null)
+                }
+                ActionTypes.ASSERT -> {
+                    // Simple assertion - check if element exists
+                    val selector = action.selector
+                    val script = when (selector.type) {
+                        SelectorTypes.ID -> "!!document.getElementById('${selector.value}')"
+                        SelectorTypes.CSS -> "!!document.querySelector('${selector.value}')"
+                        else -> "true"
+                    }
+                    val result = browser.executeJavaScript(script)
+                    if (result == true || result == "true") {
+                        Pair(true, null)
+                    } else {
+                        Pair(false, "Assertion failed: element not found")
+                    }
+                }
+                else -> {
+                    // Unknown action type, simulate it
+                    delay(500)
+                    Pair(true, null)
+                }
+            }
+        } catch (e: Exception) {
+            Pair(false, "Error executing action: ${e.message}")
+        }
+    }
+
+    /**
+     * Execute a simulated action (fallback when no browser)
+     */
+    private suspend fun executeSimulatedAction(action: RpaActionConfig): Pair<Boolean, String?> {
         // Simulate action execution with delays based on action type
         val executionTime = when (action.type) {
             ActionTypes.CLICK -> (200..500).random().toLong()

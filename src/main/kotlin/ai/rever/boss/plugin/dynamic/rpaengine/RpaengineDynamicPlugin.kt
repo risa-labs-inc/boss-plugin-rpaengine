@@ -12,20 +12,22 @@ import ai.rever.boss.plugin.api.PluginContext
 class RpaengineDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.rpaengine"
     override val displayName: String = "RPA Engine (Dynamic)"
-    override val version: String = "1.0.4"
+    override val version: String = "1.0.5"
     override val description: String = "Execute recorded RPA workflows"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-rpaengine"
 
     override fun register(context: PluginContext) {
-        // Get BrowserService if available (for future real execution)
+        // Get services from context
         val browserService = context.browserService
+        val activeTabsProvider = context.activeTabsProvider
 
         context.panelRegistry.registerPanel(RpaengineInfo) { ctx, panelInfo ->
             RpaengineComponent(
                 ctx = ctx,
                 panelInfo = panelInfo,
-                browserService = browserService
+                browserService = browserService,
+                activeTabsProvider = activeTabsProvider
             )
         }
     }

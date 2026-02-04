@@ -163,3 +163,14 @@ object SpeedPresets {
         else -> "Very Fast"
     }
 }
+
+/**
+ * Selector types
+ */
+object SelectorTypes {
+    const val ID = "id"
+    const val CSS = "css"
+    const val XPATH = "xpath"
+    const val TEXT = "text"
+    const val NONE = "none"
+}
