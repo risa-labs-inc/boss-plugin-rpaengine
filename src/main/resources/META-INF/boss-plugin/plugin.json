@@ -3,7 +3,7 @@
   "pluginId": "ai.rever.boss.plugin.dynamic.rpaengine",
   "displayName": "RPA Engine (Dynamic)",
   "version": "1.0.4",
-  "apiVersion": "1.0.5",
+  "apiVersion": "1.0.9",
   "minBossVersion": "8.16.22",
   "mainClass": "ai.rever.boss.plugin.dynamic.rpaengine.RpaengineDynamicPlugin",
   "type": "panel",
