@@ -53,7 +53,7 @@ dependencies {
         implementation(files("$bossConsolePath/plugins/plugin-scrollbar/build/libs/plugin-scrollbar-desktop-1.0.4.jar"))
         implementation(files("$bossConsolePath/plugins/plugin-bookmark-types/build/libs/plugin-bookmark-types-desktop-1.0.4.jar"))
     } else {
-        implementation("com.risaboss:plugin-api-desktop:1.0.9")
+        implementation("com.risaboss:plugin-api-desktop:1.0.10")
         implementation("com.risaboss:plugin-api-browser-desktop:1.0.4")
         implementation("com.risaboss:plugin-ui-core-desktop:1.0.4")
         implementation("com.risaboss:plugin-scrollbar-desktop:1.0.4")
