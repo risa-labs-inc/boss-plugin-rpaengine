@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.9"
+version = "1.0.10"
 
 // Auto-detect CI environment
 val useLocalDependencies = System.getenv("CI") != "true"
