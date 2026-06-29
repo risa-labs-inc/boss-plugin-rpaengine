@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.rpaengine
 
 import ai.rever.boss.plugin.ui.BossTheme
+import ai.rever.boss.plugin.ui.BossThemeColors
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -143,9 +144,9 @@ private fun HeaderSection(
                     contentDescription = "RPA Engine",
                     modifier = Modifier.size(24.dp),
                     tint = when (executionStatus) {
-                        ExecutionStatus.EXECUTING -> Color(0xFF4CAF50)
+                        ExecutionStatus.EXECUTING -> BossThemeColors.SuccessColor
                         ExecutionStatus.ERROR -> MaterialTheme.colors.error
-                        ExecutionStatus.COMPLETED -> Color(0xFF4CAF50)
+                        ExecutionStatus.COMPLETED -> BossThemeColors.SuccessColor
                         else -> MaterialTheme.colors.primary
                     }
                 )
@@ -160,9 +161,9 @@ private fun HeaderSection(
                         getStatusText(executionStatus),
                         style = MaterialTheme.typography.caption,
                         color = when (executionStatus) {
-                            ExecutionStatus.EXECUTING -> Color(0xFF4CAF50)
+                            ExecutionStatus.EXECUTING -> BossThemeColors.SuccessColor
                             ExecutionStatus.ERROR -> MaterialTheme.colors.error
-                            ExecutionStatus.COMPLETED -> Color(0xFF4CAF50)
+                            ExecutionStatus.COMPLETED -> BossThemeColors.SuccessColor
                             else -> MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                         }
                     )
@@ -334,8 +335,8 @@ private fun ExecutionControls(
         shape = RoundedCornerShape(6.dp),
         elevation = 1.dp,
         backgroundColor = when (executionStatus) {
-            ExecutionStatus.EXECUTING -> Color(0xFF4CAF50).copy(alpha = 0.1f)
-            ExecutionStatus.PAUSED -> Color(0xFFFF9800).copy(alpha = 0.1f)
+            ExecutionStatus.EXECUTING -> BossThemeColors.SuccessColor.copy(alpha = 0.1f)
+            ExecutionStatus.PAUSED -> BossThemeColors.WarningColor.copy(alpha = 0.1f)
             ExecutionStatus.ERROR -> MaterialTheme.colors.error.copy(alpha = 0.1f)
             else -> MaterialTheme.colors.surface
         }
@@ -353,7 +354,7 @@ private fun ExecutionControls(
                             executionStatus == ExecutionStatus.PAUSED ||
                             executionStatus == ExecutionStatus.ERROR,
                     colors = ButtonDefaults.buttonColors(
-                        backgroundColor = Color(0xFF4CAF50)
+                        backgroundColor = BossThemeColors.SuccessColor
                     ),
                     modifier = Modifier.weight(1f)
                 ) {
@@ -371,7 +372,7 @@ private fun ExecutionControls(
                     onClick = onPause,
                     enabled = executionStatus == ExecutionStatus.EXECUTING,
                     colors = ButtonDefaults.buttonColors(
-                        backgroundColor = Color(0xFFFF9800)
+                        backgroundColor = BossThemeColors.WarningColor
                     ),
                     modifier = Modifier.weight(1f)
                 ) {
@@ -526,7 +527,7 @@ private fun ExecutionSummaryCard(summary: ExecutionSummary) {
                 SummaryItem(
                     label = "Completed",
                     value = summary.completedActions.toString(),
-                    color = Color(0xFF4CAF50)
+                    color = BossThemeColors.SuccessColor
                 )
                 SummaryItem(
                     label = "Failed",
@@ -547,7 +548,7 @@ private fun ExecutionSummaryCard(summary: ExecutionSummary) {
                     (summary.completedActions + summary.failedActions).toFloat() / summary.totalActions
                 else 0f,
                 modifier = Modifier.fillMaxWidth().height(4.dp),
-                color = if (summary.failedActions > 0) MaterialTheme.colors.error else Color(0xFF4CAF50)
+                color = if (summary.failedActions > 0) MaterialTheme.colors.error else BossThemeColors.SuccessColor
             )
         }
     }
@@ -605,7 +606,7 @@ private fun ActionListCard(
                         Text(
                             "${executionResults.count { it.success }}/${actions.size} completed",
                             style = MaterialTheme.typography.caption,
-                            color = Color(0xFF4CAF50)
+                            color = BossThemeColors.SuccessColor
                         )
                     }
                 }
@@ -640,7 +641,7 @@ private fun ActionItem(
 ) {
     val backgroundColor = when {
         isCurrent -> MaterialTheme.colors.primary.copy(alpha = 0.2f)
-        result?.success == true -> Color(0xFF4CAF50).copy(alpha = 0.1f)
+        result?.success == true -> BossThemeColors.SuccessColor.copy(alpha = 0.1f)
         result?.success == false -> MaterialTheme.colors.error.copy(alpha = 0.1f)
         else -> MaterialTheme.colors.surface
     }
@@ -663,7 +664,7 @@ private fun ActionItem(
                 shape = CircleShape,
                 color = when {
                     isCurrent -> MaterialTheme.colors.primary
-                    result?.success == true -> Color(0xFF4CAF50)
+                    result?.success == true -> BossThemeColors.SuccessColor
                     result?.success == false -> MaterialTheme.colors.error
                     else -> MaterialTheme.colors.onSurface.copy(alpha = 0.1f)
                 }
@@ -844,9 +845,9 @@ private fun LogEntry(log: ExecutionLogEntry) {
             contentDescription = null,
             modifier = Modifier.size(14.dp),
             tint = when (log.level) {
-                LogLevel.SUCCESS -> Color(0xFF4CAF50)
+                LogLevel.SUCCESS -> BossThemeColors.SuccessColor
                 LogLevel.ERROR -> MaterialTheme.colors.error
-                LogLevel.WARNING -> Color(0xFFFF9800)
+                LogLevel.WARNING -> BossThemeColors.WarningColor
                 LogLevel.INFO -> MaterialTheme.colors.primary
                 LogLevel.DEBUG -> MaterialTheme.colors.onSurface.copy(alpha = 0.5f)
             }
