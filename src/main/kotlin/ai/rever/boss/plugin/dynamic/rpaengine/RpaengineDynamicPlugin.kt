@@ -17,6 +17,10 @@ class RpaengineDynamicPlugin : DynamicPlugin {
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-rpaengine"
 
+    // Most recently created panel component, so MCP tools can drive the engine.
+    @Volatile
+    private var lastComponent: RpaengineComponent? = null
+
     override fun register(context: PluginContext) {
         // Get services from context
         val browserService = context.browserService
@@ -28,7 +32,14 @@ class RpaengineDynamicPlugin : DynamicPlugin {
                 panelInfo = panelInfo,
                 browserService = browserService,
                 activeTabsProvider = activeTabsProvider
-            )
+            ).also { lastComponent = it }
         }
+
+        // Contribute rpa_status/run/stop MCP tools; auto-removed on disable/unload.
+        context.registerMcpToolProvider(RpaengineMcpToolProvider(pluginId) { lastComponent })
+    }
+
+    override fun dispose() {
+        lastComponent = null
     }
 }
