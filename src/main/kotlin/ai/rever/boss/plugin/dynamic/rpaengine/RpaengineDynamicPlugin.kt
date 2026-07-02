@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.rpaengine
 
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
+import com.arkivanov.essenty.lifecycle.doOnDestroy
 
 /**
  * RPA Engine dynamic plugin - Loaded from external JAR.
@@ -32,7 +33,13 @@ class RpaengineDynamicPlugin : DynamicPlugin {
                 panelInfo = panelInfo,
                 browserService = browserService,
                 activeTabsProvider = activeTabsProvider
-            ).also { lastComponent = it }
+            ).also { comp ->
+                lastComponent = comp
+                // Clear on panel close: the component's scope is cancelled on
+                // destroy, so MCP tools driving it would silently no-op while
+                // reporting success. Better to answer "open the panel first".
+                ctx.lifecycle.doOnDestroy { if (lastComponent === comp) lastComponent = null }
+            }
         }
 
         // Contribute rpa_status/run/stop MCP tools; auto-removed on disable/unload.
