@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.rpaengine
 
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
+import com.arkivanov.essenty.lifecycle.doOnDestroy
 
 /**
  * RPA Engine dynamic plugin - Loaded from external JAR.
@@ -17,6 +18,10 @@ class RpaengineDynamicPlugin : DynamicPlugin {
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-rpaengine"
 
+    // Most recently created panel component, so MCP tools can drive the engine.
+    @Volatile
+    private var lastComponent: RpaengineComponent? = null
+
     override fun register(context: PluginContext) {
         // Get services from context
         val browserService = context.browserService
@@ -28,7 +33,20 @@ class RpaengineDynamicPlugin : DynamicPlugin {
                 panelInfo = panelInfo,
                 browserService = browserService,
                 activeTabsProvider = activeTabsProvider
-            )
+            ).also { comp ->
+                lastComponent = comp
+                // Clear on panel close: the component's scope is cancelled on
+                // destroy, so MCP tools driving it would silently no-op while
+                // reporting success. Better to answer "open the panel first".
+                ctx.lifecycle.doOnDestroy { if (lastComponent === comp) lastComponent = null }
+            }
         }
+
+        // Contribute rpa_status/run/stop MCP tools; auto-removed on disable/unload.
+        context.registerMcpToolProvider(RpaengineMcpToolProvider(pluginId) { lastComponent })
+    }
+
+    override fun dispose() {
+        lastComponent = null
     }
 }
