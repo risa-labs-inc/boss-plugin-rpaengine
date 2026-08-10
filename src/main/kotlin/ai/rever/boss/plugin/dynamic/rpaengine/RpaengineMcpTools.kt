@@ -29,13 +29,66 @@ internal class RpaengineMcpToolProvider(
             },
         ),
         McpToolDefinition(
+            name = "rpa_results",
+            description =
+                "Per-action outcome of the last RPA run (index, name, ok/fail, error, duration) " +
+                    "followed by the most recent log lines. Use after rpa_status reports ERROR.",
+            handler = McpToolHandler {
+                val c = component() ?: return@McpToolHandler notOpen()
+                val results = c.executionResults.value
+                val logs = c.executionLogs.value.takeLast(LOG_TAIL)
+                if (results.isEmpty() && logs.isEmpty()) {
+                    return@McpToolHandler McpToolResult("No run has produced results yet.")
+                }
+                val body = buildString {
+                    results.forEach { r ->
+                        append("#${r.actionIndex} ${r.actionName} ")
+                        append(if (r.success) "ok" else "FAILED")
+                        r.error?.let { append(" - ").append(it) }
+                        append(" (${r.duration}ms)\n")
+                    }
+                    if (logs.isNotEmpty()) {
+                        append("--- last ${logs.size} log line(s) ---\n")
+                        logs.forEach { append("[${it.level.name}] ${it.message}\n") }
+                    }
+                }
+                McpToolResult(body.trimEnd())
+            },
+        ),
+        McpToolDefinition(
+            name = "rpa_load",
+            description =
+                "Load a saved RPA configuration by name (substring matches) so rpa_run can " +
+                    "execute it. Lists the available names when there is no match.",
+            inputSchema = NAME_SCHEMA,
+            readOnly = false,
+            handler = McpToolHandler { args ->
+                val c = component() ?: return@McpToolHandler notOpen()
+                val name = args.string("name")?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
+                if (c.selectConfigurationByName(name)) {
+                    McpToolResult("Loaded '${c.loadedConfigurationName()}'. Call rpa_run to execute it.")
+                } else {
+                    val available = c.availableConfigs.value.joinToString(", ") { it.name }
+                    McpToolResult(
+                        "No configuration matched '$name'. Available: ${available.ifEmpty { "none" }}",
+                        isError = true,
+                    )
+                }
+            },
+        ),
+        McpToolDefinition(
             name = "rpa_run",
             description = "Start (or resume) execution of the currently-loaded RPA workflow.",
             readOnly = false,
             handler = McpToolHandler {
                 val c = component() ?: return@McpToolHandler notOpen()
+                val loaded = c.loadedConfigurationName()
+                    ?: return@McpToolHandler McpToolResult(
+                        "No configuration is loaded - call rpa_load first.",
+                    )
                 c.startExecution()
-                McpToolResult("Started RPA execution (status now ${c.executionStatus.value.name}).")
+                McpToolResult("Running '$loaded' (status now ${c.executionStatus.value.name}).")
             },
         ),
         McpToolDefinition(
@@ -52,4 +105,12 @@ internal class RpaengineMcpToolProvider(
 
     private fun notOpen(): McpToolResult =
         McpToolResult("Open the RPA Engine panel first (no active instance).", isError = true)
+
+    private companion object {
+        /** Enough log tail to explain a failure without dumping a whole session. */
+        const val LOG_TAIL = 15
+
+        const val NAME_SCHEMA =
+            """{"type":"object","properties":{"name":{"type":"string","description":"Configuration name, or any part of it."}},"required":["name"]}"""
+    }
 }

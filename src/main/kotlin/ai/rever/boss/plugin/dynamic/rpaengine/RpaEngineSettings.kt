@@ -37,7 +37,7 @@ class RpaEngineSettingsManager {
         }
 
     private val settingsFile: File
-        get() = File(configDir, "settings.json")
+        get() = File(configDir, SETTINGS_FILE_NAME)
 
     // Also check the RPA Recorder's saved configurations
     private val rpaRecorderConfigDir: File
@@ -102,53 +102,47 @@ class RpaEngineSettingsManager {
     }
 
     /**
-     * Find all available RPA configuration files
+     * Find all available RPA configuration files.
+     *
+     * Sources, newest first: the engine's own config directory, the RPA Recorder's saved
+     * configurations, and `rpa`-named JSON in Downloads.
+     *
+     * The engine's own directory used to be excluded, which is why a plan written there - what
+     * LLM RPA's handoff produces - was invisible here and a run silently did nothing.
      */
     fun findAvailableConfigurations(): List<ConfigFileInfo> {
         val configs = mutableListOf<ConfigFileInfo>()
 
-        // Check RPA Recorder saved configurations
-        if (rpaRecorderConfigDir.exists() && rpaRecorderConfigDir.isDirectory) {
-            rpaRecorderConfigDir.listFiles { file -> file.extension == "json" }?.forEach { file ->
-                try {
-                    val config = loadConfigurationFile(file)
-                    if (config != null) {
-                        configs.add(ConfigFileInfo(
-                            name = config.name,
-                            path = file.absolutePath,
-                            lastModified = file.lastModified(),
-                            actionCount = config.actions.size
-                        ))
-                    }
-                } catch (e: Exception) {
-                    // Skip invalid files
-                }
-            }
-        }
-
-        // Check Downloads folder for RPA configs
-        if (downloadsDir.exists() && downloadsDir.isDirectory) {
-            downloadsDir.listFiles { file ->
-                file.extension == "json" && (file.name.startsWith("rpa_") || file.name.contains("rpa"))
-            }?.forEach { file ->
-                try {
-                    val config = loadConfigurationFile(file)
-                    if (config != null && !configs.any { it.path == file.absolutePath }) {
-                        configs.add(ConfigFileInfo(
-                            name = config.name,
-                            path = file.absolutePath,
-                            lastModified = file.lastModified(),
-                            actionCount = config.actions.size
-                        ))
-                    }
-                } catch (e: Exception) {
-                    // Skip invalid files
-                }
-            }
-        }
+        collectFrom(configDir, configs) { it.extension == "json" && it.name != SETTINGS_FILE_NAME }
+        collectFrom(rpaRecorderConfigDir, configs) { it.extension == "json" }
+        collectFrom(downloadsDir, configs) { it.extension == "json" && it.name.contains("rpa") }
 
         // Sort by last modified (newest first)
         return configs.sortedByDescending { it.lastModified }
+    }
+
+    /**
+     * Add every file in [dir] matching [accept] that parses as a configuration to [into],
+     * skipping paths already collected from an earlier source.
+     */
+    private fun collectFrom(
+        dir: File,
+        into: MutableList<ConfigFileInfo>,
+        accept: (File) -> Boolean,
+    ) {
+        if (!dir.exists() || !dir.isDirectory) return
+        dir.listFiles { file -> accept(file) }?.forEach { file ->
+            if (into.any { it.path == file.absolutePath }) return@forEach
+            val config = runCatching { loadConfigurationFile(file) }.getOrNull() ?: return@forEach
+            into.add(
+                ConfigFileInfo(
+                    name = config.name,
+                    path = file.absolutePath,
+                    lastModified = file.lastModified(),
+                    actionCount = config.actions.size
+                )
+            )
+        }
     }
 
     /**
@@ -233,5 +227,10 @@ class RpaEngineSettingsManager {
                 java.text.SimpleDateFormat("MMM d, yyyy").format(date)
             }
         }
+    }
+
+    private companion object {
+        /** The engine's own settings live beside the configurations; it is not one of them. */
+        const val SETTINGS_FILE_NAME = "settings.json"
     }
 }

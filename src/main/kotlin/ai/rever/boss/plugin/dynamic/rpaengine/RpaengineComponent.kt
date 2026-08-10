@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.time.Clock
 
 /**
@@ -107,21 +108,36 @@ class RpaengineComponent(
      * Load available RPA configurations from the file system
      */
     fun loadAvailableConfigurations() {
-        scope.launch {
-            _availableConfigs.value = settingsManager.findAvailableConfigurations()
-            addLog(LogLevel.INFO, "Found ${_availableConfigs.value.size} configuration(s)")
-        }
+        scope.launch { refreshConfigurations() }
+    }
+
+    /**
+     * Refresh the available configurations and return them.
+     *
+     * The fire-and-forget [loadAvailableConfigurations] is what the UI wants, but a non-UI
+     * caller (the MCP tools) has to *await* the scan before it can match a name against it.
+     */
+    suspend fun refreshConfigurations(): List<ConfigFileInfo> {
+        val found = withContext(Dispatchers.IO) { settingsManager.findAvailableConfigurations() }
+        _availableConfigs.value = found
+        addLog(LogLevel.INFO, "Found ${found.size} configuration(s)")
+        return found
     }
 
     /**
      * Load a specific configuration
      */
     fun loadConfiguration(configInfo: ConfigFileInfo) {
-        scope.launch {
+        scope.launch { loadConfigurationNow(configInfo) }
+    }
+
+    /** Load [configInfo] and report whether it parsed, for a caller that must await the result. */
+    suspend fun loadConfigurationNow(configInfo: ConfigFileInfo): Boolean {
+        run {
             _executionStatus.value = ExecutionStatus.LOADING
             addLog(LogLevel.INFO, "Loading configuration: ${configInfo.name}")
 
-            val config = settingsManager.loadConfiguration(configInfo.path)
+            val config = withContext(Dispatchers.IO) { settingsManager.loadConfiguration(configInfo.path) }
 
             if (config != null) {
                 _selectedConfig.value = config
@@ -130,12 +146,13 @@ class RpaengineComponent(
                 _executionSummary.value = null
                 _executionStatus.value = ExecutionStatus.IDLE
 
-                settingsManager.addToRecent(configInfo.path)
+                withContext(Dispatchers.IO) { settingsManager.addToRecent(configInfo.path) }
                 addLog(LogLevel.SUCCESS, "Loaded ${config.actions.size} actions from ${config.name}")
             } else {
                 _executionStatus.value = ExecutionStatus.ERROR
                 addLog(LogLevel.ERROR, "Failed to load configuration: ${configInfo.name}")
             }
+            return config != null
         }
     }
 
@@ -166,8 +183,30 @@ class RpaengineComponent(
     /**
      * Start or resume execution
      */
+    /**
+     * Load [name] from the available configurations, or return false when there is no such one.
+     *
+     * Exists so a run can be started without a click. Everything else on this path was
+     * reachable - a plan can be generated and written, the engine lists it - and then
+     * [startExecution] returned silently because nothing had selected it.
+     */
+    suspend fun selectConfigurationByName(name: String): Boolean {
+        val match = refreshConfigurations().matchByName(name) ?: return false
+        return loadConfigurationNow(match)
+    }
+
+    /** The loaded configuration's name, so a caller can tell what a run would execute. */
+    fun loadedConfigurationName(): String? = _selectedConfig.value?.name
+
     fun startExecution() {
-        val config = _selectedConfig.value ?: return
+        val config =
+            _selectedConfig.value ?: run {
+                // Was a bare `?: return`, so `rpa_run` reported "Started" while nothing happened
+                // and the status stayed IDLE - the same silent-success shape as the unknown-verb
+                // branch this change also fixed.
+                addLog(LogLevel.ERROR, "No configuration is loaded - select one before running")
+                return
+            }
 
         if (_executionStatus.value == ExecutionStatus.PAUSED) {
             // Resume from paused state
@@ -378,64 +417,77 @@ class RpaengineComponent(
             when (action.type) {
                 ActionTypes.NAVIGATE -> {
                     val url = action.value ?: return Pair(false, "No URL specified")
-                    // Navigate by setting window.location
-                    browser.executeJavaScript("window.location.href = '$url';")
-                    delay(1000) // Wait for navigation
+                    browser.executeJavaScript("window.location.href = ${url.asJsString()};")
+                    delay(NAVIGATE_SETTLE_MS)
                     Pair(true, null)
                 }
                 ActionTypes.CLICK -> {
-                    val selector = action.selector
-                    val script = when (selector.type) {
-                        SelectorTypes.ID -> "document.getElementById('${selector.value}')?.click();"
-                        SelectorTypes.CSS -> "document.querySelector('${selector.value}')?.click();"
-                        SelectorTypes.XPATH -> """
-                            var element = document.evaluate('${selector.value}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                            if (element) element.click();
-                        """.trimIndent()
-                        else -> "// No selector specified"
-                    }
-                    browser.executeJavaScript(script)
-                    delay(300)
-                    Pair(true, null)
+                    val found = browser.elementScript(action.selector, "el.click();")
+                        ?: return Pair(false, unsupportedSelector(action.selector))
+                    delay(ACTION_SETTLE_MS)
+                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
                 }
                 ActionTypes.INPUT -> {
-                    val selector = action.selector
-                    val value = action.value?.replace("'", "\\'") ?: ""
-                    val script = when (selector.type) {
-                        SelectorTypes.ID -> """
-                            var el = document.getElementById('${selector.value}');
-                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('input', { bubbles: true })); }
-                        """.trimIndent()
-                        SelectorTypes.CSS -> """
-                            var el = document.querySelector('${selector.value}');
-                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('input', { bubbles: true })); }
-                        """.trimIndent()
-                        else -> "// No selector specified"
-                    }
-                    browser.executeJavaScript(script)
-                    delay(200)
-                    Pair(true, null)
+                    val value = action.value ?: ""
+                    val found =
+                        browser.elementScript(
+                            action.selector,
+                            "el.focus(); el.value = ${value.asJsString()}; " +
+                                "el.dispatchEvent(new Event('input', { bubbles: true })); " +
+                                "el.dispatchEvent(new Event('change', { bubbles: true }));",
+                        ) ?: return Pair(false, unsupportedSelector(action.selector))
+                    delay(INPUT_SETTLE_MS)
+                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
                 }
                 ActionTypes.SELECT -> {
-                    val selector = action.selector
-                    val value = action.value?.replace("'", "\\'") ?: ""
-                    val script = when (selector.type) {
-                        SelectorTypes.ID -> """
-                            var el = document.getElementById('${selector.value}');
-                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('change', { bubbles: true })); }
-                        """.trimIndent()
-                        SelectorTypes.CSS -> """
-                            var el = document.querySelector('${selector.value}');
-                            if (el) { el.value = '$value'; el.dispatchEvent(new Event('change', { bubbles: true })); }
-                        """.trimIndent()
-                        else -> "// No selector specified"
-                    }
+                    val value = action.value ?: ""
+                    val found =
+                        browser.elementScript(
+                            action.selector,
+                            "el.value = ${value.asJsString()}; " +
+                                "el.dispatchEvent(new Event('change', { bubbles: true }));",
+                        ) ?: return Pair(false, unsupportedSelector(action.selector))
+                    delay(INPUT_SETTLE_MS)
+                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                }
+                // Enter in a search field is how most of the web is driven, so this is not an
+                // exotic verb - its absence is why a generated "search for X" plan stopped at
+                // typing. `value` names the key, defaulting to Enter.
+                ActionTypes.KEYPRESS -> {
+                    val key = action.value?.takeIf { it.isNotBlank() } ?: "Enter"
+                    val dispatch = keyPressScript(key)
+                    val found =
+                        if (action.selector.type == SelectorTypes.NONE || action.selector.value.isNullOrBlank()) {
+                            browser.executeJavaScript(
+                                "var el = document.activeElement || document.body; $dispatch true;",
+                            )
+                            true
+                        } else {
+                            browser.elementScript(action.selector, "el.focus(); $dispatch")
+                                ?: return Pair(false, unsupportedSelector(action.selector))
+                        }
+                    delay(ACTION_SETTLE_MS)
+                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                }
+                ActionTypes.SUBMIT -> {
+                    // requestSubmit fires validation and submit handlers the way a real click
+                    // does; submit() skips both, so it is only the fallback.
+                    val script =
+                        "var f = el.form || el; " +
+                            "if (f.requestSubmit) { f.requestSubmit(); } else { f.submit(); }"
+                    val found = browser.elementScript(action.selector, script)
+                        ?: return Pair(false, unsupportedSelector(action.selector))
+                    delay(NAVIGATE_SETTLE_MS)
+                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                }
+                ActionTypes.RUN_SCRIPT -> {
+                    val script = action.value ?: return Pair(false, "No script specified")
                     browser.executeJavaScript(script)
-                    delay(200)
+                    delay(ACTION_SETTLE_MS)
                     Pair(true, null)
                 }
                 ActionTypes.WAIT -> {
-                    val waitTime = action.value?.toLongOrNull() ?: 1000L
+                    val waitTime = action.value?.toLongOrNull() ?: DEFAULT_WAIT_MS
                     delay(waitTime)
                     Pair(true, null)
                 }
@@ -444,34 +496,106 @@ class RpaengineComponent(
                     val x = coords?.getOrNull(0) ?: 0
                     val y = coords?.getOrNull(1) ?: 0
                     browser.executeJavaScript("window.scrollTo($x, $y);")
-                    delay(200)
+                    delay(ACTION_SETTLE_MS)
                     Pair(true, null)
                 }
                 ActionTypes.ASSERT -> {
-                    // Simple assertion - check if element exists
-                    val selector = action.selector
-                    val script = when (selector.type) {
-                        SelectorTypes.ID -> "!!document.getElementById('${selector.value}')"
-                        SelectorTypes.CSS -> "!!document.querySelector('${selector.value}')"
-                        else -> "true"
-                    }
-                    val result = browser.executeJavaScript(script)
-                    if (result == true || result == "true") {
-                        Pair(true, null)
-                    } else {
-                        Pair(false, "Assertion failed: element not found")
-                    }
+                    val found = browser.elementScript(action.selector, "")
+                        ?: return Pair(false, unsupportedSelector(action.selector))
+                    if (found) Pair(true, null) else Pair(false, "Assertion failed: element not found")
                 }
-                else -> {
-                    // Unknown action type, simulate it
-                    delay(500)
-                    Pair(true, null)
-                }
+                // Declared in ActionTypes but not doable through `executeJavaScript`, which is the
+                // only thing BrowserIntegration offers: a screenshot needs host capture, and
+                // frame switching needs a target this api cannot express. Failing says so; the
+                // previous `else` slept 500ms and reported success, so an unimplemented verb was
+                // indistinguishable from a working one in the log.
+                ActionTypes.SCREENSHOT, ActionTypes.SWITCH_FRAME ->
+                    Pair(false, "'${action.type}' is not supported when driving a real browser")
+                else -> Pair(false, "Unknown action type '${action.type}'")
             }
         } catch (e: Exception) {
             Pair(false, "Error executing action: ${e.message}")
         }
     }
+
+    /**
+     * Run [body] against the first element matching [selector], reporting whether one matched.
+     *
+     * Returns null when the selector kind is one this engine cannot resolve, so the caller can
+     * fail with a message rather than silently doing nothing - which is what the old
+     * `else -> "// No selector specified"` did, while still reporting success.
+     *
+     * Every value crosses into JavaScript through [asJsString]. That is not defensive tidying: a
+     * generated plan's very first selector is typically `input[name='q']`, and interpolating it
+     * raw produced `document.querySelector('input[name='q']')` - a syntax error. XPath is worse,
+     * since `//div[@role='tab']` is full of quotes.
+     */
+    private suspend fun BrowserIntegration.elementScript(
+        selector: SelectorInfo,
+        body: String,
+    ): Boolean? {
+        val value = selector.value
+        val locate =
+            when (selector.type) {
+                SelectorTypes.ID -> "document.getElementById(${value.orEmpty().asJsString()})"
+                SelectorTypes.CSS -> "document.querySelector(${value.orEmpty().asJsString()})"
+                SelectorTypes.XPATH ->
+                    "document.evaluate(${value.orEmpty().asJsString()}, document, null, " +
+                        "XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue"
+                SelectorTypes.TEXT -> textSelectorScript(value.orEmpty())
+                else -> return null
+            }
+        if (value.isNullOrBlank()) return null
+        // null means "this selector cannot be resolved at all"; false means "resolved, no match".
+        // Callers report those differently, so the fallback must not collapse them.
+        if (awaitElement(locate, body)) return true
+        return cssTagFallback(selector, body)
+    }
+
+    /**
+     * Run [body] against the first element [locate] resolves to, polling until it appears.
+     *
+     * A single attempt right after a navigation is a race: the page can be `readyState`
+     * complete and still be swapping in the widget the plan targets. Returns false when the
+     * element never appeared.
+     */
+    private suspend fun BrowserIntegration.awaitElement(
+        locate: String,
+        body: String,
+    ): Boolean {
+        val deadline = Clock.System.now().toEpochMilliseconds() + ELEMENT_TIMEOUT_MS
+        while (true) {
+            val result = executeJavaScript("var el = $locate; if (el) { $body } !!el;")
+            if (result == true || result == "true") return true
+            if (Clock.System.now().toEpochMilliseconds() >= deadline) return false
+            delay(ELEMENT_POLL_MS)
+        }
+    }
+
+    /**
+     * Retry a tag-qualified CSS selector with the tag dropped: `input[name='q']` -> `[name='q']`.
+     *
+     * Generated plans guess the tag, and the guess is often wrong in a way the attributes are
+     * not - Google's search box is a `textarea[name='q']`, so `input[name='q']` matched nothing
+     * on a page that had loaded perfectly. The retry is logged, so a plan running on a fallback
+     * is visible rather than silently different.
+     */
+    private suspend fun BrowserIntegration.cssTagFallback(
+        selector: SelectorInfo,
+        body: String,
+    ): Boolean {
+        if (selector.type != SelectorTypes.CSS) return false
+        val raw = selector.value.orEmpty()
+        val stripped = raw.stripTagQualifier()
+        if (stripped == raw) return false
+        if (!awaitElement("document.querySelector(${stripped.asJsString()})", body)) return false
+        addLog(LogLevel.WARNING, "Selector '$raw' matched nothing; used '$stripped' instead")
+        return true
+    }
+
+    private fun unsupportedSelector(selector: SelectorInfo): String =
+        "Cannot resolve a '${selector.type}' selector" +
+            if (selector.value.isNullOrBlank()) " with no value" else ""
 
     /**
      * Execute a simulated action (fallback when no browser)
@@ -526,5 +650,23 @@ class RpaengineComponent(
      */
     fun formatTimestamp(timestamp: Long): String {
         return settingsManager.formatTimestamp(timestamp)
+    }
+
+    private companion object {
+        /** After a navigation or form submit, before the next action reads the new page. */
+        const val NAVIGATE_SETTLE_MS = 1000L
+
+        /** After a click, keypress or scroll, so handlers run before the next action. */
+        const val ACTION_SETTLE_MS = 300L
+
+        /** After typing, which fires input and change handlers. */
+        const val INPUT_SETTLE_MS = 200L
+
+        /** A `wait` action with no parseable value. */
+        const val DEFAULT_WAIT_MS = 1000L
+
+        /** How long to keep looking for an element before calling the action failed. */
+        const val ELEMENT_TIMEOUT_MS = 5_000L
+        const val ELEMENT_POLL_MS = 100L
     }
 }

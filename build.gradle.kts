@@ -14,6 +14,34 @@ version = "1.1.2"
 val useLocalDependencies = System.getenv("CI") != "true"
 val bossPluginApiPath = "../boss-plugin-api"
 
+// Newest boss-plugin-api jar from the sibling repo (local dev), resolved lazily in a provider so
+// it runs at dependency-RESOLUTION time rather than configuration time: clean/help/tasks still
+// work on a fresh checkout with no sibling jar built, and compilation fails with this actionable
+// message instead of unresolved-reference noise.
+//
+// This replaces a hardcoded `boss-plugin-api-1.0.51.jar`, which no longer existed in the sibling
+// checkout. `compileOnly(files(...))` on a missing path contributes *nothing*, silently, so every
+// api symbol came back "unresolved reference" with no hint that a stale filename was the cause.
+// Never name a version here. Same fix as llmrpa's.
+val newestApiJar = provider {
+    val apiJarPattern = Regex("""boss-plugin-api-(\d+)\.(\d+)\.(\d+)\.jar""")
+    file("$bossPluginApiPath/build/libs").listFiles()
+        ?.mapNotNull { jar -> apiJarPattern.matchEntire(jar.name)?.let { m -> jar to m } }
+        // Lexicographic (major, minor, patch) - no packing arithmetic that would mis-order
+        // components >= 1000.
+        ?.maxWithOrNull(
+            compareBy(
+                { it.second.groupValues[1].toInt() },
+                { it.second.groupValues[2].toInt() },
+                { it.second.groupValues[3].toInt() }
+            )
+        )?.first
+        ?: error(
+            "No boss-plugin-api jar found in $bossPluginApiPath/build/libs - " +
+                "run ./gradlew buildPluginJar in the sibling boss-plugin-api checkout first."
+        )
+}
+
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(17))
@@ -35,10 +63,15 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.51.jar"))
+        compileOnly(files(newestApiJar))
+        // The api is compileOnly, so the test source set has to bring it back itself. slf4j
+        // because BossLogger binds it at class-init: without a backend every class holding a
+        // logger fails with NoClassDefFoundError.
+        testImplementation(files(newestApiJar))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
+        testImplementation(files("build/downloaded-deps/boss-plugin-api.jar"))
     }
 
     // Compose dependencies
@@ -61,6 +94,9 @@ dependencies {
 
     // Serialization for JSON
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+
+    testImplementation(kotlin("test"))
+    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.17")
 }
 
 // Task to build plugin JAR with compiled classes only
@@ -108,4 +144,8 @@ tasks.register<Jar>("shadowJar") {
     from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
     from(sourceSets.main.get().output)
     from("src/main/resources")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
