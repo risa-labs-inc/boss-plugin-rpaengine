@@ -54,3 +54,37 @@ class TextSelectorScriptTest {
         assertTrue(out.length() > 0)
     }
 }
+
+/**
+ * The cheap-prefilter half of [textSelectorScript].
+ *
+ * `innerText` is layout-dependent, so reading it per candidate forces style and layout across the
+ * whole set, and the expression is re-evaluated every poll for up to five seconds - so a `text`
+ * selector that misses would mean roughly fifty full-page layout passes.
+ */
+class TextSelectorCostTest {
+
+    @Test
+    fun `prefilters on textContent before consulting innerText`() {
+        val js = textSelectorScript("Images")
+        val cheapAt = js.indexOf("textContent")
+        val exactAt = js.indexOf("innerText")
+        assertTrue(cheapAt in 0 until exactAt, "innerText is not gated behind textContent: $js")
+    }
+
+    @Test
+    fun `still confirms with innerText`() {
+        // textContent alone would match hidden text, which is not a visible label.
+        assertTrue(textSelectorScript("Images").contains("innerText"))
+    }
+
+    @Test
+    fun `considers the tags a plan actually names`() {
+        val js = textSelectorScript("Some result title")
+        // A search result title is an h3; omitting the heading and list tags made "click the
+        // result titled X" unresolvable.
+        listOf("h3", "li", "textarea", "label").forEach {
+            assertTrue(js.contains(it), "candidate tags omit $it: $js")
+        }
+    }
+}

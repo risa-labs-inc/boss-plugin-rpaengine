@@ -243,23 +243,30 @@ internal fun keyPressScript(key: String): String {
 /**
  * JS expression resolving the element whose visible label is [value].
  *
- * There is no DOM API for "the element with this text", so this scans - and the naive scan
- * picks the wrong node. An ancestor shares its descendant's `innerText`, and `querySelectorAll`
- * returns document order, so a wrapper `div` matches *before* the `a` inside it. Clicking that
- * wrapper does nothing at all and still looks like a success: this is how a plan that clicked
- * Google's "Images" tab reported ok while staying on the web-results page.
+ * There is no DOM API for "the element with this text", so this scans - and the naive scan picks
+ * the wrong node. An ancestor shares its descendant's `innerText`, and `querySelectorAll` returns
+ * document order, so a wrapper `div` matches *before* the `a` inside it. Clicking that wrapper
+ * does nothing at all and still looks like a success: this is how a plan that clicked Google's
+ * "Images" tab reported ok while staying on the web-results page.
  *
  * So: drop any match that contains another match (those are the wrappers), then prefer a
  * clickable leaf, then step to the nearest enclosing or contained anchor. Dropping ancestors is
  * not the same as taking the *last* match - a label that occurs twice on the page ("Images" in
- * the nav and again in a card) would make "last" a different element rather than a deeper one,
- * so first-occurrence order is kept.
+ * the nav and again in a card) would make "last" a different element rather than a deeper one, so
+ * first-occurrence order is kept.
+ *
+ * `textContent` does the prefiltering and `innerText` only confirms the survivors. `innerText` is
+ * layout-dependent, so reading it per candidate forces style and layout across the whole set - a
+ * few thousand nodes on a search results page - and [awaitElement] re-evaluates this expression
+ * every poll, so a `text` selector that misses (the common case for a generated plan) would mean
+ * ~50 full-page layout passes. `textContent` is free and can only over-select, which the
+ * `innerText` pass then removes.
  */
 internal fun textSelectorScript(value: String): String =
     "(function () { var t = ${value.asJsString()}; " +
-        "var all = Array.prototype.slice.call(" +
-        "document.querySelectorAll('a,button,input,span,div')).filter(function (n) { " +
-        "return (n.innerText || n.value || '').trim() === t; }); " +
+        "var cheap = Array.prototype.slice.call(document.querySelectorAll($TEXT_CANDIDATE_TAGS))" +
+        ".filter(function (n) { return (n.textContent || n.value || '').trim() === t; }); " +
+        "var all = cheap.filter(function (n) { return (n.innerText || n.value || '').trim() === t; }); " +
         "var leaves = all.filter(function (n) { return !all.some(function (m) { " +
         "return m !== n && n.contains(m); }); }); " +
         "if (!leaves.length) { return null; } " +
@@ -267,6 +274,31 @@ internal fun textSelectorScript(value: String): String =
         "return n.tagName === 'A' || n.tagName === 'BUTTON' || n.tagName === 'INPUT'; }); " +
         "var el = clickable.length ? clickable[0] : leaves[0]; " +
         "return (el.closest && el.closest('a,button')) || el.querySelector('a,button') || el; })()"
+
+/**
+ * Tags a `text` selector will consider.
+ *
+ * Deliberately broader than the interactive elements: a plan says "click the result titled X", and
+ * on a search results page that title is an `h3`. Omitting the heading and list tags made those
+ * selectors unresolvable for the same reason the CSS fallback exists - the plan names what the
+ * user sees, not the tag the site chose.
+ */
+private const val TEXT_CANDIDATE_TAGS =
+    "'a,button,input,textarea,label,span,div,li,td,th,p,h1,h2,h3,h4,h5,h6'"
+
+/**
+ * A CSS selector that also requires the element to be rendered.
+ *
+ * Used for the tag-stripped fallback only. Dropping the tag widens the match, and `[name='q']`
+ * also matches `<input type=hidden name=q>`, a `<meta name=q>`, or an off-screen duplicate.
+ * Setting a value on one of those makes `!!el` true and the action reports **ok** while nothing
+ * visible happened - reintroducing, through the fallback, the exact failure this engine's changes
+ * exist to remove. `offsetParent` is null for a hidden or `display: none` element, and `<body>`
+ * itself is never a plausible target here.
+ */
+internal fun visibleQuerySelector(selector: String): String =
+    "Array.prototype.slice.call(document.querySelectorAll(${selector.asJsString()}))" +
+        ".find(function (n) { return n.offsetParent !== null; })"
 
 /**
  * Whether a JS eval result is truthy.

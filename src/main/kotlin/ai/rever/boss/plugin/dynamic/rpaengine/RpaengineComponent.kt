@@ -133,8 +133,12 @@ class RpaengineComponent(
 
     /** Load [configInfo] and report whether it parsed, for a caller that must await the result. */
     suspend fun loadConfigurationNow(configInfo: ConfigFileInfo): Boolean {
-        if (_executionStatus.value == ExecutionStatus.EXECUTING) {
+        if (_executionStatus.value == ExecutionStatus.EXECUTING ||
+            _executionStatus.value == ExecutionStatus.PAUSED
+        ) {
             // Loading clears results and resets status, which silently kills a run in progress.
+            // PAUSED counts: pausing only flips the flag, so the job is still alive and would
+            // append one stale result into the freshly cleared list.
             addLog(LogLevel.ERROR, "A run is in progress - stop it before loading a configuration")
             return false
         }
@@ -204,15 +208,31 @@ class RpaengineComponent(
      * agent-triggered script execution in a tab holding the user's live session. A person
      * clicking a downloaded plan is choosing it; an agent resolving a name is not.
      */
-    suspend fun selectManagedConfigurationByName(name: String): Boolean {
-        val managed = refreshConfigurations().filter { settingsManager.isManagedPath(it.path) }
-        val match = managed.matchByName(name) ?: return false
-        return loadConfigurationNow(match)
+    suspend fun selectManagedConfigurationByName(name: String): LoadOutcome {
+        // One scan for both the match and the miss report: two calls walked three directories
+        // twice and logged "Found N configuration(s)" twice for every miss.
+        val all = refreshConfigurations()
+        val (managed, unmanaged) = all.partition { settingsManager.isManagedPath(it.path) }
+        managed.matchByName(name)?.let { match ->
+            return if (loadConfigurationNow(match)) {
+                LoadOutcome.Loaded(match.name)
+            } else {
+                LoadOutcome.Failed(match.name)
+            }
+        }
+        // A name the user can see in the panel but an agent may not load is a *policy* answer, not
+        // "no such configuration" - saying the latter reads as a bug to whoever is looking at it.
+        unmanaged.matchByName(name)?.let { return LoadOutcome.NotManaged(it.name) }
+        return LoadOutcome.NoMatch(managed.map { it.name })
     }
 
-    /** Names an agent may load, for reporting a miss. */
-    suspend fun managedConfigurationNames(): List<String> =
-        refreshConfigurations().filter { settingsManager.isManagedPath(it.path) }.map { it.name }
+    /** What [selectManagedConfigurationByName] did, so the caller can report it precisely. */
+    sealed interface LoadOutcome {
+        data class Loaded(val name: String) : LoadOutcome
+        data class Failed(val name: String) : LoadOutcome
+        data class NotManaged(val name: String) : LoadOutcome
+        data class NoMatch(val available: List<String>) : LoadOutcome
+    }
 
     /** The loaded configuration's name, so a caller can tell what a run would execute. */
     fun loadedConfigurationName(): String? = _selectedConfig.value?.name
@@ -240,7 +260,14 @@ class RpaengineComponent(
             }
 
         if (_executionStatus.value == ExecutionStatus.PAUSED) {
-            // Resume from paused state
+            // Resume from paused state.
+            //
+            // Cancel first: pausing only flips the status flag, so the previous job is still alive
+            // and can sit inside awaitElement for up to ELEMENT_TIMEOUT_MS. Resuming without
+            // cancelling let it reach the top of its loop, see EXECUTING again and carry on from
+            // action i+1 while the new job started from i - two loops appending results and
+            // driving the same tab, which is the double-start bug reached through resume.
+            executionJob?.cancel()
             _executionStatus.value = ExecutionStatus.EXECUTING
             addLog(LogLevel.INFO, "Resuming execution from action ${_currentActionIndex.value + 1}")
             executionJob = scope.launch {
@@ -371,7 +398,7 @@ class RpaengineComponent(
             val startTime = Clock.System.now().toEpochMilliseconds()
 
             // Simulate action execution
-            val result = executeAction(action, index)
+            val result = executeAction(action)
 
             val duration = Clock.System.now().toEpochMilliseconds() - startTime
 
@@ -432,7 +459,7 @@ class RpaengineComponent(
     /**
      * Execute a single action
      */
-    private suspend fun executeAction(action: RpaActionConfig, index: Int): Pair<Boolean, String?> {
+    private suspend fun executeAction(action: RpaActionConfig): Pair<Boolean, String?> {
         val browser = browserIntegration
 
         // If we have browser integration, execute real actions
@@ -452,6 +479,12 @@ class RpaengineComponent(
             when (action.type) {
                 ActionTypes.NAVIGATE -> {
                     val url = action.value ?: return Pair(false, "No URL specified")
+                    // Assigning location.href to a javascript: URL executes it in the page.
+                    // `run_script` is a declared verb, so this is not a new capability - but a
+                    // navigate step should navigate, and nothing should smuggle script through it.
+                    if (NAVIGABLE_SCHEME.matchEntire(url.trim()) == null) {
+                        return Pair(false, "Refusing to navigate to '$url' (http, https or about only)")
+                    }
                     browser.executeJavaScript("window.location.href = ${url.asJsString()};")
                     delay(NAVIGATE_SETTLE_MS)
                     Pair(true, null)
@@ -498,7 +531,8 @@ class RpaengineComponent(
                             // Enter", so the script reports whether it had a real target
                             // instead of this branch assuming success.
                             browser.executeJavaScript(
-                                "var el = document.activeElement; $dispatch landed;",
+                                "(function () { var el = document.activeElement; " +
+                                    "$dispatch return landed; })();",
                             ).isJsTrue()
                         } else {
                             browser.elementScript(action.selector, dispatch)
@@ -563,23 +597,17 @@ class RpaengineComponent(
     }
 
     /**
-     * Run [body] against the first element matching [selector], reporting whether one matched.
+     * Run [body] against the first element [selector] names.
      *
-     * Returns null when the selector kind is one this engine cannot resolve, so the caller can
-     * fail with a message rather than silently doing nothing - which is what the old
-     * `else -> "// No selector specified"` did, while still reporting success.
+     * Returns null when the selector kind is one this engine cannot resolve, false when it
+     * resolved but nothing matched, true when [body] ran. All three are reported differently, so
+     * they must stay distinct - see [locateExpression]. The old code had no such distinction: an
+     * unresolvable selector hit `else -> "// No selector specified"` and reported success.
      *
      * Every value crosses into JavaScript through [asJsString]. That is not defensive tidying: a
      * generated plan's very first selector is typically `input[name='q']`, and interpolating it
      * raw produced `document.querySelector('input[name='q']')` - a syntax error. XPath is worse,
      * since `//div[@role='tab']` is full of quotes.
-     */
-    /**
-     * Run [body] against the element [selector] names.
-     *
-     * Returns null when the selector cannot be resolved at all, false when it resolved but
-     * nothing matched, true when [body] ran. Those three are reported differently, so they must
-     * stay distinct - see [locateExpression].
      */
     private suspend fun BrowserIntegration.elementScript(
         selector: SelectorInfo,
@@ -592,7 +620,7 @@ class RpaengineComponent(
         val stripped = selector.value.orEmpty().stripTagQualifier()
         val fallback =
             if (selector.type == SelectorTypes.CSS && stripped != selector.value) {
-                "document.querySelector(${stripped.asJsString()})"
+                visibleQuerySelector(stripped)
             } else {
                 null
             }
@@ -604,7 +632,11 @@ class RpaengineComponent(
                 "Selector '${selector.value}' matched nothing; used '$stripped' instead",
             )
         }
-        return executeJavaScript("var el = $locate; if (el) { $body } !!el;").isJsTrue()
+        // Wrapped: `var` at eval top level lands on the page's global object, so `el`/`ev`/`f`
+        // would clobber a page's own globals of those names.
+        return executeJavaScript(
+            "(function () { var el = $locate; if (el) { $body } return !!el; })();",
+        ).isJsTrue()
     }
 
     /**
@@ -626,40 +658,39 @@ class RpaengineComponent(
 
     /** True when [locate] currently resolves to an element. Side-effect free. */
     private suspend fun BrowserIntegration.matches(locate: String): Boolean =
-        executeJavaScript("!!($locate);").isJsTrue()
+        executeJavaScript("(function () { return !!($locate); })();").isJsTrue()
 
     private fun unsupportedSelector(selector: SelectorInfo): String =
         "Cannot resolve a '${selector.type}' selector" +
             if (selector.value.isNullOrBlank()) " with no value" else ""
 
     /**
-     * Execute a simulated action (fallback when no browser)
+     * Execute a simulated action: sleep for a plausible duration and report the outcome.
+     *
+     * Two things this must NOT do, both of which it used to. It returned a random 5% failure,
+     * making a simulated run non-reproducible for no benefit. And its `else` branch passed *any*
+     * verb, including the ones [executeRealAction] explicitly refuses, so with no browser an
+     * unimplemented verb was again indistinguishable from a working one - and the
+     * `rpa_results` output was indistinguishable from a real run's. Unsupported verbs fail here
+     * too, and every outcome is tagged so a caller cannot mistake this for execution.
      */
     private suspend fun executeSimulatedAction(action: RpaActionConfig): Pair<Boolean, String?> {
-        // Simulate action execution with delays based on action type
-        val executionTime = when (action.type) {
-            ActionTypes.CLICK -> (200..500).random().toLong()
-            ActionTypes.INPUT -> (action.value?.length ?: 10) * 50L + 200
-            ActionTypes.SELECT -> (300..600).random().toLong()
-            ActionTypes.NAVIGATE -> (1000..3000).random().toLong()
-            ActionTypes.WAIT -> action.value?.toLongOrNull() ?: 1000L
-            ActionTypes.SCROLL -> (200..400).random().toLong()
-            ActionTypes.SCREENSHOT -> (500..1000).random().toLong()
-            ActionTypes.ASSERT -> (100..300).random().toLong()
-            else -> (200..500).random().toLong()
-        }
+        val executionTime =
+            when (action.type) {
+                ActionTypes.NAVIGATE -> NAVIGATE_SETTLE_MS
+                ActionTypes.WAIT -> action.value?.toLongOrNull() ?: DEFAULT_WAIT_MS
+                ActionTypes.SCROLL -> ACTION_SETTLE_MS
+                ActionTypes.ASSERT -> INPUT_SETTLE_MS
+                else -> ACTION_SETTLE_MS
+            }
+        delay((executionTime / _executionSpeed.value).toLong())
 
-        // Apply speed modifier
-        val adjustedTime = (executionTime / _executionSpeed.value).toLong()
-        delay(adjustedTime)
-
-        // Simulate success (95% success rate in simulation mode)
-        val success = Math.random() > 0.05
-
-        return if (success) {
-            Pair(true, null)
-        } else {
-            Pair(false, "Simulated error: Element not found or action failed")
+        return when (action.type) {
+            ActionTypes.NAVIGATE, ActionTypes.CLICK, ActionTypes.INPUT, ActionTypes.SELECT,
+            ActionTypes.KEYPRESS, ActionTypes.SUBMIT, ActionTypes.RUN_SCRIPT, ActionTypes.WAIT,
+            ActionTypes.SCROLL, ActionTypes.ASSERT,
+            -> Pair(true, "simulated: no browser, nothing was actually done")
+            else -> Pair(false, "simulated: '${action.type}' is not a verb this engine implements")
         }
     }
 
@@ -700,7 +731,16 @@ class RpaengineComponent(
         /** A `wait` action with no parseable value. */
         const val DEFAULT_WAIT_MS = 1000L
 
-        /** How long to keep looking for an element before calling the action failed. */
+        /** Schemes a `navigate` action may use. */
+        val NAVIGABLE_SCHEME = Regex("^(?:https?://|about:)\\S*", RegexOption.IGNORE_CASE)
+
+        /**
+         * How long to keep looking for an element before calling the action failed.
+         *
+         * Deliberately NOT scaled by the execution speed, unlike the inter-action delays: speed
+         * is about pacing a run for a watching human, while this is how long a page is given to
+         * produce an element. Scaling it would make a fast run fail on a slow site.
+         */
         const val ELEMENT_TIMEOUT_MS = 5_000L
         const val ELEMENT_POLL_MS = 100L
     }

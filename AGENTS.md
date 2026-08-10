@@ -142,3 +142,35 @@ running `./gradlew test` would make the policy above enforceable, and is worth a
 assertions cannot show that a locator picks the right *node*, so paste that file into a real page
 (`browser_run_js` against a results tab) and check what it resolves to. On Google's results page
 the fixed script returns the `A` carrying `udm=2`; the old one returned a `DIV[role=listitem]`.
+
+### Second review round
+
+- **Resume must cancel the paused job.** `pauseExecution` only flips the status flag, so the
+  previous job is alive and can be inside `awaitElement` for up to `ELEMENT_TIMEOUT_MS`. Resuming
+  without cancelling let it see `EXECUTING` again and continue from *i+1* while the new job started
+  from *i* - the double-start bug, reached through resume. Loading also refuses while `PAUSED` for
+  the same reason.
+- **The text scan prefilters on `textContent`.** `innerText` is layout-dependent, so reading it per
+  candidate forces layout across the whole set, and the expression is re-evaluated every poll for
+  five seconds: a `text` selector that misses would be ~50 full-page layout passes. `textContent`
+  is free and can only over-select; the `innerText` pass then removes the rest. The candidate tags
+  include headings and list items because a plan says "click the result titled X" and that title is
+  an `h3`.
+- **The tag-stripped fallback requires a rendered element** (`visibleQuerySelector`). Dropping the
+  tag widens the match, and `[name='q']` also matches `<input type=hidden>` or an off-screen
+  duplicate; writing to one of those made the probe true and the action report ok while nothing
+  visible happened. The widening would otherwise have reintroduced the very failure this file is
+  about.
+- **Injected bodies are wrapped in an IIFE.** `var` at eval top level lands on the page's global
+  object, so `el`/`ev`/`f` clobbered any page globals with those names.
+- **Simulation mode is not allowed to look like execution.** It used to inject a random 5% failure
+  and pass *any* verb through its `else`, so with no browser an unimplemented verb was
+  indistinguishable from a working one and `rpa_results` looked like a real run. Unsupported verbs
+  fail there too, and every simulated outcome is tagged.
+- **`rpa_load` distinguishes "not managed" from "no match".** A configuration the user can see in
+  the panel (from `~/Downloads`) reported "No configuration matched", which reads as a bug rather
+  than the deliberate policy it is. `LoadOutcome` carries the four cases, from a single scan.
+- `isManagedPath` wraps `canonicalFile`, not just `startsWith` - the former is what throws - and
+  fails closed.
+- `navigate` takes http, https and about only. `run_script` is a declared verb so this is not a new
+  capability, but a navigate step should navigate, and `location.href = 'javascript:...'` executes.

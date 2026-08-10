@@ -108,12 +108,13 @@ class RpaEngineSettingsManager {
      * configurations can carry `run_script` actions, which execute arbitrary JavaScript in a tab
      * holding the user's session.
      */
-    fun isManagedPath(path: String): Boolean {
-        val file = File(path).canonicalFile
-        return listOf(configDir, rpaRecorderConfigDir).any { dir ->
-            runCatching { file.startsWith(dir.canonicalFile) }.getOrDefault(false)
-        }
-    }
+    fun isManagedPath(path: String): Boolean =
+        // canonicalFile is what throws (IOException), not startsWith - so it has to be inside.
+        // Fail closed: a path that cannot be canonicalised is not one to hand an agent.
+        runCatching {
+            val file = File(path).canonicalFile
+            listOf(configDir, rpaRecorderConfigDir).any { dir -> file.startsWith(dir.canonicalFile) }
+        }.getOrDefault(false)
 
     /**
      * Find all available RPA configuration files.

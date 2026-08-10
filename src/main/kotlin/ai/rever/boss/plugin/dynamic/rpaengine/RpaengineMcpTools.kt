@@ -59,21 +59,35 @@ internal class RpaengineMcpToolProvider(
             name = "rpa_load",
             description =
                 "Load a saved RPA configuration by name (substring matches) so rpa_run can " +
-                    "execute it. Lists the available names when there is no match.",
+                    "execute it. Lists the available names when there is no match. Only " +
+                    "configurations in BOSS-managed directories can be loaded this way; one " +
+                    "downloaded into ~/Downloads has to be picked in the panel.",
             inputSchema = NAME_SCHEMA,
             readOnly = false,
             handler = McpToolHandler { args ->
                 val c = component() ?: return@McpToolHandler notOpen()
                 val name = args.string("name")?.trim()?.takeIf { it.isNotEmpty() }
                     ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
-                if (c.selectManagedConfigurationByName(name)) {
-                    McpToolResult("Loaded '${c.loadedConfigurationName()}'. Call rpa_run to execute it.")
-                } else {
-                    val available = c.managedConfigurationNames().joinToString(", ")
-                    McpToolResult(
-                        "No configuration matched '$name'. Available: ${available.ifEmpty { "none" }}",
-                        isError = true,
-                    )
+                when (val outcome = c.selectManagedConfigurationByName(name)) {
+                    is RpaengineComponent.LoadOutcome.Loaded ->
+                        McpToolResult("Loaded '${outcome.name}'. Call rpa_run to execute it.")
+
+                    is RpaengineComponent.LoadOutcome.Failed ->
+                        McpToolResult("Found '${outcome.name}' but it did not parse.", isError = true)
+
+                    is RpaengineComponent.LoadOutcome.NotManaged ->
+                        McpToolResult(
+                            "'${outcome.name}' is in ~/Downloads, which this tool will not load - " +
+                                "open it from the RPA Engine panel instead.",
+                            isError = true,
+                        )
+
+                    is RpaengineComponent.LoadOutcome.NoMatch ->
+                        McpToolResult(
+                            "No configuration matched '$name'. Available: " +
+                                outcome.available.joinToString(", ").ifEmpty { "none" },
+                            isError = true,
+                        )
                 }
             },
         ),
