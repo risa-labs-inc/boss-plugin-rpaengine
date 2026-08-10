@@ -278,10 +278,14 @@ class RpaengineComponent(
             // cancelling let it reach the top of its loop, see EXECUTING again and carry on from
             // action i+1 while the new job started from i - two loops appending results and
             // driving the same tab, which is the double-start bug reached through resume.
-            executionJob?.cancel()
+            val previous = executionJob
+            previous?.cancel()
             _executionStatus.value = ExecutionStatus.EXECUTING
             addLog(LogLevel.INFO, "Resuming execution from action ${_currentActionIndex.value + 1}")
             executionJob = scope.launch {
+                // Joined, not just cancelled: cancellation is cooperative, so without this the old
+                // job can still be unwinding while the new one starts appending results.
+                previous?.join()
                 executeActions()
             }
         } else {
@@ -476,14 +480,24 @@ class RpaengineComponent(
             }
         }
 
-        // Execution completed
-        _executionStatus.value = ExecutionStatus.COMPLETED
+        // Execution reached the end of the plan. With stopOnError = false that is not the same
+        // as success: failed actions were recorded and the run used to finish COMPLETED and log
+        // "Execution completed successfully" over the top of them.
+        val failed = _executionResults.value.count { !it.success }
+        _executionStatus.value = if (failed > 0) ExecutionStatus.ERROR else ExecutionStatus.COMPLETED
         _executionSummary.value?.let { summary ->
             _executionSummary.value = summary.copy(
                 endTime = Clock.System.now().toEpochMilliseconds()
             )
         }
-        addLog(LogLevel.SUCCESS, "Execution completed successfully")
+        if (failed > 0) {
+            addLog(
+                LogLevel.ERROR,
+                "Execution finished with $failed of ${_executionResults.value.size} action(s) failed",
+            )
+        } else {
+            addLog(LogLevel.SUCCESS, "Execution completed successfully")
+        }
     }
 
     /**
@@ -656,9 +670,10 @@ class RpaengineComponent(
                     val raw = action.value
                     val waitTime = raw?.toLongOrNull()
                     if (raw != null && waitTime == null) {
-                        // "3s" and "3000ms" silently became the default, so a plan asking for a
-                        // long settle got one second and no indication why.
-                        addLog(LogLevel.WARNING, "Wait value '$raw' is not a number of ms; using $DEFAULT_WAIT_MS")
+                        // A warning was not enough: the plan asked for a specific settle and got a
+                        // different one, and reporting ok says it got what it asked for. "3s" and
+                        // "3000ms" are the realistic cases.
+                        return Pair(false, "Wait value '$raw' is not a number of milliseconds")
                     }
                     delay(waitTime ?: DEFAULT_WAIT_MS)
                     Pair(true, null)
@@ -666,9 +681,9 @@ class RpaengineComponent(
                 ActionTypes.SCROLL -> {
                     val coords = action.value?.split(",")?.map { it.trim().toIntOrNull() }
                     if (coords?.any { it == null } == true) {
-                        // An unparseable coordinate became 0, so "scroll to 500" scrolled to the
-                        // top and reported ok.
-                        addLog(LogLevel.WARNING, "Scroll value '${action.value}' is not 'x,y'; using 0 for the rest")
+                        // Same reasoning as wait: scrolling somewhere other than where the plan
+                        // said, and reporting ok, is the failure this engine exists to remove.
+                        return Pair(false, "Scroll value '${action.value}' is not a coordinate or 'x,y'")
                     }
                     // One coordinate means the y axis. Read as x it parsed cleanly, fired no
                     // warning, and scrolled the page *sideways* to 500 while staying at the top -

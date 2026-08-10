@@ -35,9 +35,11 @@ class TextSelectorScriptTest {
     }
 
     @Test
-    fun `matches on exact trimmed text`() {
+    fun `the innerText pass is an exact match`() {
+        // Exactness belongs to the narrowing pass. The cheap prefilter must NOT be exact - see
+        // TextSelectorCostTest - or it drops elements the exact pass would have accepted.
         val js = textSelectorScript("Images")
-        assertTrue(js.contains(".trim() === t"), "must be an exact match, not a substring: $js")
+        assertTrue(js.contains("norm(n.innerText || n.value) === t"), "not an exact match: $js")
     }
 
     @Test
@@ -86,5 +88,33 @@ class TextSelectorCostTest {
         listOf("h3", "li", "textarea", "label").forEach {
             assertTrue(js.contains(it), "candidate tags omit $it: $js")
         }
+    }
+}
+
+/**
+ * The prefilter has to be a genuine **superset** of the exact pass.
+ *
+ * It was not. `innerText` collapses whitespace runs and drops `display: none` subtrees, while
+ * `textContent` preserves both - so a label wrapped across source lines (`<a>Cat\n  images</a>`) or
+ * a button with a hidden span was rejected by the cheap pass, and the exact pass never saw it. The
+ * selector then missed an element that was right there.
+ */
+class TextPrefilterSupersetTest {
+
+    @Test
+    fun `the cheap pass is not an exact comparison`() {
+        val js = textSelectorScript("Images")
+        assertTrue(
+            js.contains("norm(n.textContent || n.value).indexOf(t) !== -1"),
+            "the prefilter is exact, so it can drop what the innerText pass would accept: $js",
+        )
+    }
+
+    @Test
+    fun `both passes normalise whitespace`() {
+        val js = textSelectorScript("Cat images")
+        assertTrue(js.contains("replace(/\\s+/g, ' ')"), "no whitespace normalisation: $js")
+        assertTrue(js.contains("norm(n.textContent"), "cheap pass not normalised: $js")
+        assertTrue(js.contains("norm(n.innerText"), "exact pass not normalised: $js")
     }
 }

@@ -264,9 +264,16 @@ internal fun keyPressScript(key: String): String {
  */
 internal fun textSelectorScript(value: String): String =
     "(function () { var t = ${value.asJsString()}; " +
+        // Whitespace-normalised, and `indexOf` rather than `===`, so the cheap pass is a genuine
+        // superset. It was not: innerText collapses whitespace runs and drops `display: none`
+        // subtrees while textContent preserves both, so a label wrapped across source lines, or a
+        // button with a hidden span, was rejected here and the innerText pass never saw it. An
+        // ancestor's text contains its descendant's, which is what makes indexOf safe - the
+        // innerText pass is what narrows it back down.
+        "var norm = function (s) { return (s || '').replace(/\\s+/g, ' ').trim(); }; " +
         "var cheap = Array.prototype.slice.call(document.querySelectorAll($TEXT_CANDIDATE_TAGS))" +
-        ".filter(function (n) { return (n.textContent || n.value || '').trim() === t; }); " +
-        "var all = cheap.filter(function (n) { return (n.innerText || n.value || '').trim() === t; }); " +
+        ".filter(function (n) { return norm(n.textContent || n.value).indexOf(t) !== -1; }); " +
+        "var all = cheap.filter(function (n) { return norm(n.innerText || n.value) === t; }); " +
         "var leaves = all.filter(function (n) { return !all.some(function (m) { " +
         "return m !== n && n.contains(m); }); }); " +
         "if (!leaves.length) { return null; } " +
@@ -310,6 +317,13 @@ internal fun visibleQuerySelector(selector: String): String =
  */
 internal fun typeValueScript(value: String): String =
     "el.focus(); var want = ${value.asJsString()}; " +
+        // BEFORE the write, because the assignment is what makes `'value' in el` true. A <span> or
+        // a plain <div> - exactly what a generated plan guesses at - has no prototype `value`
+        // descriptor, so `el.value = want` created an own property and the read-back below read
+        // *that* back and found it equal. The check was vacuous and the action reported ok with
+        // nothing visible happening: round four's contenteditable branch fixed the div case and
+        // left this one.
+        "if (!el.isContentEditable && !('value' in el)) { return false; } " +
         // A contenteditable element has no `value`, so plain assignment set an expando property
         // and the read-back below then failed the action outright. Setting textContent makes it a
         // working verb instead - and this is the case the whole read-back was motivated by.

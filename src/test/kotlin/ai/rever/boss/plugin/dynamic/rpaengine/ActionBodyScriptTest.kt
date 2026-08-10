@@ -78,3 +78,34 @@ class ActionBodyScriptTest {
             .forEach { assertTrue(it.contains("\\'"), "unescaped value: $it") }
     }
 }
+
+/**
+ * Typing must refuse an element that cannot hold a value.
+ *
+ * The read-back added earlier could not fail on a plain `<span>` or `<div>`: with no prototype
+ * `value` descriptor, `el.value = want` creates an own property and the read-back reads that same
+ * property back. Verification that cannot fail is worse than none, because it reads as proof.
+ */
+class TypeCapabilityTest {
+
+    @Test
+    fun `typing refuses an element with no value`() {
+        val js = typeValueScript("cat images")
+        assertTrue(js.contains("!('value' in el)"), "no capability check: $js")
+    }
+
+    @Test
+    fun `the capability check comes before the write`() {
+        // Order is the whole point: the assignment is what makes `'value' in el` true.
+        val js = typeValueScript("cat images")
+        val check = js.indexOf("'value' in el")
+        val write = js.indexOf("el.value = want")
+        assertTrue(check in 0 until write, "the check must precede the write: $js")
+    }
+
+    @Test
+    fun `a contenteditable element is exempt from the value check`() {
+        val js = typeValueScript("x")
+        assertTrue(js.contains("!el.isContentEditable && !('value' in el)"), "not exempt: $js")
+    }
+}

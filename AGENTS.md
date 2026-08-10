@@ -266,3 +266,34 @@ navigation is legitimately a no-op, and `https://www.google.com` versus the brow
 `https://www.google.com/` differ by a slash: action #0 of every plan reported
 `Still on '...' after navigating to '...'` and the run stopped there. A redirect breaks the same
 comparison from the other side. Only the assignment is checked.
+
+### Sixth review round
+
+- **A verification that cannot fail is worse than none, because it reads as proof.**
+  `typeValueScript`'s read-back could not fail on a plain `<span>`/`<div>`: with no prototype `value`
+  descriptor, `el.value = want` creates an *own* property and the read-back read that same property
+  back and found it equal. The `contenteditable` branch added a round earlier fixed the div case and
+  left this one reporting ok with nothing visible happening. The capability check
+  (`!('value' in el)`) has to come **before** the write, since the assignment is what makes that
+  true - and there is a test asserting the order, not just the presence.
+- **A cheap prefilter has to be a genuine superset.** The `textContent` pass was exact, and
+  `innerText` collapses whitespace runs and drops `display: none` subtrees while `textContent`
+  preserves both - so a label wrapped across source lines, or a button with a hidden span, was
+  rejected before the exact pass ever saw it. Both sides are whitespace-normalised and the cheap
+  pass uses `indexOf`. The claim in the old comment that `textContent` "can only over-select" was
+  simply wrong for an exact comparison.
+- **Reaching the end of the plan is not success when `stopOnError = false`.** The run finished
+  `COMPLETED` and logged "Execution completed successfully" over recorded failures. It now ends
+  `ERROR` and says how many of how many failed.
+- An unparseable `wait` or `scroll` value is a **failure**, not a warning: the plan asked for a
+  specific settle or position, something else happened, and reporting ok says it got what it asked
+  for.
+- Resume `join`s the cancelled job rather than only cancelling it - cancellation is cooperative, so
+  the old job could still be unwinding while the new one appends results.
+
+**A hypothesis worth measuring before acting on it:** review round six argued that
+`processResources`' `\$version` replacement emits the literal string `$version`, since a raw
+string's `\$` is two characters and `Matcher.replaceAll` treats `\$` as an escaped `$`. Measured,
+it does not: `build/resources/main/.../plugin.json` reads `"version": "1.2.0"`, and so does the jar.
+The committed source still saying `1.0.6` is expected - it is synced at build time and never
+committed.
