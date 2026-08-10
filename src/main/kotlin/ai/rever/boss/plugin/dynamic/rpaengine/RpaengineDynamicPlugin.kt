@@ -53,14 +53,24 @@ class RpaengineDynamicPlugin : DynamicPlugin {
         lastComponent = null
     }
 
+    /**
+     * The version from *this* plugin's manifest.
+     *
+     * Every BOSS plugin ships `/META-INF/boss-plugin/plugin.json` at the same resource path, so a
+     * single `getResourceAsStream` returns whichever jar comes first if the host ever loads plugins
+     * through a shared or parent-first classloader - and this plugin would report someone else's
+     * version. Every candidate is checked and only the one naming this plugin id is accepted.
+     */
     private fun manifestVersion(): String =
         runCatching {
-            javaClass.getResourceAsStream("/META-INF/boss-plugin/plugin.json")
-                ?.bufferedReader()
-                ?.use { reader ->
-                    Regex(""""version"\s*:\s*"([^"]+)"""").find(reader.readText())
-                        ?.groupValues
-                        ?.get(1)
-                }
+            javaClass.classLoader
+                ?.getResources("META-INF/boss-plugin/plugin.json")
+                ?.asSequence()
+                ?.mapNotNull { url -> runCatching { url.readText() }.getOrNull() }
+                ?.firstOrNull { text -> field(text, "pluginId") == pluginId }
+                ?.let { text -> field(text, "version") }
         }.getOrNull() ?: "unknown"
+
+    private fun field(manifest: String, name: String): String? =
+        Regex(""""$name"\s*:\s*"([^"]+)"""").find(manifest)?.groupValues?.get(1)
 }

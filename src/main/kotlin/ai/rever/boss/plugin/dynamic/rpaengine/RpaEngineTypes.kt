@@ -309,10 +309,21 @@ internal fun visibleQuerySelector(selector: String): String =
  * that the field really holds what the plan asked for.
  */
 internal fun typeValueScript(value: String): String =
-    "el.focus(); el.value = ${value.asJsString()}; " +
+    "el.focus(); var want = ${value.asJsString()}; " +
+        // A contenteditable element has no `value`, so plain assignment set an expando property
+        // and the read-back below then failed the action outright. Setting textContent makes it a
+        // working verb instead - and this is the case the whole read-back was motivated by.
+        "if (el.isContentEditable) { el.textContent = want; } else { " +
+        // React and friends track an input's value through the prototype setter: assigning
+        // `el.value` directly leaves component state unchanged, so the next render reverts the
+        // field. The read-back happens before that render, so it would pass and the value would
+        // then vanish. Going through the descriptor's setter is what the framework observes.
+        "var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value'); " +
+        "if (d && d.set) { d.set.call(el, want); } else { el.value = want; } } " +
         "el.dispatchEvent(new Event('input', { bubbles: true })); " +
         "el.dispatchEvent(new Event('change', { bubbles: true })); " +
-        "if (el.value !== ${value.asJsString()}) { return false; }"
+        "var have = el.isContentEditable ? el.textContent : el.value; " +
+        "if (have !== want) { return false; }"
 
 /**
  * JS body that selects [value] in `el`, by option value or visible label.
@@ -352,6 +363,25 @@ internal fun isNavigableUrl(url: String): Boolean =
     NAVIGABLE_SCHEME.matchEntire(url.trim()) != null
 
 private val NAVIGABLE_SCHEME = Regex("(?:https?://|about:)\\S*", RegexOption.IGNORE_CASE)
+
+/**
+ * What a completion value from an action body means.
+ *
+ * The four cases exist because collapsing them misdirects whoever reads the failure:
+ *  - truthy: the body ran.
+ *  - a `threw: ...` string: name the exception, not the selector.
+ *  - explicitly false: the body's own check failed, so the caller's [onFailure] is the right words.
+ *  - nothing at all: **success**. Existence was proven immediately before by polling, so an absent
+ *    completion value is a click or submit that navigated and tore the frame down; failing it
+ *    failed the step that actually worked and stopped the run right where it succeeded.
+ */
+internal fun interpretOutcome(result: Any?, onFailure: String): Pair<Boolean, String?> =
+    when {
+        result.isJsTrue() -> Pair(true, null)
+        result is String && result.startsWith("threw: ") -> Pair(false, result)
+        result == false || result == "false" -> Pair(false, onFailure)
+        else -> Pair(true, null)
+    }
 
 /**
  * Whether a JS eval result is truthy.

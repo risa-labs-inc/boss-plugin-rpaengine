@@ -16,8 +16,27 @@ class ActionBodyScriptTest {
     @Test
     fun `typing verifies the value took`() {
         val js = typeValueScript("cat images")
-        assertTrue(js.contains("el.value !=="), "does not compare the value back: $js")
+        assertTrue(js.contains("have !== want"), "does not compare the value back: $js")
         assertTrue(js.contains("return false"), "cannot report a failure: $js")
+    }
+
+    @Test
+    fun `typing handles a contenteditable element`() {
+        // The case the read-back was motivated by: a contenteditable div has no `value`, so plain
+        // assignment set an expando property and the read-back then failed the action outright.
+        val js = typeValueScript("x")
+        assertTrue(js.contains("isContentEditable"), "does not branch on contenteditable: $js")
+        assertTrue(js.contains("textContent = want"), "does not set text on a contenteditable: $js")
+    }
+
+    @Test
+    fun `typing goes through the prototype value setter`() {
+        // React tracks the value through the prototype setter; a direct assignment leaves component
+        // state unchanged and the next render reverts the field - after the read-back has passed.
+        val js = typeValueScript("x")
+        assertTrue(js.contains("getOwnPropertyDescriptor"), "no descriptor setter: $js")
+        assertTrue(js.contains("d.set.call(el, want)"), "does not call the setter: $js")
+        assertTrue(js.contains("el.value = want"), "no fallback for a plain element: $js")
     }
 
     @Test

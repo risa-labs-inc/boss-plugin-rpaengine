@@ -209,3 +209,36 @@ the fixed script returns the `A` carrying `udm=2`; the old one returned a `DIV[r
   `mkdirs()`, which has no business inside a security predicate called in a loop.
 - The plugin's `version` is read from the manifest. Hardcoded, it said `1.0.5` while the build said
   `1.2.0`: `processResources` syncs `plugin.json`, never a Kotlin constant.
+
+### Fourth review round
+
+- **`input` had started failing outright on a `contenteditable` element** - the very case the
+  read-back was added for. No `value` property, so the assignment set an expando and the read-back
+  returned false. It branches on `isContentEditable` and sets `textContent`, which makes it a
+  working verb rather than a hard failure.
+- **A framework-controlled input needs the prototype setter.** React tracks an input's value
+  through `Object.getOwnPropertyDescriptor(prototype, 'value').set`; a direct `el.value =`
+  assignment leaves component state unchanged and the next render reverts the field - *after* the
+  read-back has already passed. So the verification would have reported success and the value would
+  then vanish.
+- **The four-outcome mapping is now `interpretOutcome`**, a pure function with a table-driven test.
+  It is the densest decision in the file and the policy is easy to "simplify" wrongly.
+- `manifestVersion()` checks `pluginId` and iterates `getResources`. Every plugin ships
+  `/META-INF/boss-plugin/plugin.json` at the same path, so a single `getResourceAsStream` under a
+  shared or parent-first classloader would report *another plugin's* version.
+- Settings IO moved off `Dispatchers.Main`: `loadSettings` reads (and writes a default on first
+  run), and the three setters wrote JSON synchronously from a Compose event handler.
+- `rpa_stop` says `Nothing was running` instead of claiming a stop, `loadConfigurationNow` also
+  refuses while `LOADING` (two concurrent `rpa_load` calls interleaved, last write winning), and a
+  selectorless `keypress` checks it has a real target *before* dispatching, so a failing action no
+  longer leaves key events on `<body>`.
+
+CI: `pull_request` only (`build.yml` already fires on push to `main`, so every merge compiled
+twice), `permissions: contents: read`, a `concurrency` group that cancels superseded PR runs, and
+the job renamed `build-and-test` since it is the compile gate too.
+
+Still untested and worth knowing: `awaitElement`'s backoff and deadline, `executeActions`' resume
+skip, and `selectManagedConfigurationByName`'s partition. All three need a fake `BrowserIntegration`
+or an injectable settings root. The JS tests assert on implementation strings, which a refactor
+breaks and a behavioural regression can slip past - a GraalJS harness with a hand-rolled DOM is the
+real answer if the wrapper-vs-anchor and duplicate-label cases ever regress.

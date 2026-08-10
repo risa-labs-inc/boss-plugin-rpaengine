@@ -119,8 +119,11 @@ internal class RpaengineMcpToolProvider(
             readOnly = false,
             handler = McpToolHandler {
                 val c = component() ?: return@McpToolHandler notOpen()
-                c.stopExecution()
-                McpToolResult("Stopped RPA execution.")
+                if (c.stopExecution()) {
+                    McpToolResult("Stopped RPA execution.")
+                } else {
+                    McpToolResult("Nothing was running (status ${c.executionStatus.value}).")
+                }
             },
         ),
     )

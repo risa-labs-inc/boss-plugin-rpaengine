@@ -91,7 +91,8 @@ class RpaengineComponent(
 
         // Load settings and available configurations
         scope.launch {
-            val settings = settingsManager.loadSettings()
+            // loadSettings does exists()/readText() and writes a default file on first run.
+            val settings = withContext(Dispatchers.IO) { settingsManager.loadSettings() }
             _executionSpeed.value = settings.executionSpeed
             _humanLikeMode.value = settings.humanLikeMode
             _stopOnError.value = settings.stopOnError
@@ -135,11 +136,13 @@ class RpaengineComponent(
     /** Load [configInfo] and report whether it parsed, for a caller that must await the result. */
     suspend fun loadConfigurationNow(configInfo: ConfigFileInfo): Boolean {
         if (_executionStatus.value == ExecutionStatus.EXECUTING ||
-            _executionStatus.value == ExecutionStatus.PAUSED
+            _executionStatus.value == ExecutionStatus.PAUSED ||
+            _executionStatus.value == ExecutionStatus.LOADING
         ) {
             // Loading clears results and resets status, which silently kills a run in progress.
             // PAUSED counts: pausing only flips the flag, so the job is still alive and would
-            // append one stale result into the freshly cleared list.
+            // append one stale result into the freshly cleared list. LOADING counts because two
+            // concurrent rpa_load calls otherwise interleave and the last write wins.
             addLog(LogLevel.ERROR, "A run is in progress - stop it before loading a configuration")
             return false
         }
@@ -169,7 +172,8 @@ class RpaengineComponent(
      */
     fun setExecutionSpeed(speed: Float) {
         _executionSpeed.value = speed
-        settingsManager.updateSettings { it.copy(executionSpeed = speed) }
+        // Off Main: this writes JSON synchronously from a Compose event handler.
+        scope.launch { withContext(Dispatchers.IO) { settingsManager.updateSettings { it.copy(executionSpeed = speed) } } }
     }
 
     /**
@@ -177,7 +181,8 @@ class RpaengineComponent(
      */
     fun setHumanLikeMode(enabled: Boolean) {
         _humanLikeMode.value = enabled
-        settingsManager.updateSettings { it.copy(humanLikeMode = enabled) }
+        // Off Main: this writes JSON synchronously from a Compose event handler.
+        scope.launch { withContext(Dispatchers.IO) { settingsManager.updateSettings { it.copy(humanLikeMode = enabled) } } }
     }
 
     /**
@@ -185,7 +190,8 @@ class RpaengineComponent(
      */
     fun setStopOnError(enabled: Boolean) {
         _stopOnError.value = enabled
-        settingsManager.updateSettings { it.copy(stopOnError = enabled) }
+        // Off Main: this writes JSON synchronously from a Compose event handler.
+        scope.launch { withContext(Dispatchers.IO) { settingsManager.updateSettings { it.copy(stopOnError = enabled) } } }
     }
 
     /**
@@ -346,7 +352,16 @@ class RpaengineComponent(
     /**
      * Stop execution
      */
-    fun stopExecution() {
+    fun stopExecution(): Boolean {
+        val wasRunning =
+            _executionStatus.value == ExecutionStatus.EXECUTING ||
+                _executionStatus.value == ExecutionStatus.PAUSED ||
+                _executionStatus.value == ExecutionStatus.LOADING
+        if (!wasRunning) {
+            // Reported "Stopped RPA execution." and logged a stop for a run that was never
+            // going, which by this plugin's own standard is the wrong answer.
+            return false
+        }
         executionJob?.cancel()
         _executionStatus.value = ExecutionStatus.IDLE
         _currentActionIndex.value = -1
@@ -359,6 +374,7 @@ class RpaengineComponent(
         }
 
         addLog(LogLevel.WARNING, "Execution stopped")
+        return true
     }
 
     /**
@@ -554,8 +570,13 @@ class RpaengineComponent(
                             // instead of this branch assuming success.
                             val landed =
                                 browser.executeJavaScript(
+                                    // `landed` is checked BEFORE dispatching: firing all three
+                                    // key events at <body> and only then deciding there was no
+                                    // real target left side effects on the page for an action that
+                                    // reports failure.
                                     "(function () { var el = document.activeElement; " +
-                                        "if (!el) { return false; } $dispatch return landed; })();",
+                                        "if (!el || el === document.body) { return false; } " +
+                                        "$dispatch return landed; })();",
                                 ).isJsTrue()
                             if (landed) {
                                 Pair(true, null)
@@ -715,12 +736,7 @@ class RpaengineComponent(
                 "(function () { var el = $locate; if (!el) { return false; } " +
                     "try { $body } catch (e) { return 'threw: ' + e.message; } return true; })();",
             )
-        return when {
-            outcome.isJsTrue() -> Pair(true, null)
-            outcome is String && outcome.startsWith("threw: ") -> Pair(false, outcome)
-            outcome == false || outcome == "false" -> Pair(false, onFailure)
-            else -> Pair(true, null)
-        }
+        return interpretOutcome(outcome, onFailure)
     }
 
     /**
