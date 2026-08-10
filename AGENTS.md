@@ -81,15 +81,36 @@ while doing nothing. That is the failure mode to design against here, not except
 - The `text` selector scanned `a,button,input,span,div` and took the **first** match. An
   ancestor shares its descendant's `innerText` and comes first in document order, so a wrapper
   `div` won over the `a` inside it; `.click()` on that div did nothing and the action passed.
-  `textSelectorScript` now prefers a clickable match, takes the deepest, and steps to the
-  enclosing anchor.
+  `textSelectorScript` now drops every match that *contains* another match (that is what a
+  wrapper is), prefers a clickable one, and steps to the enclosing anchor. Note it excludes
+  ancestors rather than taking the *last* match: a label appearing twice on the page (nav and
+  card) makes "last" a different element, not a deeper one.
 - A synthetic `KeyboardEvent` never performs a **default action**. Dispatching Enter into a
   search box ran every page handler and left the form unsubmitted - success, no search.
   `keyPressScript` submits the enclosing form itself for Enter, unless a handler called
   `preventDefault` (the page implements Enter) or there is no form.
-- Element lookup was a single attempt. It now polls to `ELEMENT_TIMEOUT_MS`, and a tag-qualified
-  CSS selector that misses is retried with the tag dropped (`input[name='q']` -> `[name='q']`),
-  logged at WARNING. Generated plans guess the tag and Google's search box is a `textarea`.
+- Element lookup was a single attempt. It now polls to `ELEMENT_TIMEOUT_MS`.
+- A tag-qualified CSS selector carries its tag-stripped form (`input[name='q']` -> `[name='q']`)
+  as an **alternative in the same probe**, logged at WARNING when the fallback is what matched.
+  Generated plans guess the tag and Google's search box is a `textarea`. It is one probe, not a
+  retry: two sequential deadlines made every miss cost 10s and let the fallback win only after
+  the primary had exhausted its own.
+
+**The probe must never carry the action's body.** `awaitElement` polls `!!(locate)` and nothing
+else; the body runs once, after. When they were one script, any eval whose completion value did
+not come back - a body that threw, a click that navigated and tore down the frame - re-ran the
+mutation on every poll, turning one submit into fifty.
+
+**A run cannot be started or reloaded over a live one.** `rpa_run` and `rpa_load` are reachable
+from an agent in a loop; without the guard a second start cleared the results mid-run and
+replaced `executionJob` *without cancelling it*, so the old job appended a stale result into the
+new run and orphaned its tab. `browserIntegration`/`currentTabId` are also cleared per run: stale
+handles meant a failed `createBrowserTab` logged "simulation mode" while still driving the old tab.
+
+**`rpa_load` only loads from directories BOSS manages.** The scan includes `~/Downloads` for the
+human picking in the panel, but `run_script` executes arbitrary JavaScript in a tab holding the
+user's session, so a downloaded file must not be reachable by an agent resolving a substring.
+`isManagedPath` is the gate; a person clicking a downloaded plan is choosing it, an agent is not.
 
 `elementScript` returns `Boolean?` where **null means the selector cannot be resolved at all**
 and **false means resolved but no match**. Callers report those differently; a change that
@@ -107,6 +128,15 @@ Every test here was mutation-checked: inverting the selector precedence, droppin
 guard, removing the Enter submit clause, and interpolating instead of escaping each make a
 specific named test fail. Add tests the same way - a JS-emitting helper is trivially "tested" by
 a string assertion that also passes on the broken version.
+
+A fixture can silently fail to discriminate. `ConfigMatchTest`'s exact-wins case first used
+entries where nothing else contained the query, so a substring-first implementation found nothing
+on its first pass and returned the exact match anyway: the test passed on the very mutation it
+named. The earlier entry has to actually contain the query.
+
+Nothing runs `./gradlew test` in CI - `build.yml` fires only on push to `main` and delegates to
+the shared release workflow. These tests protect local development only; a PR-triggered job
+running `./gradlew test` would make the policy above enforceable, and is worth adding.
 
 `TextSelectorScriptTest` dumps the generated script to `build/tmp/text-selector-images.js`. String
 assertions cannot show that a locator picks the right *node*, so paste that file into a real page

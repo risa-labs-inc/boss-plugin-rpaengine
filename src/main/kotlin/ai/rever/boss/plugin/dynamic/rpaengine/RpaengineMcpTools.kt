@@ -66,10 +66,10 @@ internal class RpaengineMcpToolProvider(
                 val c = component() ?: return@McpToolHandler notOpen()
                 val name = args.string("name")?.trim()?.takeIf { it.isNotEmpty() }
                     ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
-                if (c.selectConfigurationByName(name)) {
+                if (c.selectManagedConfigurationByName(name)) {
                     McpToolResult("Loaded '${c.loadedConfigurationName()}'. Call rpa_run to execute it.")
                 } else {
-                    val available = c.availableConfigs.value.joinToString(", ") { it.name }
+                    val available = c.managedConfigurationNames().joinToString(", ")
                     McpToolResult(
                         "No configuration matched '$name'. Available: ${available.ifEmpty { "none" }}",
                         isError = true,
@@ -83,9 +83,17 @@ internal class RpaengineMcpToolProvider(
             readOnly = false,
             handler = McpToolHandler {
                 val c = component() ?: return@McpToolHandler notOpen()
+                val status = c.executionStatus.value
+                if (status == ExecutionStatus.EXECUTING || status == ExecutionStatus.LOADING) {
+                    return@McpToolHandler McpToolResult(
+                        "A run is already in progress (status $status) - call rpa_stop first.",
+                        isError = true,
+                    )
+                }
                 val loaded = c.loadedConfigurationName()
                     ?: return@McpToolHandler McpToolResult(
                         "No configuration is loaded - call rpa_load first.",
+                        isError = true,
                     )
                 c.startExecution()
                 McpToolResult("Running '$loaded' (status now ${c.executionStatus.value.name}).")

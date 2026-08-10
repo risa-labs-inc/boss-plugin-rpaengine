@@ -133,27 +133,30 @@ class RpaengineComponent(
 
     /** Load [configInfo] and report whether it parsed, for a caller that must await the result. */
     suspend fun loadConfigurationNow(configInfo: ConfigFileInfo): Boolean {
-        run {
-            _executionStatus.value = ExecutionStatus.LOADING
-            addLog(LogLevel.INFO, "Loading configuration: ${configInfo.name}")
-
-            val config = withContext(Dispatchers.IO) { settingsManager.loadConfiguration(configInfo.path) }
-
-            if (config != null) {
-                _selectedConfig.value = config
-                _currentActionIndex.value = -1
-                _executionResults.value = emptyList()
-                _executionSummary.value = null
-                _executionStatus.value = ExecutionStatus.IDLE
-
-                withContext(Dispatchers.IO) { settingsManager.addToRecent(configInfo.path) }
-                addLog(LogLevel.SUCCESS, "Loaded ${config.actions.size} actions from ${config.name}")
-            } else {
-                _executionStatus.value = ExecutionStatus.ERROR
-                addLog(LogLevel.ERROR, "Failed to load configuration: ${configInfo.name}")
-            }
-            return config != null
+        if (_executionStatus.value == ExecutionStatus.EXECUTING) {
+            // Loading clears results and resets status, which silently kills a run in progress.
+            addLog(LogLevel.ERROR, "A run is in progress - stop it before loading a configuration")
+            return false
         }
+        _executionStatus.value = ExecutionStatus.LOADING
+        addLog(LogLevel.INFO, "Loading configuration: ${configInfo.name}")
+
+        val config = withContext(Dispatchers.IO) { settingsManager.loadConfiguration(configInfo.path) }
+
+        if (config != null) {
+            _selectedConfig.value = config
+            _currentActionIndex.value = -1
+            _executionResults.value = emptyList()
+            _executionSummary.value = null
+            _executionStatus.value = ExecutionStatus.IDLE
+
+            withContext(Dispatchers.IO) { settingsManager.addToRecent(configInfo.path) }
+            addLog(LogLevel.SUCCESS, "Loaded ${config.actions.size} actions from ${config.name}")
+        } else {
+            _executionStatus.value = ExecutionStatus.ERROR
+            addLog(LogLevel.ERROR, "Failed to load configuration: ${configInfo.name}")
+        }
+        return config != null
     }
 
     /**
@@ -181,9 +184,6 @@ class RpaengineComponent(
     }
 
     /**
-     * Start or resume execution
-     */
-    /**
      * Load [name] from the available configurations, or return false when there is no such one.
      *
      * Exists so a run can be started without a click. Everything else on this path was
@@ -195,10 +195,41 @@ class RpaengineComponent(
         return loadConfigurationNow(match)
     }
 
+    /**
+     * Load [name] from the configurations BOSS itself manages, refusing anything outside them.
+     *
+     * This is the agent-reachable entry point, and the scan deliberately includes `~/Downloads`
+     * for the human picking from the panel. Combined with substring matching and the
+     * `run_script` verb, that source would let any JSON file that lands in Downloads become
+     * agent-triggered script execution in a tab holding the user's live session. A person
+     * clicking a downloaded plan is choosing it; an agent resolving a name is not.
+     */
+    suspend fun selectManagedConfigurationByName(name: String): Boolean {
+        val managed = refreshConfigurations().filter { settingsManager.isManagedPath(it.path) }
+        val match = managed.matchByName(name) ?: return false
+        return loadConfigurationNow(match)
+    }
+
+    /** Names an agent may load, for reporting a miss. */
+    suspend fun managedConfigurationNames(): List<String> =
+        refreshConfigurations().filter { settingsManager.isManagedPath(it.path) }.map { it.name }
+
     /** The loaded configuration's name, so a caller can tell what a run would execute. */
     fun loadedConfigurationName(): String? = _selectedConfig.value?.name
 
+    /**
+     * Start or resume execution.
+     */
     fun startExecution() {
+        if (_executionStatus.value == ExecutionStatus.EXECUTING ||
+            _executionStatus.value == ExecutionStatus.LOADING
+        ) {
+            // Reachable from an agent that can call rpa_run in a loop. Without this, a second
+            // start cleared the results mid-run and replaced executionJob WITHOUT cancelling it,
+            // so the old job appended one stale result into the new run and orphaned its tab.
+            addLog(LogLevel.ERROR, "A run is already in progress - stop it before starting another")
+            return
+        }
         val config =
             _selectedConfig.value ?: run {
                 // Was a bare `?: return`, so `rpa_run` reported "Started" while nothing happened
@@ -219,6 +250,10 @@ class RpaengineComponent(
             // Start fresh - create a browser tab first
             _executionStatus.value = ExecutionStatus.LOADING
             _currentActionIndex.value = 0
+            // Stale handles from the previous run: if this run's createBrowserTab returns null,
+            // the log says "simulation mode" while executeAction still drives the OLD tab.
+            browserIntegration = null
+            currentTabId = null
             _executionResults.value = emptyList()
             _executionSummary.value = ExecutionSummary(
                 totalActions = config.actions.size,
@@ -455,19 +490,28 @@ class RpaengineComponent(
                 // typing. `value` names the key, defaulting to Enter.
                 ActionTypes.KEYPRESS -> {
                     val key = action.value?.takeIf { it.isNotBlank() } ?: "Enter"
-                    val dispatch = keyPressScript(key)
+                    val dispatch = "if (el) { el.focus(); }" + keyPressScript(key)
                     val found =
                         if (action.selector.type == SelectorTypes.NONE || action.selector.value.isNullOrBlank()) {
+                            // No selector means "whatever has focus". Nothing is focused right
+                            // after a navigation, which is exactly when a plan says "press
+                            // Enter", so the script reports whether it had a real target
+                            // instead of this branch assuming success.
                             browser.executeJavaScript(
-                                "var el = document.activeElement || document.body; $dispatch true;",
-                            )
-                            true
+                                "var el = document.activeElement; $dispatch landed;",
+                            ).isJsTrue()
                         } else {
-                            browser.elementScript(action.selector, "el.focus(); $dispatch")
+                            browser.elementScript(action.selector, dispatch)
                                 ?: return Pair(false, unsupportedSelector(action.selector))
                         }
                     delay(ACTION_SETTLE_MS)
-                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                    if (found) {
+                        Pair(true, null)
+                    } else if (action.selector.value.isNullOrBlank()) {
+                        Pair(false, "Nothing was focused to receive the '$key' key")
+                    } else {
+                        Pair(false, "No element matched ${action.selector.value}")
+                    }
                 }
                 ActionTypes.SUBMIT -> {
                     // requestSubmit fires validation and submit handlers the way a real click
@@ -530,68 +574,59 @@ class RpaengineComponent(
      * raw produced `document.querySelector('input[name='q']')` - a syntax error. XPath is worse,
      * since `//div[@role='tab']` is full of quotes.
      */
+    /**
+     * Run [body] against the element [selector] names.
+     *
+     * Returns null when the selector cannot be resolved at all, false when it resolved but
+     * nothing matched, true when [body] ran. Those three are reported differently, so they must
+     * stay distinct - see [locateExpression].
+     */
     private suspend fun BrowserIntegration.elementScript(
         selector: SelectorInfo,
         body: String,
     ): Boolean? {
-        val value = selector.value
-        val locate =
-            when (selector.type) {
-                SelectorTypes.ID -> "document.getElementById(${value.orEmpty().asJsString()})"
-                SelectorTypes.CSS -> "document.querySelector(${value.orEmpty().asJsString()})"
-                SelectorTypes.XPATH ->
-                    "document.evaluate(${value.orEmpty().asJsString()}, document, null, " +
-                        "XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue"
-                SelectorTypes.TEXT -> textSelectorScript(value.orEmpty())
-                else -> return null
+        val primary = locateExpression(selector) ?: return null
+        // A tag-qualified CSS selector gets its tag dropped as an alternative in the SAME probe.
+        // Two sequential 5s deadlines made every miss cost 10s, and the fallback could only win
+        // after the primary had exhausted its own - so it is an alternative, not a retry.
+        val stripped = selector.value.orEmpty().stripTagQualifier()
+        val fallback =
+            if (selector.type == SelectorTypes.CSS && stripped != selector.value) {
+                "document.querySelector(${stripped.asJsString()})"
+            } else {
+                null
             }
-        if (value.isNullOrBlank()) return null
-        // null means "this selector cannot be resolved at all"; false means "resolved, no match".
-        // Callers report those differently, so the fallback must not collapse them.
-        if (awaitElement(locate, body)) return true
-        return cssTagFallback(selector, body)
+        val locate = if (fallback == null) primary else "($primary) || ($fallback)"
+        if (!awaitElement(locate)) return false
+        if (fallback != null && !matches(primary)) {
+            addLog(
+                LogLevel.WARNING,
+                "Selector '${selector.value}' matched nothing; used '$stripped' instead",
+            )
+        }
+        return executeJavaScript("var el = $locate; if (el) { $body } !!el;").isJsTrue()
     }
 
     /**
-     * Run [body] against the first element [locate] resolves to, polling until it appears.
+     * Poll until [locate] resolves to an element, or the timeout expires.
      *
-     * A single attempt right after a navigation is a race: the page can be `readyState`
-     * complete and still be swapping in the widget the plan targets. Returns false when the
-     * element never appeared.
+     * Existence only: this must never carry the action's body. Probe and mutation used to be one
+     * script, so an eval whose completion value did not come back - a body that threw, or a click
+     * that navigated and tore down the frame - re-ran the mutation on every poll, turning one
+     * submit into fifty.
      */
-    private suspend fun BrowserIntegration.awaitElement(
-        locate: String,
-        body: String,
-    ): Boolean {
+    private suspend fun BrowserIntegration.awaitElement(locate: String): Boolean {
         val deadline = Clock.System.now().toEpochMilliseconds() + ELEMENT_TIMEOUT_MS
         while (true) {
-            val result = executeJavaScript("var el = $locate; if (el) { $body } !!el;")
-            if (result == true || result == "true") return true
+            if (matches(locate)) return true
             if (Clock.System.now().toEpochMilliseconds() >= deadline) return false
             delay(ELEMENT_POLL_MS)
         }
     }
 
-    /**
-     * Retry a tag-qualified CSS selector with the tag dropped: `input[name='q']` -> `[name='q']`.
-     *
-     * Generated plans guess the tag, and the guess is often wrong in a way the attributes are
-     * not - Google's search box is a `textarea[name='q']`, so `input[name='q']` matched nothing
-     * on a page that had loaded perfectly. The retry is logged, so a plan running on a fallback
-     * is visible rather than silently different.
-     */
-    private suspend fun BrowserIntegration.cssTagFallback(
-        selector: SelectorInfo,
-        body: String,
-    ): Boolean {
-        if (selector.type != SelectorTypes.CSS) return false
-        val raw = selector.value.orEmpty()
-        val stripped = raw.stripTagQualifier()
-        if (stripped == raw) return false
-        if (!awaitElement("document.querySelector(${stripped.asJsString()})", body)) return false
-        addLog(LogLevel.WARNING, "Selector '$raw' matched nothing; used '$stripped' instead")
-        return true
-    }
+    /** True when [locate] currently resolves to an element. Side-effect free. */
+    private suspend fun BrowserIntegration.matches(locate: String): Boolean =
+        executeJavaScript("!!($locate);").isJsTrue()
 
     private fun unsupportedSelector(selector: SelectorInfo): String =
         "Cannot resolve a '${selector.type}' selector" +

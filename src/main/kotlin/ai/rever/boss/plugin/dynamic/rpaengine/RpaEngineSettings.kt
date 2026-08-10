@@ -102,6 +102,20 @@ class RpaEngineSettingsManager {
     }
 
     /**
+     * Whether [path] sits in a directory BOSS owns, as opposed to `~/Downloads`.
+     *
+     * Anything writable by a download is not a trustworthy source for an agent-selected plan:
+     * configurations can carry `run_script` actions, which execute arbitrary JavaScript in a tab
+     * holding the user's session.
+     */
+    fun isManagedPath(path: String): Boolean {
+        val file = File(path).canonicalFile
+        return listOf(configDir, rpaRecorderConfigDir).any { dir ->
+            runCatching { file.startsWith(dir.canonicalFile) }.getOrDefault(false)
+        }
+    }
+
+    /**
      * Find all available RPA configuration files.
      *
      * Sources, newest first: the engine's own config directory, the RPA Recorder's saved
@@ -115,7 +129,7 @@ class RpaEngineSettingsManager {
 
         collectFrom(configDir, configs) { it.extension == "json" && it.name != SETTINGS_FILE_NAME }
         collectFrom(rpaRecorderConfigDir, configs) { it.extension == "json" }
-        collectFrom(downloadsDir, configs) { it.extension == "json" && it.name.contains("rpa") }
+        collectFrom(downloadsDir, configs) { it.extension == "json" && it.name.contains("rpa", ignoreCase = true) }
 
         // Sort by last modified (newest first)
         return configs.sortedByDescending { it.lastModified }

@@ -18,14 +18,15 @@ class TextSelectorScriptTest {
     }
 
     @Test
-    fun `takes the deepest match, not the first`() {
-        // Ancestors come first in document order, so indexing from the front is the bug.
+    fun `drops matches that contain another match`() {
+        // The wrapper bug is ancestors, and ancestors are exactly the matches containing another
+        // match. Taking the *last* match would also drop them, but a label occurring twice on the
+        // page (nav and card) makes "last" a different element rather than a deeper one - so the
+        // ancestors are excluded explicitly and first-occurrence order is kept.
         val js = textSelectorScript("Images")
-        assertTrue(js.contains("all[all.length - 1]"), "does not take the deepest match: $js")
-        assertTrue(
-            js.contains("clickable[clickable.length - 1]"),
-            "does not take the deepest clickable match: $js",
-        )
+        assertTrue(js.contains("n.contains(m)"), "does not exclude ancestors: $js")
+        assertTrue(js.contains("leaves[0]"), "does not keep first-occurrence order: $js")
+        assertTrue(js.contains("clickable[0]"), "does not prefer the first clickable leaf: $js")
     }
 
     @Test

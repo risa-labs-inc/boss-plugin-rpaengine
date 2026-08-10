@@ -170,9 +170,9 @@ object SpeedPresets {
     }
 }
 
-/**
- * Selector types
- */
+/** A leading tag name in front of an attribute predicate: the `input` of `input[name=q]`. */
+private val TAG_QUALIFIED_ATTRIBUTE = Regex("""^[a-zA-Z][a-zA-Z0-9]*(?=\[)""")
+
 /**
  * Renders [this] as a JavaScript string literal, quotes and all.
  *
@@ -181,6 +181,14 @@ object SpeedPresets {
  * both produced a syntax error when pasted in raw. Escaping backslashes first matters - doing it
  * after would double-escape the ones this adds.
  */
+internal fun String.asJsString(): String =
+    "'" +
+        replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r") +
+        "'"
+
 /**
  * Find the configuration [name] refers to: an exact name wins, otherwise the first
  * case-insensitive substring match.
@@ -189,8 +197,8 @@ object SpeedPresets {
  * (`llm-rpa-open-google-...`), so a substring-only match silently runs a *different*
  * plan than the one that was asked for.
  */
-/** A leading tag name in front of an attribute predicate: the `input` of `input[name=q]`. */
-private val TAG_QUALIFIED_ATTRIBUTE = Regex("""^[a-zA-Z][a-zA-Z0-9]*(?=\[)""")
+internal fun List<ConfigFileInfo>.matchByName(name: String): ConfigFileInfo? =
+    firstOrNull { it.name == name } ?: firstOrNull { it.name.contains(name, ignoreCase = true) }
 
 /**
  * Drop a leading tag name from a CSS selector that also carries an attribute predicate,
@@ -198,6 +206,13 @@ private val TAG_QUALIFIED_ATTRIBUTE = Regex("""^[a-zA-Z][a-zA-Z0-9]*(?=\[)""")
  * no tag to drop, when the tag is not followed by an attribute predicate, or when the
  * selector is a descendant/compound expression where dropping it would change the meaning.
  */
+internal fun String.stripTagQualifier(): String {
+    val trimmed = trim()
+    if (trimmed.contains(' ') || trimmed.contains('>') || trimmed.contains(',')) return this
+    val stripped = trimmed.replaceFirst(TAG_QUALIFIED_ATTRIBUTE, "")
+    return if (stripped == trimmed) this else stripped
+}
+
 /**
  * JS that presses [key] on `el`, and submits the enclosing form when the key is Enter.
  *
@@ -206,33 +221,15 @@ private val TAG_QUALIFIED_ATTRIBUTE = Regex("""^[a-zA-Z][a-zA-Z0-9]*(?=\[)""")
  * still leaves the form unsubmitted. `requestSubmit` supplies the missing default, skipped
  * when a handler called `preventDefault` (the page implements Enter itself) and when there
  * is no form.
- */
-/**
- * JS expression resolving the element whose visible label is [value].
  *
- * There is no DOM API for "the element with this text", so this scans - and the naive scan
- * picks the wrong node. An ancestor shares its descendant's `innerText`, and `querySelectorAll`
- * returns document order, so a wrapper `div` matches *before* the `a` inside it. Clicking that
- * wrapper does nothing at all and still looks like a success: this is how a plan that clicked
- * Google's "Images" tab reported ok while staying on the web-results page.
- *
- * So: among the matches, prefer a genuinely clickable one, else take the deepest, then step to
- * its nearest enclosing or contained anchor/button.
+ * The completion value reports whether the press had somewhere to land: false when the target
+ * is the bare `<body>`, because a plan that says "press Enter" with nothing focused did not do
+ * what it asked for and must not pass.
  */
-internal fun textSelectorScript(value: String): String =
-    "(function () { var t = ${value.asJsString()}; " +
-        "var all = Array.prototype.slice.call(" +
-        "document.querySelectorAll('a,button,input,span,div')).filter(function (n) { " +
-        "return (n.innerText || n.value || '').trim() === t; }); " +
-        "if (!all.length) { return null; } " +
-        "var clickable = all.filter(function (n) { " +
-        "return n.tagName === 'A' || n.tagName === 'BUTTON' || n.tagName === 'INPUT'; }); " +
-        "var el = clickable.length ? clickable[clickable.length - 1] : all[all.length - 1]; " +
-        "return (el.closest && el.closest('a,button')) || el.querySelector('a,button') || el; })()"
-
 internal fun keyPressScript(key: String): String {
     val press =
-        "var ev = new KeyboardEvent('keydown', { key: ${key.asJsString()}, bubbles: true, " +
+        "var landed = !!(el && el !== document.body); " +
+            "var ev = new KeyboardEvent('keydown', { key: ${key.asJsString()}, bubbles: true, " +
             "cancelable: true }); el.dispatchEvent(ev); " +
             "['keypress','keyup'].forEach(function (t) { " +
             "el.dispatchEvent(new KeyboardEvent(t, { key: ${key.asJsString()}, bubbles: true, " +
@@ -243,24 +240,65 @@ internal fun keyPressScript(key: String): String {
         "if (el.form.requestSubmit) { el.form.requestSubmit(); } else { el.form.submit(); } }"
 }
 
-internal fun String.stripTagQualifier(): String {
-    val trimmed = trim()
-    if (trimmed.contains(' ') || trimmed.contains('>') || trimmed.contains(',')) return this
-    val stripped = trimmed.replaceFirst(TAG_QUALIFIED_ATTRIBUTE, "")
-    return if (stripped == trimmed) this else stripped
+/**
+ * JS expression resolving the element whose visible label is [value].
+ *
+ * There is no DOM API for "the element with this text", so this scans - and the naive scan
+ * picks the wrong node. An ancestor shares its descendant's `innerText`, and `querySelectorAll`
+ * returns document order, so a wrapper `div` matches *before* the `a` inside it. Clicking that
+ * wrapper does nothing at all and still looks like a success: this is how a plan that clicked
+ * Google's "Images" tab reported ok while staying on the web-results page.
+ *
+ * So: drop any match that contains another match (those are the wrappers), then prefer a
+ * clickable leaf, then step to the nearest enclosing or contained anchor. Dropping ancestors is
+ * not the same as taking the *last* match - a label that occurs twice on the page ("Images" in
+ * the nav and again in a card) would make "last" a different element rather than a deeper one,
+ * so first-occurrence order is kept.
+ */
+internal fun textSelectorScript(value: String): String =
+    "(function () { var t = ${value.asJsString()}; " +
+        "var all = Array.prototype.slice.call(" +
+        "document.querySelectorAll('a,button,input,span,div')).filter(function (n) { " +
+        "return (n.innerText || n.value || '').trim() === t; }); " +
+        "var leaves = all.filter(function (n) { return !all.some(function (m) { " +
+        "return m !== n && n.contains(m); }); }); " +
+        "if (!leaves.length) { return null; } " +
+        "var clickable = leaves.filter(function (n) { " +
+        "return n.tagName === 'A' || n.tagName === 'BUTTON' || n.tagName === 'INPUT'; }); " +
+        "var el = clickable.length ? clickable[0] : leaves[0]; " +
+        "return (el.closest && el.closest('a,button')) || el.querySelector('a,button') || el; })()"
+
+/**
+ * Whether a JS eval result is truthy.
+ *
+ * The browser bridge hands back `true` for a boolean and `"true"` for a stringified one
+ * depending on the value's type, so every call site had to test both and one that tests only
+ * `== true` silently reads every success as a failure.
+ */
+internal fun Any?.isJsTrue(): Boolean = this == true || this == "true"
+
+/**
+ * The JS expression that resolves [selector] to an element, or null when this selector cannot be
+ * resolved at all (an unknown type, or no value).
+ *
+ * Kept separate from executing anything so the "unresolvable" case is a pure, testable decision.
+ * Callers distinguish it from "resolved but nothing matched", and collapsing the two turns a
+ * precise "no element matched X" back into a useless "cannot resolve a css selector".
+ */
+internal fun locateExpression(selector: SelectorInfo): String? {
+    val value = selector.value?.takeIf { it.isNotBlank() } ?: return null
+    return when (selector.type) {
+        SelectorTypes.ID -> "document.getElementById(${value.asJsString()})"
+        SelectorTypes.CSS -> "document.querySelector(${value.asJsString()})"
+        SelectorTypes.XPATH ->
+            "document.evaluate(${value.asJsString()}, document, null, " +
+                "XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue"
+        SelectorTypes.TEXT -> textSelectorScript(value)
+        else -> null
+    }
 }
 
-internal fun List<ConfigFileInfo>.matchByName(name: String): ConfigFileInfo? =
-    firstOrNull { it.name == name } ?: firstOrNull { it.name.contains(name, ignoreCase = true) }
-
-internal fun String.asJsString(): String =
-    "'" +
-        replace("\\", "\\\\")
-            .replace("'", "\\'")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r") +
-        "'"
-
+/** Selector types */
 object SelectorTypes {
     const val ID = "id"
     const val CSS = "css"

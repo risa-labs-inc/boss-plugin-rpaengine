@@ -2,7 +2,9 @@ package ai.rever.boss.plugin.dynamic.rpaengine
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * [matchByName] backs the `rpa_load` MCP tool. The cases that matter are the ones where a
@@ -15,9 +17,10 @@ class ConfigMatchTest {
 
     @Test
     fun `exact name wins over an earlier substring match`() {
-        val configs = listOf(config("llm-rpa-open-google-and-search"), config("cats"))
-        // "cats" is a substring of nothing here, but it IS positioned after a longer entry:
-        // a substring-first implementation returns the first element instead.
+        // The earlier entry must actually CONTAIN the query, otherwise a substring-first
+        // implementation finds nothing on its first pass and returns the exact match anyway -
+        // passing the mutation this test exists to catch.
+        val configs = listOf(config("cats-and-dogs"), config("cats"))
         assertEquals("cats", configs.matchByName("cats")?.name)
     }
 
@@ -94,5 +97,68 @@ class StripTagQualifierTest {
     @Test
     fun `handles a tag with digits`() {
         assertEquals("[role='heading']", "h2[role='heading']".stripTagQualifier())
+    }
+}
+
+/**
+ * The `null` vs `false` split that AGENTS.md names as the thing a future change is most likely to
+ * collapse. [locateExpression] is the pure half: null means "this selector cannot be resolved at
+ * all", and everything else is a probe that may or may not match.
+ */
+class LocateExpressionTest {
+
+    private fun selector(type: String, value: String?) = SelectorInfo(type = type, value = value)
+
+    @Test
+    fun `an unknown selector type is unresolvable`() {
+        assertNull(locateExpression(selector("magic", "anything")))
+    }
+
+    @Test
+    fun `a none selector is unresolvable`() {
+        assertNull(locateExpression(selector(SelectorTypes.NONE, "ignored")))
+    }
+
+    @Test
+    fun `a blank or missing value is unresolvable, whatever the type`() {
+        assertNull(locateExpression(selector(SelectorTypes.CSS, null)))
+        assertNull(locateExpression(selector(SelectorTypes.CSS, "   ")))
+        assertNull(locateExpression(selector(SelectorTypes.ID, "")))
+    }
+
+    @Test
+    fun `each supported type resolves to its own DOM call`() {
+        assertTrue(locateExpression(selector(SelectorTypes.ID, "q"))!!.contains("getElementById"))
+        assertTrue(locateExpression(selector(SelectorTypes.CSS, "[name='q']"))!!.contains("querySelector"))
+        assertTrue(locateExpression(selector(SelectorTypes.XPATH, "//a"))!!.contains("document.evaluate"))
+        assertTrue(locateExpression(selector(SelectorTypes.TEXT, "Images"))!!.contains("innerText"))
+    }
+
+    @Test
+    fun `the value is escaped into the expression`() {
+        val js = locateExpression(selector(SelectorTypes.CSS, "[name='q']"))!!
+        assertTrue(js.contains("\\'"), "quotes must be escaped: $js")
+    }
+}
+
+/**
+ * The browser bridge returns `true` for a boolean and `"true"` for a stringified one, so a call
+ * site testing only `== true` reads every success as a failure.
+ */
+class IsJsTrueTest {
+
+    @Test
+    fun `accepts both shapes the bridge returns`() {
+        assertTrue(true.isJsTrue())
+        assertTrue("true".isJsTrue())
+    }
+
+    @Test
+    fun `rejects falsehood, null and anything else`() {
+        assertFalse(false.isJsTrue())
+        assertFalse("false".isJsTrue())
+        assertFalse(null.isJsTrue())
+        assertFalse("".isJsTrue())
+        assertFalse(1.isJsTrue())
     }
 }
