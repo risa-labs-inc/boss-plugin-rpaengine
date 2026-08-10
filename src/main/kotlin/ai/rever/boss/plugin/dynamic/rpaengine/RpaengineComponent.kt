@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -212,7 +213,9 @@ class RpaengineComponent(
         // One scan for both the match and the miss report: two calls walked three directories
         // twice and logged "Found N configuration(s)" twice for every miss.
         val all = refreshConfigurations()
-        val (managed, unmanaged) = all.partition { settingsManager.isManagedPath(it.path) }
+        // Roots resolved once for the whole scan, not per candidate.
+        val roots = settingsManager.managedRoots()
+        val (managed, unmanaged) = all.partition { settingsManager.isManagedPath(it.path, roots) }
         managed.matchByName(name)?.let { match ->
             return if (loadConfigurationNow(match)) {
                 LoadOutcome.Loaded(match.name)
@@ -482,7 +485,7 @@ class RpaengineComponent(
                     // Assigning location.href to a javascript: URL executes it in the page.
                     // `run_script` is a declared verb, so this is not a new capability - but a
                     // navigate step should navigate, and nothing should smuggle script through it.
-                    if (NAVIGABLE_SCHEME.matchEntire(url.trim()) == null) {
+                    if (!isNavigableUrl(url)) {
                         return Pair(false, "Refusing to navigate to '$url' (http, https or about only)")
                     }
                     browser.executeJavaScript("window.location.href = ${url.asJsString()};")
@@ -490,62 +493,75 @@ class RpaengineComponent(
                     Pair(true, null)
                 }
                 ActionTypes.CLICK -> {
-                    val found = browser.elementScript(action.selector, "el.click();")
-                        ?: return Pair(false, unsupportedSelector(action.selector))
+                    val outcome =
+                        browser.runOn(
+                            action.selector,
+                            "el.click();",
+                            "No element matched ${action.selector.value}",
+                        ) ?: return Pair(false, unsupportedSelector(action.selector))
                     delay(ACTION_SETTLE_MS)
-                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                    outcome
                 }
                 ActionTypes.INPUT -> {
                     val value = action.value ?: ""
-                    val found =
-                        browser.elementScript(
+                    // Reports whether the value actually took. `el.value = x` on a contenteditable
+                    // div or any non-form element a plan guessed sets an expando property: nothing
+                    // visible happens and existence alone would call that a success.
+                    val outcome =
+                        browser.runOn(
                             action.selector,
-                            "el.focus(); el.value = ${value.asJsString()}; " +
-                                "el.dispatchEvent(new Event('input', { bubbles: true })); " +
-                                "el.dispatchEvent(new Event('change', { bubbles: true }));",
+                            typeValueScript(value),
+                            "Could not type into '${action.selector.value}' (no match, or it has no value)",
                         ) ?: return Pair(false, unsupportedSelector(action.selector))
                     delay(INPUT_SETTLE_MS)
-                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                    outcome
                 }
                 ActionTypes.SELECT -> {
                     val value = action.value ?: ""
-                    val found =
-                        browser.elementScript(
+                    // Assigning an unmatched value to a <select> leaves it unchanged per spec, and
+                    // `change` still fires - so existence reported ok for a selection that never
+                    // happened. Matches by label as well as value, because a plan names what the
+                    // user sees (same reasoning as TEXT_CANDIDATE_TAGS).
+                    val outcome =
+                        browser.runOn(
                             action.selector,
-                            "el.value = ${value.asJsString()}; " +
-                                "el.dispatchEvent(new Event('change', { bubbles: true }));",
+                            selectOptionScript(value),
+                            "No option '$value' in '${action.selector.value}'",
                         ) ?: return Pair(false, unsupportedSelector(action.selector))
                     delay(INPUT_SETTLE_MS)
-                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                    outcome
                 }
                 // Enter in a search field is how most of the web is driven, so this is not an
                 // exotic verb - its absence is why a generated "search for X" plan stopped at
                 // typing. `value` names the key, defaulting to Enter.
                 ActionTypes.KEYPRESS -> {
                     val key = action.value?.takeIf { it.isNotBlank() } ?: "Enter"
-                    val dispatch = "if (el) { el.focus(); }" + keyPressScript(key)
-                    val found =
+                    val dispatch = "el.focus(); " + keyPressScript(key)
+                    val outcome =
                         if (action.selector.type == SelectorTypes.NONE || action.selector.value.isNullOrBlank()) {
                             // No selector means "whatever has focus". Nothing is focused right
                             // after a navigation, which is exactly when a plan says "press
                             // Enter", so the script reports whether it had a real target
                             // instead of this branch assuming success.
-                            browser.executeJavaScript(
-                                "(function () { var el = document.activeElement; " +
-                                    "$dispatch return landed; })();",
-                            ).isJsTrue()
+                            val landed =
+                                browser.executeJavaScript(
+                                    "(function () { var el = document.activeElement; " +
+                                        "if (!el) { return false; } $dispatch return landed; })();",
+                                ).isJsTrue()
+                            if (landed) {
+                                Pair(true, null)
+                            } else {
+                                Pair(false, "Nothing was focused to receive the '$key' key")
+                            }
                         } else {
-                            browser.elementScript(action.selector, dispatch)
-                                ?: return Pair(false, unsupportedSelector(action.selector))
+                            browser.runOn(
+                                action.selector,
+                                dispatch,
+                                "No element matched ${action.selector.value}",
+                            ) ?: return Pair(false, unsupportedSelector(action.selector))
                         }
                     delay(ACTION_SETTLE_MS)
-                    if (found) {
-                        Pair(true, null)
-                    } else if (action.selector.value.isNullOrBlank()) {
-                        Pair(false, "Nothing was focused to receive the '$key' key")
-                    } else {
-                        Pair(false, "No element matched ${action.selector.value}")
-                    }
+                    outcome
                 }
                 ActionTypes.SUBMIT -> {
                     // requestSubmit fires validation and submit handlers the way a real click
@@ -553,34 +569,67 @@ class RpaengineComponent(
                     val script =
                         "var f = el.form || el; " +
                             "if (f.requestSubmit) { f.requestSubmit(); } else { f.submit(); }"
-                    val found = browser.elementScript(action.selector, script)
-                        ?: return Pair(false, unsupportedSelector(action.selector))
+                    val outcome =
+                        browser.runOn(
+                            action.selector,
+                            script,
+                            "No element matched ${action.selector.value}",
+                        ) ?: return Pair(false, unsupportedSelector(action.selector))
                     delay(NAVIGATE_SETTLE_MS)
-                    if (found) Pair(true, null) else Pair(false, "No element matched ${action.selector.value}")
+                    outcome
                 }
                 ActionTypes.RUN_SCRIPT -> {
                     val script = action.value ?: return Pair(false, "No script specified")
-                    browser.executeJavaScript(script)
+                    // Wrapped so a throwing script is a failure rather than a silent pass: the
+                    // bridge may surface an eval error as a returned value rather than an
+                    // exception, and this branch used to discard the result entirely.
+                    val outcome =
+                        browser.executeJavaScript(
+                            "(function () { try { $script; return true; } " +
+                                "catch (e) { return 'threw: ' + e.message; } })();",
+                        )
                     delay(ACTION_SETTLE_MS)
-                    Pair(true, null)
+                    if (outcome.isJsTrue()) Pair(true, null) else Pair(false, "Script failed: $outcome")
                 }
                 ActionTypes.WAIT -> {
-                    val waitTime = action.value?.toLongOrNull() ?: DEFAULT_WAIT_MS
-                    delay(waitTime)
+                    val raw = action.value
+                    val waitTime = raw?.toLongOrNull()
+                    if (raw != null && waitTime == null) {
+                        // "3s" and "3000ms" silently became the default, so a plan asking for a
+                        // long settle got one second and no indication why.
+                        addLog(LogLevel.WARNING, "Wait value '$raw' is not a number of ms; using $DEFAULT_WAIT_MS")
+                    }
+                    delay(waitTime ?: DEFAULT_WAIT_MS)
                     Pair(true, null)
                 }
                 ActionTypes.SCROLL -> {
-                    val coords = action.value?.split(",")?.map { it.trim().toIntOrNull() ?: 0 }
+                    val parts = action.value?.split(",")?.map { it.trim() }
+                    val coords = parts?.map { it.toIntOrNull() }
+                    if (coords?.any { it == null } == true) {
+                        // An unparseable coordinate became 0, so "scroll to 500" scrolled to the
+                        // top and reported ok.
+                        addLog(LogLevel.WARNING, "Scroll value '${action.value}' is not 'x,y'; using 0 for the rest")
+                    }
                     val x = coords?.getOrNull(0) ?: 0
                     val y = coords?.getOrNull(1) ?: 0
-                    browser.executeJavaScript("window.scrollTo($x, $y);")
+                    browser.executeJavaScript("window.scrollTo(${x ?: 0}, ${y ?: 0});")
                     delay(ACTION_SETTLE_MS)
                     Pair(true, null)
                 }
                 ActionTypes.ASSERT -> {
-                    val found = browser.elementScript(action.selector, "")
+                    // An assert used to pass on mere existence, dropping `value` silently - so a
+                    // plan asserting the wrong text passed, which is the same silent success as
+                    // everything else here.
+                    val expected = action.value?.takeIf { it.isNotBlank() }
+                    val body = if (expected == null) "" else assertTextScript(expected)
+                    val failure =
+                        if (expected == null) {
+                            "Assertion failed: element not found"
+                        } else {
+                            "Assertion failed: '${action.selector.value}' does not contain '$expected'"
+                        }
+                    browser.runOn(action.selector, body, failure)
                         ?: return Pair(false, unsupportedSelector(action.selector))
-                    if (found) Pair(true, null) else Pair(false, "Assertion failed: element not found")
                 }
                 // Declared in ActionTypes but not doable through `executeJavaScript`, which is the
                 // only thing BrowserIntegration offers: a screenshot needs host capture, and
@@ -591,32 +640,50 @@ class RpaengineComponent(
                     Pair(false, "'${action.type}' is not supported when driving a real browser")
                 else -> Pair(false, "Unknown action type '${action.type}'")
             }
+        } catch (e: CancellationException) {
+            // Must come first: CancellationException is a RuntimeException, and every verb has a
+            // delay() inside this try - so a cancelled job almost always resumes *into* the catch
+            // below. Swallowed, `rpa_stop` appended a phantom FAILED action and left the status
+            // ERROR, and a resume was killed by the cancelled job's resumption setting ERROR
+            // before the new one could start.
+            throw e
         } catch (e: Exception) {
             Pair(false, "Error executing action: ${e.message}")
         }
     }
 
     /**
-     * Run [body] against the first element [selector] names.
+     * Run [body] against the first element [selector] names, and report what happened.
      *
-     * Returns null when the selector kind is one this engine cannot resolve, false when it
-     * resolved but nothing matched, true when [body] ran. All three are reported differently, so
-     * they must stay distinct - see [locateExpression]. The old code had no such distinction: an
-     * unresolvable selector hit `else -> "// No selector specified"` and reported success.
+     * Returns null when the selector kind is one this engine cannot resolve, so the caller fails
+     * with a message rather than silently doing nothing - which is what the old
+     * `else -> "// No selector specified"` did, while still reporting success.
+     *
+     * Otherwise the outcome distinguishes four cases, because collapsing them sends the reader
+     * hunting for the wrong thing:
+     *  - the body ran: success.
+     *  - the body threw: the failure names the exception, not the selector.
+     *  - the body returned false, meaning its own check failed (the value did not take, no such
+     *    option): [onFailure].
+     *  - no completion value came back at all: success. Existence was just proven by
+     *    [awaitElement], so this is a click or submit that navigated and tore the frame down
+     *    before the value returned - failing it would fail the step that actually worked and stop
+     *    the run right at the point it succeeded.
      *
      * Every value crosses into JavaScript through [asJsString]. That is not defensive tidying: a
      * generated plan's very first selector is typically `input[name='q']`, and interpolating it
      * raw produced `document.querySelector('input[name='q']')` - a syntax error. XPath is worse,
      * since `//div[@role='tab']` is full of quotes.
      */
-    private suspend fun BrowserIntegration.elementScript(
+    private suspend fun BrowserIntegration.runOn(
         selector: SelectorInfo,
         body: String,
-    ): Boolean? {
+        onFailure: String,
+    ): Pair<Boolean, String?>? {
         val primary = locateExpression(selector) ?: return null
         // A tag-qualified CSS selector gets its tag dropped as an alternative in the SAME probe.
-        // Two sequential 5s deadlines made every miss cost 10s, and the fallback could only win
-        // after the primary had exhausted its own - so it is an alternative, not a retry.
+        // Two sequential deadlines made every miss cost 10s and let the fallback win only after
+        // the primary had exhausted its own - so it is an alternative, not a retry.
         val stripped = selector.value.orEmpty().stripTagQualifier()
         val fallback =
             if (selector.type == SelectorTypes.CSS && stripped != selector.value) {
@@ -625,18 +692,26 @@ class RpaengineComponent(
                 null
             }
         val locate = if (fallback == null) primary else "($primary) || ($fallback)"
-        if (!awaitElement(locate)) return false
+        if (!awaitElement(locate)) return Pair(false, onFailure)
         if (fallback != null && !matches(primary)) {
             addLog(
                 LogLevel.WARNING,
                 "Selector '${selector.value}' matched nothing; used '$stripped' instead",
             )
         }
-        // Wrapped: `var` at eval top level lands on the page's global object, so `el`/`ev`/`f`
-        // would clobber a page's own globals of those names.
-        return executeJavaScript(
-            "(function () { var el = $locate; if (el) { $body } return !!el; })();",
-        ).isJsTrue()
+        // Wrapped: `var` at eval top level lands on the page's global object, so `el` would
+        // clobber a page global of that name.
+        val outcome =
+            executeJavaScript(
+                "(function () { var el = $locate; if (!el) { return false; } " +
+                    "try { $body } catch (e) { return 'threw: ' + e.message; } return true; })();",
+            )
+        return when {
+            outcome.isJsTrue() -> Pair(true, null)
+            outcome is String && outcome.startsWith("threw: ") -> Pair(false, outcome)
+            outcome == false || outcome == "false" -> Pair(false, onFailure)
+            else -> Pair(true, null)
+        }
     }
 
     /**
@@ -646,13 +721,19 @@ class RpaengineComponent(
      * script, so an eval whose completion value did not come back - a body that threw, or a click
      * that navigated and tore down the frame - re-ran the mutation on every poll, turning one
      * submit into fifty.
+     *
+     * The interval backs off. A `text` selector resolves by scanning twelve tag names, so a miss
+     * at a flat 100ms was fifty full sweeps of the document; backing off costs a little latency on
+     * a slow-appearing element and roughly quarters that.
      */
     private suspend fun BrowserIntegration.awaitElement(locate: String): Boolean {
         val deadline = Clock.System.now().toEpochMilliseconds() + ELEMENT_TIMEOUT_MS
+        var interval = ELEMENT_POLL_MS
         while (true) {
             if (matches(locate)) return true
             if (Clock.System.now().toEpochMilliseconds() >= deadline) return false
-            delay(ELEMENT_POLL_MS)
+            delay(interval)
+            interval = (interval * 2).coerceAtMost(ELEMENT_POLL_MAX_MS)
         }
     }
 
@@ -731,8 +812,6 @@ class RpaengineComponent(
         /** A `wait` action with no parseable value. */
         const val DEFAULT_WAIT_MS = 1000L
 
-        /** Schemes a `navigate` action may use. */
-        val NAVIGABLE_SCHEME = Regex("^(?:https?://|about:)\\S*", RegexOption.IGNORE_CASE)
 
         /**
          * How long to keep looking for an element before calling the action failed.
@@ -743,5 +822,8 @@ class RpaengineComponent(
          */
         const val ELEMENT_TIMEOUT_MS = 5_000L
         const val ELEMENT_POLL_MS = 100L
+
+        /** The poll interval doubles up to this, so a miss is not fifty full document sweeps. */
+        const val ELEMENT_POLL_MAX_MS = 500L
     }
 }

@@ -108,13 +108,32 @@ class RpaEngineSettingsManager {
      * configurations can carry `run_script` actions, which execute arbitrary JavaScript in a tab
      * holding the user's session.
      */
-    fun isManagedPath(path: String): Boolean =
+    fun isManagedPath(path: String): Boolean = isManagedPath(path, managedRoots())
+
+    /**
+     * As [isManagedPath], against an explicit set of roots.
+     *
+     * The roots are a parameter so this is testable without touching the real home directory, and
+     * so a scan can resolve them once instead of per candidate - the `configDir` getter runs
+     * `exists()` + `mkdirs()`, which is a poor thing to hide inside a security predicate called in
+     * a loop.
+     *
+     * `File.startsWith` compares path *components*, so a sibling named `rpaengine-evil` is
+     * correctly rejected. Do not turn it into a string prefix.
+     */
+    fun isManagedPath(path: String, roots: List<File>): Boolean =
         // canonicalFile is what throws (IOException), not startsWith - so it has to be inside.
         // Fail closed: a path that cannot be canonicalised is not one to hand an agent.
         runCatching {
             val file = File(path).canonicalFile
-            listOf(configDir, rpaRecorderConfigDir).any { dir -> file.startsWith(dir.canonicalFile) }
+            roots.any { dir -> file.startsWith(dir) }
         }.getOrDefault(false)
+
+    /** The canonical directories BOSS owns, resolved once. */
+    fun managedRoots(): List<File> =
+        listOf(configDir, rpaRecorderConfigDir).mapNotNull { dir ->
+            runCatching { dir.canonicalFile }.getOrNull()
+        }
 
     /**
      * Find all available RPA configuration files.

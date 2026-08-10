@@ -13,7 +13,10 @@ import com.arkivanov.essenty.lifecycle.doOnDestroy
 class RpaengineDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.rpaengine"
     override val displayName: String = "RPA Engine (Dynamic)"
-    override val version: String = "1.0.5"
+    // Read from the manifest, which processResources syncs from build.gradle.kts - the single
+    // source of truth. Hardcoded, this said 1.0.5 while the build said 1.2.0, and it drifted
+    // further with every bump because the resource filter does not touch Kotlin sources.
+    override val version: String = manifestVersion()
     override val description: String = "Execute recorded RPA workflows"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-rpaengine"
@@ -49,4 +52,15 @@ class RpaengineDynamicPlugin : DynamicPlugin {
     override fun dispose() {
         lastComponent = null
     }
+
+    private fun manifestVersion(): String =
+        runCatching {
+            javaClass.getResourceAsStream("/META-INF/boss-plugin/plugin.json")
+                ?.bufferedReader()
+                ?.use { reader ->
+                    Regex(""""version"\s*:\s*"([^"]+)"""").find(reader.readText())
+                        ?.groupValues
+                        ?.get(1)
+                }
+        }.getOrNull() ?: "unknown"
 }

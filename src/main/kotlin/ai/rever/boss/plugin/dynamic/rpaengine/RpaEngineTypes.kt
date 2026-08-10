@@ -301,6 +301,59 @@ internal fun visibleQuerySelector(selector: String): String =
         ".find(function (n) { return n.offsetParent !== null; })"
 
 /**
+ * JS body that types [value] into `el` and reports whether it actually took.
+ *
+ * `el.value = x` on a `contenteditable` div, or any non-form element a generated plan guessed at,
+ * silently sets an expando property: nothing visible happens and the element plainly exists, so
+ * checking for existence called that a success. Comparing the value back is the cheapest evidence
+ * that the field really holds what the plan asked for.
+ */
+internal fun typeValueScript(value: String): String =
+    "el.focus(); el.value = ${value.asJsString()}; " +
+        "el.dispatchEvent(new Event('input', { bubbles: true })); " +
+        "el.dispatchEvent(new Event('change', { bubbles: true })); " +
+        "if (el.value !== ${value.asJsString()}) { return false; }"
+
+/**
+ * JS body that selects [value] in `el`, by option value or visible label.
+ *
+ * Assigning a value no option carries leaves a `<select>` unchanged (spec behaviour) while
+ * `change` still fires, so the old version reported a selection that never happened. The label
+ * fallback exists because a plan names what the user sees, the same reasoning as
+ * [TEXT_CANDIDATE_TAGS].
+ */
+internal fun selectOptionScript(value: String): String =
+    "var want = ${value.asJsString()}; " +
+        "var opt = Array.prototype.slice.call(el.options || []).find(function (o) { " +
+        "return o.value === want || (o.text || '').trim() === want; }); " +
+        "if (!opt) { return false; } " +
+        "el.value = opt.value; " +
+        "el.dispatchEvent(new Event('change', { bubbles: true }));"
+
+/**
+ * JS body asserting that `el` contains [expected], as text or as a field value.
+ *
+ * `assert` used to run an empty body, so it passed on the element merely existing and dropped
+ * `value` without a word - a plan asserting the wrong thing passed.
+ */
+internal fun assertTextScript(expected: String): String =
+    "var want = ${expected.asJsString()}; " +
+        "var have = (el.innerText || el.value || el.textContent || ''); " +
+        "if (have.indexOf(want) === -1) { return false; }"
+
+/**
+ * Whether [url] is something a `navigate` action may go to.
+ *
+ * `location.href = 'javascript:...'` executes in the page. `run_script` is a declared verb so this
+ * is not a new capability, but a navigate step should navigate. Case-insensitive and trimmed
+ * because `JavaScript:` and a leading space both survive an exact-match check.
+ */
+internal fun isNavigableUrl(url: String): Boolean =
+    NAVIGABLE_SCHEME.matchEntire(url.trim()) != null
+
+private val NAVIGABLE_SCHEME = Regex("(?:https?://|about:)\\S*", RegexOption.IGNORE_CASE)
+
+/**
  * Whether a JS eval result is truthy.
  *
  * The browser bridge hands back `true` for a boolean and `"true"` for a stringified one

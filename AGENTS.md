@@ -174,3 +174,38 @@ the fixed script returns the `A` carrying `udm=2`; the old one returned a `DIV[r
   fails closed.
 - `navigate` takes http, https and about only. `run_script` is a declared verb so this is not a new
   capability, but a navigate step should navigate, and `location.href = 'javascript:...'` executes.
+
+### Third review round
+
+- **`catch (e: Exception)` must rethrow `CancellationException` first.** It is a `RuntimeException`,
+  and every verb has a `delay()` inside that `try`, so a cancelled job almost always resumed *into*
+  the catch. `rpa_stop` therefore appended a phantom FAILED action, incremented `failedActions` and
+  left the status `ERROR`; a resume was killed by the cancelled job's queued resumption setting
+  `ERROR` before the new job's loop-top check ran. Verified by stopping mid-run: status `IDLE`, two
+  recorded results, no phantom failure.
+- **Pause records a result, so resume must not re-run that action.** The in-flight action completes
+  and appends its result while `_currentActionIndex` still points at it, and `executeActions`
+  resumes from that index - a second result for the same action, double-counted, and a `click`
+  replayed on a page it already navigated away from.
+- **`input` and `select` verify the effect, not the element.** `el.value = x` on a
+  `contenteditable` div sets an expando property; assigning an unmatched value to a `<select>`
+  leaves it unchanged while `change` still fires. Both reported ok. `typeValueScript` compares the
+  value back and `selectOptionScript` requires a matching option (by label as well as value).
+- **`assert` honours its `value`.** It ran an empty body, so it passed on existence and dropped the
+  expected text without a word.
+- **`runOn` distinguishes four outcomes**, because collapsing them misdirects the reader: the body
+  ran; the body threw (name the exception, not the selector); the body's own check returned false
+  (the caller's message); no completion value at all, which after `awaitElement` has proven
+  existence means a click or submit that navigated and tore the frame down - that is a **success**,
+  and failing it stopped runs at the step that actually worked.
+- `run_script` checks its result; `wait` and `scroll` log a WARNING instead of silently coercing an
+  unparseable value; `navigate` uses `isNavigableUrl`, and the poll interval backs off to
+  `ELEMENT_POLL_MAX_MS`.
+- **Both security gates now have tests**, and both needed a fixture chosen to discriminate:
+  `isNavigableUrl`'s trim is only pinned by a *positive* case (rejecting `"  javascript:"` works
+  without it), and `isManagedPath`'s component comparison only by a sibling directory sharing the
+  prefix (`rpaengine-evil`). `isManagedPath` takes its roots as a parameter so it is testable
+  without the real home directory and so a scan resolves them once - the `configDir` getter runs
+  `mkdirs()`, which has no business inside a security predicate called in a loop.
+- The plugin's `version` is read from the manifest. Hardcoded, it said `1.0.5` while the build said
+  `1.2.0`: `processResources` syncs `plugin.json`, never a Kotlin constant.
