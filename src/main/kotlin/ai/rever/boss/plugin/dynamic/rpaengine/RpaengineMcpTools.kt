@@ -75,6 +75,12 @@ internal class RpaengineMcpToolProvider(
                     is RpaengineComponent.LoadOutcome.Failed ->
                         McpToolResult("Found '${outcome.name}' but it did not parse.", isError = true)
 
+                    is RpaengineComponent.LoadOutcome.Busy ->
+                        McpToolResult(
+                            "A run is in progress (status ${outcome.status}) - call rpa_stop first.",
+                            isError = true,
+                        )
+
                     is RpaengineComponent.LoadOutcome.NotManaged ->
                         McpToolResult(
                             "'${outcome.name}' is in ~/Downloads, which this tool will not load - " +

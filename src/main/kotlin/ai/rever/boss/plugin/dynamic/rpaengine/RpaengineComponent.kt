@@ -133,8 +133,14 @@ class RpaengineComponent(
         scope.launch { loadConfigurationNow(configInfo) }
     }
 
-    /** Load [configInfo] and report whether it parsed, for a caller that must await the result. */
-    suspend fun loadConfigurationNow(configInfo: ConfigFileInfo): Boolean {
+    /**
+     * Load [configInfo], reporting why not when it fails.
+     *
+     * Returning a bare Boolean collapsed "a run is in flight" into "it did not parse", so
+     * `rpa_load` during a run told the caller its plan was corrupt - which is the misdirection
+     * [LoadOutcome] exists to remove, and an agent told that will regenerate rather than stop.
+     */
+    suspend fun loadConfigurationNow(configInfo: ConfigFileInfo): LoadResult {
         if (_executionStatus.value == ExecutionStatus.EXECUTING ||
             _executionStatus.value == ExecutionStatus.PAUSED ||
             _executionStatus.value == ExecutionStatus.LOADING
@@ -144,7 +150,7 @@ class RpaengineComponent(
             // append one stale result into the freshly cleared list. LOADING counts because two
             // concurrent rpa_load calls otherwise interleave and the last write wins.
             addLog(LogLevel.ERROR, "A run is in progress - stop it before loading a configuration")
-            return false
+            return LoadResult.Busy(_executionStatus.value)
         }
         _executionStatus.value = ExecutionStatus.LOADING
         addLog(LogLevel.INFO, "Loading configuration: ${configInfo.name}")
@@ -164,7 +170,14 @@ class RpaengineComponent(
             _executionStatus.value = ExecutionStatus.ERROR
             addLog(LogLevel.ERROR, "Failed to load configuration: ${configInfo.name}")
         }
-        return config != null
+        return if (config != null) LoadResult.Loaded else LoadResult.NotParsed
+    }
+
+    /** Why [loadConfigurationNow] did or did not load. */
+    sealed interface LoadResult {
+        data object Loaded : LoadResult
+        data object NotParsed : LoadResult
+        data class Busy(val status: ExecutionStatus) : LoadResult
     }
 
     /**
@@ -195,18 +208,6 @@ class RpaengineComponent(
     }
 
     /**
-     * Load [name] from the available configurations, or return false when there is no such one.
-     *
-     * Exists so a run can be started without a click. Everything else on this path was
-     * reachable - a plan can be generated and written, the engine lists it - and then
-     * [startExecution] returned silently because nothing had selected it.
-     */
-    suspend fun selectConfigurationByName(name: String): Boolean {
-        val match = refreshConfigurations().matchByName(name) ?: return false
-        return loadConfigurationNow(match)
-    }
-
-    /**
      * Load [name] from the configurations BOSS itself manages, refusing anything outside them.
      *
      * This is the agent-reachable entry point, and the scan deliberately includes `~/Downloads`
@@ -223,10 +224,10 @@ class RpaengineComponent(
         val roots = settingsManager.managedRoots()
         val (managed, unmanaged) = all.partition { settingsManager.isManagedPath(it.path, roots) }
         managed.matchByName(name)?.let { match ->
-            return if (loadConfigurationNow(match)) {
-                LoadOutcome.Loaded(match.name)
-            } else {
-                LoadOutcome.Failed(match.name)
+            return when (val result = loadConfigurationNow(match)) {
+                LoadResult.Loaded -> LoadOutcome.Loaded(match.name)
+                LoadResult.NotParsed -> LoadOutcome.Failed(match.name)
+                is LoadResult.Busy -> LoadOutcome.Busy(result.status)
             }
         }
         // A name the user can see in the panel but an agent may not load is a *policy* answer, not
@@ -240,6 +241,7 @@ class RpaengineComponent(
         data class Loaded(val name: String) : LoadOutcome
         data class Failed(val name: String) : LoadOutcome
         data class NotManaged(val name: String) : LoadOutcome
+        data class Busy(val status: ExecutionStatus) : LoadOutcome
         data class NoMatch(val available: List<String>) : LoadOutcome
     }
 
@@ -513,9 +515,29 @@ class RpaengineComponent(
                     if (!isNavigableUrl(url)) {
                         return Pair(false, "Refusing to navigate to '$url' (http, https or about only)")
                     }
-                    browser.executeJavaScript("window.location.href = ${url.asJsString()};")
+                    // Was discarding the result, so a dead tab or a throwing assignment still
+                    // reported ok - in the verb that is action #0 of every plan.
+                    //
+                    // The assignment is all that is checked. Comparing location.href before and
+                    // after looks stronger and is not: the execution tab is *created at* the first
+                    // navigate's URL, so that navigation is legitimately a no-op, and
+                    // "https://www.google.com" vs the browser's "https://www.google.com/" differ by
+                    // a slash - which reported the working step as a failure and stopped the run at
+                    // action #0. A redirect breaks the comparison from the other side.
+                    val assigned =
+                        browser.executeJavaScript(
+                            "(function () { try { window.location.href = ${url.asJsString()}; " +
+                                "return true; } catch (e) { return 'threw: ' + e.message; } })();",
+                        )
                     delay(NAVIGATE_SETTLE_MS)
-                    Pair(true, null)
+                    when {
+                        assigned is String && assigned.startsWith("threw: ") -> Pair(false, assigned)
+                        assigned.isJsTrue() -> Pair(true, null)
+                        // No completion value: the assignment navigated and tore the frame down
+                        // before it could return, which is what a successful navigate looks like.
+                        assigned == null || assigned == "" -> Pair(true, null)
+                        else -> Pair(false, "Could not navigate to '$url': $assigned")
+                    }
                 }
                 ActionTypes.CLICK -> {
                     val outcome =
@@ -619,7 +641,16 @@ class RpaengineComponent(
                                 "catch (e) { return 'threw: ' + e.message; } })();",
                         )
                     delay(ACTION_SETTLE_MS)
-                    if (outcome.isJsTrue()) Pair(true, null) else Pair(false, "Script failed: $outcome")
+                    // Deliberately NOT interpretOutcome's last branch: that one is justified by
+                    // awaitElement having already proven the element exists, and a bare script has
+                    // no such proof - "nothing came back" is genuinely ambiguous here. It stays a
+                    // failure, but says which ambiguity rather than printing `null`.
+                    when {
+                        outcome.isJsTrue() -> Pair(true, null)
+                        outcome == null || outcome == "" ->
+                            Pair(false, "Script returned no completion value; it may have navigated")
+                        else -> Pair(false, "Script failed: $outcome")
+                    }
                 }
                 ActionTypes.WAIT -> {
                     val raw = action.value
@@ -633,18 +664,24 @@ class RpaengineComponent(
                     Pair(true, null)
                 }
                 ActionTypes.SCROLL -> {
-                    val parts = action.value?.split(",")?.map { it.trim() }
-                    val coords = parts?.map { it.toIntOrNull() }
+                    val coords = action.value?.split(",")?.map { it.trim().toIntOrNull() }
                     if (coords?.any { it == null } == true) {
                         // An unparseable coordinate became 0, so "scroll to 500" scrolled to the
                         // top and reported ok.
                         addLog(LogLevel.WARNING, "Scroll value '${action.value}' is not 'x,y'; using 0 for the rest")
                     }
-                    val x = coords?.getOrNull(0) ?: 0
-                    val y = coords?.getOrNull(1) ?: 0
-                    browser.executeJavaScript("window.scrollTo(${x ?: 0}, ${y ?: 0});")
+                    // One coordinate means the y axis. Read as x it parsed cleanly, fired no
+                    // warning, and scrolled the page *sideways* to 500 while staying at the top -
+                    // and "scroll to 500" almost always means down.
+                    val x = if (coords != null && coords.size > 1) coords[0] ?: 0 else 0
+                    val y = (if (coords != null && coords.size > 1) coords[1] else coords?.get(0)) ?: 0
+                    val scrolled =
+                        browser.executeJavaScript(
+                            "(function () { try { window.scrollTo($x, $y); return true; } " +
+                                "catch (e) { return 'threw: ' + e.message; } })();",
+                        )
                     delay(ACTION_SETTLE_MS)
-                    Pair(true, null)
+                    if (scrolled.isJsTrue()) Pair(true, null) else Pair(false, "Could not scroll: $scrolled")
                 }
                 ActionTypes.ASSERT -> {
                     // An assert used to pass on mere existence, dropping `value` silently - so a

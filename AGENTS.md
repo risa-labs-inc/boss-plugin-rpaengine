@@ -242,3 +242,27 @@ skip, and `selectManagedConfigurationByName`'s partition. All three need a fake 
 or an injectable settings root. The JS tests assert on implementation strings, which a refactor
 breaks and a behavioural regression can slip past - a GraalJS harness with a hand-rolled DOM is the
 real answer if the wrapper-vs-anchor and duplicate-label cases ever regress.
+
+### Fifth review round
+
+- **A bare Boolean from `loadConfigurationNow` collapsed "busy" into "did not parse"**, so
+  `rpa_load` during a run told the caller its plan was corrupt - and an agent told that regenerates
+  rather than calling `rpa_stop`. There is a `LoadResult` and a `LoadOutcome.Busy(status)` now.
+- **`navigate` and `scroll` discarded the bridge result entirely**, reporting ok in the verb that is
+  action #0 of every plan.
+- **A one-coordinate `scroll` scrolled the wrong axis.** `"500"` parsed cleanly, so no warning
+  fired, and the page went *sideways* to 500 while staying at the top. One value now means y.
+- **Moving settings IO off Main introduced a lost update.** `updateSettings` is read-modify-write
+  over a shared cache and used to be serialized by the Main dispatcher; three independent
+  `launch { withContext(IO) }` callers could read the same snapshot and the second write drop the
+  first field. Serialized with a lock, and `cachedSettings` is `@Volatile`.
+- `run_script` deliberately does *not* take `interpretOutcome`'s last branch: that branch is
+  justified by `awaitElement` having already proven the element exists, and a bare script has no
+  such proof. It stays a failure, but names the ambiguity instead of printing `null`.
+
+**Verifying `navigate` by comparing `location.href` before and after does not work** - I tried it and
+it failed the working step. The execution tab is *created at* the first navigate's URL, so that
+navigation is legitimately a no-op, and `https://www.google.com` versus the browser's
+`https://www.google.com/` differ by a slash: action #0 of every plan reported
+`Still on '...' after navigating to '...'` and the run stopped there. A redirect breaks the same
+comparison from the other side. Only the assignment is checked.

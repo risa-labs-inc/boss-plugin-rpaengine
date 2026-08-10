@@ -53,12 +53,19 @@ class RpaEngineSettingsManager {
             return File(homeDir, "Downloads")
         }
 
+    /** Guards [cachedSettings] and the read-modify-write in [updateSettings]. */
+    private val settingsLock = Any()
+
+    @Volatile
     private var cachedSettings: RpaEnginePersistedSettings? = null
 
     /**
      * Load settings from disk
      */
-    fun loadSettings(): RpaEnginePersistedSettings {
+    fun loadSettings(): RpaEnginePersistedSettings =
+        synchronized(settingsLock) { loadSettingsLocked() }
+
+    private fun loadSettingsLocked(): RpaEnginePersistedSettings {
         cachedSettings?.let { return it }
 
         return try {
@@ -95,10 +102,20 @@ class RpaEngineSettingsManager {
     /**
      * Update settings
      */
+    /**
+     * Read, transform and write the settings under a lock.
+     *
+     * Read-modify-write over the shared [cachedSettings]. It used to be called synchronously from
+     * the Main dispatcher, which serialized it by construction; once the callers moved to
+     * `Dispatchers.IO` two of them could read the same snapshot and the second write would drop the
+     * first one's field - toggling Human-like while dragging Speed is enough.
+     */
     fun updateSettings(update: (RpaEnginePersistedSettings) -> RpaEnginePersistedSettings) {
-        val current = loadSettings()
-        val updated = update(current)
-        saveSettings(updated)
+        synchronized(settingsLock) {
+            val current = loadSettingsLocked()
+            val updated = update(current)
+            saveSettings(updated)
+        }
     }
 
     /**
