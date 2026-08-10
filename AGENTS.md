@@ -297,3 +297,11 @@ string's `\$` is two characters and `Matcher.replaceAll` treats `\$` as an escap
 it does not: `build/resources/main/.../plugin.json` reads `"version": "1.2.0"`, and so does the jar.
 The committed source still saying `1.0.6` is expected - it is synced at build time and never
 committed.
+
+**The decode side of the cross-plugin contract is this repo's to hold.** LLM RPA writes these files
+with `explicitNulls = false`, which omits a null key entirely, and kotlinx treats a field with no
+default as *required* - so an action with no `selector` (normal for navigate, wait, submit) made the
+whole configuration unreadable and the user saw an empty config rather than an error.
+`RpaActionConfig.selector` is defaulted, and `ConfigurationDecodingTest` decodes the exact shapes
+that writer produces. `RpaConfiguration.name`/`actions` stay required on purpose: they are what tells
+a configuration apart from `settings.json`, which lives in the same scanned directory.

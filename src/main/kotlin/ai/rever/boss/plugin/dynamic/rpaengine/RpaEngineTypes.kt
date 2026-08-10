@@ -53,6 +53,8 @@ data class SelectorInfo(
  */
 @Serializable
 data class RpaConfiguration(
+    // name and actions stay required: they are what distinguishes a configuration from any other
+    // JSON in the scanned directories, and `settings.json` living beside them relies on that.
     val name: String,
     val description: String = "",
     val actions: List<RpaActionConfig>
@@ -66,7 +68,11 @@ data class RpaActionConfig(
     val name: String = "",
     val actionType: String = "default", // default, assertion, screenshot, network, custom
     val type: String, // click, input, navigate, wait, select, scroll, switch_frame, run_script, screenshot, assert
-    val selector: SelectorInfo,
+    // Defaulted so an action with no selector at all - normal for navigate, wait and submit, and
+    // what a writer omits when `explicitNulls = false` drops the key - does not make the whole
+    // configuration unreadable. kotlinx treats a field with no default as required, so the user
+    // would see an empty config rather than an error, which is the failure this plugin is about.
+    val selector: SelectorInfo = SelectorInfo(type = SelectorTypes.NONE),
     val value: String? = null,
     val meta: Map<String, String>? = null
 )
