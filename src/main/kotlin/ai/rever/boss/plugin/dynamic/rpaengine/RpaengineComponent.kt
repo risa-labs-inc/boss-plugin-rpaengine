@@ -393,6 +393,15 @@ class RpaengineComponent(
                 return
             }
 
+            // Pausing only flips the status flag, so the in-flight action runs to completion and
+            // records its result while _currentActionIndex still points at it - and this loop
+            // resumes from that index. Skipping an index that already has a result is what stops
+            // resume re-running it: a second result for the same action, counted twice, and for a
+            // click that navigated, the click replayed on a different page.
+            if (_executionResults.value.any { it.actionIndex == index }) {
+                continue
+            }
+
             _currentActionIndex.value = index
             val action = config.actions[index]
 
