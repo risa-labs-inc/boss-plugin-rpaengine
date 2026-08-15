@@ -13,7 +13,10 @@ import com.arkivanov.essenty.lifecycle.doOnDestroy
 class RpaengineDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.rpaengine"
     override val displayName: String = "RPA Engine (Dynamic)"
-    override val version: String = "1.0.5"
+    // Read from the manifest, which processResources syncs from build.gradle.kts - the single
+    // source of truth. Hardcoded, this said 1.0.5 while the build said 1.2.0, and it drifted
+    // further with every bump because the resource filter does not touch Kotlin sources.
+    override val version: String = manifestVersion()
     override val description: String = "Execute recorded RPA workflows"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-rpaengine"
@@ -49,4 +52,25 @@ class RpaengineDynamicPlugin : DynamicPlugin {
     override fun dispose() {
         lastComponent = null
     }
+
+    /**
+     * The version from *this* plugin's manifest.
+     *
+     * Every BOSS plugin ships `/META-INF/boss-plugin/plugin.json` at the same resource path, so a
+     * single `getResourceAsStream` returns whichever jar comes first if the host ever loads plugins
+     * through a shared or parent-first classloader - and this plugin would report someone else's
+     * version. Every candidate is checked and only the one naming this plugin id is accepted.
+     */
+    private fun manifestVersion(): String =
+        runCatching {
+            javaClass.classLoader
+                ?.getResources("META-INF/boss-plugin/plugin.json")
+                ?.asSequence()
+                ?.mapNotNull { url -> runCatching { url.readText() }.getOrNull() }
+                ?.firstOrNull { text -> field(text, "pluginId") == pluginId }
+                ?.let { text -> field(text, "version") }
+        }.getOrNull() ?: "unknown"
+
+    private fun field(manifest: String, name: String): String? =
+        Regex(""""$name"\s*:\s*"([^"]+)"""").find(manifest)?.groupValues?.get(1)
 }

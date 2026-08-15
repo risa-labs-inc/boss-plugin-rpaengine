@@ -37,7 +37,7 @@ class RpaEngineSettingsManager {
         }
 
     private val settingsFile: File
-        get() = File(configDir, "settings.json")
+        get() = File(configDir, SETTINGS_FILE_NAME)
 
     // Also check the RPA Recorder's saved configurations
     private val rpaRecorderConfigDir: File
@@ -53,12 +53,19 @@ class RpaEngineSettingsManager {
             return File(homeDir, "Downloads")
         }
 
+    /** Guards [cachedSettings] and the read-modify-write in [updateSettings]. */
+    private val settingsLock = Any()
+
+    @Volatile
     private var cachedSettings: RpaEnginePersistedSettings? = null
 
     /**
      * Load settings from disk
      */
-    fun loadSettings(): RpaEnginePersistedSettings {
+    fun loadSettings(): RpaEnginePersistedSettings =
+        synchronized(settingsLock) { loadSettingsLocked() }
+
+    private fun loadSettingsLocked(): RpaEnginePersistedSettings {
         cachedSettings?.let { return it }
 
         return try {
@@ -95,60 +102,98 @@ class RpaEngineSettingsManager {
     /**
      * Update settings
      */
+    /**
+     * Read, transform and write the settings under a lock.
+     *
+     * Read-modify-write over the shared [cachedSettings]. It used to be called synchronously from
+     * the Main dispatcher, which serialized it by construction; once the callers moved to
+     * `Dispatchers.IO` two of them could read the same snapshot and the second write would drop the
+     * first one's field - toggling Human-like while dragging Speed is enough.
+     */
     fun updateSettings(update: (RpaEnginePersistedSettings) -> RpaEnginePersistedSettings) {
-        val current = loadSettings()
-        val updated = update(current)
-        saveSettings(updated)
+        synchronized(settingsLock) {
+            val current = loadSettingsLocked()
+            val updated = update(current)
+            saveSettings(updated)
+        }
     }
 
     /**
-     * Find all available RPA configuration files
+     * Whether [path] sits in a directory BOSS owns, as opposed to `~/Downloads`.
+     *
+     * Anything writable by a download is not a trustworthy source for an agent-selected plan:
+     * configurations can carry `run_script` actions, which execute arbitrary JavaScript in a tab
+     * holding the user's session.
+     */
+    fun isManagedPath(path: String): Boolean = isManagedPath(path, managedRoots())
+
+    /**
+     * As [isManagedPath], against an explicit set of roots.
+     *
+     * The roots are a parameter so this is testable without touching the real home directory, and
+     * so a scan can resolve them once instead of per candidate - the `configDir` getter runs
+     * `exists()` + `mkdirs()`, which is a poor thing to hide inside a security predicate called in
+     * a loop.
+     *
+     * `File.startsWith` compares path *components*, so a sibling named `rpaengine-evil` is
+     * correctly rejected. Do not turn it into a string prefix.
+     */
+    fun isManagedPath(path: String, roots: List<File>): Boolean =
+        // canonicalFile is what throws (IOException), not startsWith - so it has to be inside.
+        // Fail closed: a path that cannot be canonicalised is not one to hand an agent.
+        runCatching {
+            val file = File(path).canonicalFile
+            roots.any { dir -> file.startsWith(dir) }
+        }.getOrDefault(false)
+
+    /** The canonical directories BOSS owns, resolved once. */
+    fun managedRoots(): List<File> =
+        listOf(configDir, rpaRecorderConfigDir).mapNotNull { dir ->
+            runCatching { dir.canonicalFile }.getOrNull()
+        }
+
+    /**
+     * Find all available RPA configuration files.
+     *
+     * Sources, newest first: the engine's own config directory, the RPA Recorder's saved
+     * configurations, and `rpa`-named JSON in Downloads.
+     *
+     * The engine's own directory used to be excluded, which is why a plan written there - what
+     * LLM RPA's handoff produces - was invisible here and a run silently did nothing.
      */
     fun findAvailableConfigurations(): List<ConfigFileInfo> {
         val configs = mutableListOf<ConfigFileInfo>()
 
-        // Check RPA Recorder saved configurations
-        if (rpaRecorderConfigDir.exists() && rpaRecorderConfigDir.isDirectory) {
-            rpaRecorderConfigDir.listFiles { file -> file.extension == "json" }?.forEach { file ->
-                try {
-                    val config = loadConfigurationFile(file)
-                    if (config != null) {
-                        configs.add(ConfigFileInfo(
-                            name = config.name,
-                            path = file.absolutePath,
-                            lastModified = file.lastModified(),
-                            actionCount = config.actions.size
-                        ))
-                    }
-                } catch (e: Exception) {
-                    // Skip invalid files
-                }
-            }
-        }
-
-        // Check Downloads folder for RPA configs
-        if (downloadsDir.exists() && downloadsDir.isDirectory) {
-            downloadsDir.listFiles { file ->
-                file.extension == "json" && (file.name.startsWith("rpa_") || file.name.contains("rpa"))
-            }?.forEach { file ->
-                try {
-                    val config = loadConfigurationFile(file)
-                    if (config != null && !configs.any { it.path == file.absolutePath }) {
-                        configs.add(ConfigFileInfo(
-                            name = config.name,
-                            path = file.absolutePath,
-                            lastModified = file.lastModified(),
-                            actionCount = config.actions.size
-                        ))
-                    }
-                } catch (e: Exception) {
-                    // Skip invalid files
-                }
-            }
-        }
+        collectFrom(configDir, configs) { it.extension == "json" && it.name != SETTINGS_FILE_NAME }
+        collectFrom(rpaRecorderConfigDir, configs) { it.extension == "json" }
+        collectFrom(downloadsDir, configs) { it.extension == "json" && it.name.contains("rpa", ignoreCase = true) }
 
         // Sort by last modified (newest first)
         return configs.sortedByDescending { it.lastModified }
+    }
+
+    /**
+     * Add every file in [dir] matching [accept] that parses as a configuration to [into],
+     * skipping paths already collected from an earlier source.
+     */
+    private fun collectFrom(
+        dir: File,
+        into: MutableList<ConfigFileInfo>,
+        accept: (File) -> Boolean,
+    ) {
+        if (!dir.exists() || !dir.isDirectory) return
+        dir.listFiles { file -> accept(file) }?.forEach { file ->
+            if (into.any { it.path == file.absolutePath }) return@forEach
+            val config = runCatching { loadConfigurationFile(file) }.getOrNull() ?: return@forEach
+            into.add(
+                ConfigFileInfo(
+                    name = config.name,
+                    path = file.absolutePath,
+                    lastModified = file.lastModified(),
+                    actionCount = config.actions.size
+                )
+            )
+        }
     }
 
     /**
@@ -233,5 +278,10 @@ class RpaEngineSettingsManager {
                 java.text.SimpleDateFormat("MMM d, yyyy").format(date)
             }
         }
+    }
+
+    private companion object {
+        /** The engine's own settings live beside the configurations; it is not one of them. */
+        const val SETTINGS_FILE_NAME = "settings.json"
     }
 }
