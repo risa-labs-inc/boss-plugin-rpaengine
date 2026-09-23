@@ -96,6 +96,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
 
     testImplementation(kotlin("test"))
+    // Evaluates the pure JS helpers of injected scripts and parses whole scripts (ES5).
+    testImplementation("org.openjdk.nashorn:nashorn-core:15.4")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.17")
 }
 

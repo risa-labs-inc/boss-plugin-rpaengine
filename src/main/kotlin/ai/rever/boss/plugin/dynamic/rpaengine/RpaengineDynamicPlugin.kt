@@ -45,8 +45,11 @@ class RpaengineDynamicPlugin : DynamicPlugin {
             }
         }
 
-        // Contribute rpa_status/run/stop MCP tools; auto-removed on disable/unload.
-        context.registerMcpToolProvider(RpaengineMcpToolProvider(pluginId) { lastComponent })
+        // Contribute the MCP tools; auto-removed on disable/unload. rpa_observe/rpa_step take the
+        // tab provider from the plugin context so they work with no panel open.
+        context.registerMcpToolProvider(
+            RpaengineMcpToolProvider(pluginId, { lastComponent }, TabActions { activeTabsProvider }),
+        )
     }
 
     override fun dispose() {

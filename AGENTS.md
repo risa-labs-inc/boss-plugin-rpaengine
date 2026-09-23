@@ -116,7 +116,9 @@ user's session, so a downloaded file must not be reachable by an agent resolving
 and **false means resolved but no match**. Callers report those differently; a change that
 collapses them turns "no element matched `X`" back into a useless "cannot resolve a css selector".
 
-MCP tools are `rpa_status`, `rpa_load`, `rpa_run`, `rpa_stop`, `rpa_results`. `rpa_load` exists
+MCP tools are `rpa_status`, `rpa_load`, `rpa_run`, `rpa_stop`, `rpa_results`, plus
+`rpa_observe` and `rpa_step` (`TabActions.kt`), which take a tab id and need no panel. Step
+execution for both the panel and `rpa_step` lives in `ActionRunner`. `rpa_load` exists
 because loading a configuration was UI-only, which made the whole plugin undriveable by an agent.
 
 ### Testing
