@@ -4,6 +4,11 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /** Argument parsing and the refusal list for rpa_observe / rpa_step. */
 class TabActionArgsTest {
@@ -63,9 +68,27 @@ class TabActionArgsTest {
 
     @Test
     fun `element verbs require a selector`() {
-        listOf("click", "input", "select", "submit").forEach { t ->
+        listOf("click", "input", "select", "submit", "download").forEach { t ->
             assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs("""{"tab_id":"t","action":{"type":"$t","value":"x"}}""") }, t)
         }
+    }
+
+    @Test
+    fun `download parses its selector`() {
+        val a = parseStepArgs("""{"tab_id":"t","action":{"type":"download","selector":{"type":"css","value":"a.mw-file-description"}}}""")
+        assertEquals(ActionTypes.DOWNLOAD, a.action.type)
+        assertEquals(SelectorInfo(type = "css", value = "a.mw-file-description"), a.action.selector)
+    }
+
+    @Test
+    fun `schema and description offer download`() {
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""enum":["click","input","select","keypress","submit","scroll","navigate","wait","download"]"""))
+        assertTrue(TabActions.STEP_SCHEMA.contains("Required for click, input, select, submit, download;"))
+        assertTrue(TabActions.STEP_DESCRIPTION.contains("download saves the element's image or linked file"))
+        // Parseable JSON, with the enum matching what the parser allows.
+        val enum = Json.parseToJsonElement(TabActions.STEP_SCHEMA).jsonObject["properties"]!!.jsonObject["action"]!!
+            .jsonObject["properties"]!!.jsonObject["type"]!!.jsonObject["enum"]!!.jsonArray.map { it.jsonPrimitive.content }
+        assertEquals(STEP_ALLOWED_TYPES, enum.toSet())
     }
 
     @Test

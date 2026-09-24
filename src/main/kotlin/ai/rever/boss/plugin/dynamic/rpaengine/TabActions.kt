@@ -9,6 +9,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -60,7 +61,7 @@ internal const val STEP_MAX_WAIT_MS = 10_000L
 
 internal val STEP_ALLOWED_TYPES = setOf(
     ActionTypes.CLICK, ActionTypes.INPUT, ActionTypes.SELECT, ActionTypes.KEYPRESS,
-    ActionTypes.SUBMIT, ActionTypes.SCROLL, ActionTypes.NAVIGATE, ActionTypes.WAIT,
+    ActionTypes.SUBMIT, ActionTypes.SCROLL, ActionTypes.NAVIGATE, ActionTypes.WAIT, ActionTypes.DOWNLOAD,
 )
 
 /** Plan verbs rpa_step refuses by name; anything else outside [STEP_ALLOWED_TYPES] is refused as unknown. */
@@ -70,7 +71,8 @@ internal val STEP_REFUSED_TYPES = setOf(
 
 private val STEP_SELECTOR_TYPES = setOf(SelectorTypes.ID, SelectorTypes.CSS, SelectorTypes.XPATH, SelectorTypes.TEXT)
 
-private val SELECTOR_REQUIRED = setOf(ActionTypes.CLICK, ActionTypes.INPUT, ActionTypes.SELECT, ActionTypes.SUBMIT)
+private val SELECTOR_REQUIRED =
+    setOf(ActionTypes.CLICK, ActionTypes.INPUT, ActionTypes.SELECT, ActionTypes.SUBMIT, ActionTypes.DOWNLOAD)
 
 private fun invalid(message: String): Nothing = throw TabToolException(TabErrorCodes.INVALID_INPUT, message)
 
@@ -155,6 +157,9 @@ internal fun parseStepArgs(raw: String): StepArgs {
 internal data class ObservedSelector(val type: String, val value: String)
 
 @Serializable
+internal data class ObservedImage(val src: String?, val alt: String?, val width: Int, val height: Int)
+
+@Serializable
 internal data class ObservedElement(
     val id: String,
     val role: String?,
@@ -163,6 +168,7 @@ internal data class ObservedElement(
     val type: String?,
     val placeholder: String?,
     val href: String?,
+    val image: ObservedImage?,
     val options: List<String>?,
     val checked: Boolean?,
     val sensitive: Boolean,
@@ -187,7 +193,12 @@ internal data class StepResult(
     @SerialName("url_after") val urlAfter: String?,
     val navigated: Boolean,
     @SerialName("duration_ms") val durationMs: Long,
+    /** Set only by a successful `download`. */
+    val download: DownloadInfo? = null,
 )
+
+@Serializable
+internal data class DownloadInfo(val url: String, val file: String, val bytes: Long?, val method: String)
 
 /** What the observe script hands back, before ids and labels are finalised here. */
 @Serializable
@@ -195,6 +206,8 @@ internal data class PageSnapshot(
     val url: String? = null,
     val title: String? = null,
     val total: Int = 0,
+    /** Standalone images found, before the image cap. They follow the interactive ones in [items]. */
+    val imageTotal: Int = 0,
     val items: List<RawElement> = emptyList(),
     val error: String? = null,
 )
@@ -207,12 +220,16 @@ internal data class RawElement(
     val type: String? = null,
     val placeholder: String? = null,
     val href: String? = null,
+    val image: RawImage? = null,
     val options: List<String>? = null,
     val checked: Boolean? = null,
     val sensitive: Boolean = false,
     val inViewport: Boolean = false,
     val selector: ObservedSelector,
 )
+
+@Serializable
+internal data class RawImage(val src: String? = null, val alt: String? = null, val width: Int = 0, val height: Int = 0)
 
 internal val TabJson = Json {
     encodeDefaults = true
@@ -243,12 +260,18 @@ internal const val SENSITIVE_NAME_PATTERN = "pass|pwd|card|cvv|ssn|otp"
 internal fun looksSensitiveName(nameOrId: String): Boolean =
     Regex(SENSITIVE_NAME_PATTERN, RegexOption.IGNORE_CASE).containsMatchIn(nameOrId)
 
+/** Longest data: URI reported as an image source; past it the source is null. Shared with the observe script. */
+internal const val DATA_URI_MAX = 200
+
+internal fun sanitizeImageSrc(src: String?): String? =
+    src?.takeIf { it.isNotBlank() && !(it.startsWith("data:", ignoreCase = true) && it.length > DATA_URI_MAX) }
+
 internal fun buildObserveResult(tabId: String, snapshot: PageSnapshot): ObserveResult =
     ObserveResult(
         tabId = tabId,
         url = snapshot.url,
         title = snapshot.title?.replace(Regex("\\s+"), " ")?.trim(),
-        truncated = snapshot.total > snapshot.items.size,
+        truncated = snapshot.total + snapshot.imageTotal > snapshot.items.size,
         elements = snapshot.items.mapIndexed { i, e ->
             ObservedElement(
                 id = "e${i + 1}",
@@ -258,6 +281,9 @@ internal fun buildObserveResult(tabId: String, snapshot: PageSnapshot): ObserveR
                 type = e.type,
                 placeholder = e.placeholder,
                 href = e.href,
+                image = e.image?.let {
+                    ObservedImage(sanitizeImageSrc(it.src), normalizeLabel(it.alt), it.width, it.height)
+                },
                 options = e.options?.mapNotNull(::normalizeLabel),
                 checked = e.checked,
                 sensitive = e.sensitive,
@@ -271,12 +297,47 @@ internal fun buildObserveResult(tabId: String, snapshot: PageSnapshot): ObserveR
 // Injected scripts
 // ---------------------------------------------------------------------------------------------
 
+/** An interactive element's image is reported from this rendered size (both sides, CSS px). */
+internal const val IMAGE_MIN_PX = 48
+
+/** A standalone `<img>` is reported from this rendered size, up to [OBSERVE_IMAGE_LIMIT] of them. */
+internal const val STANDALONE_IMAGE_MIN_PX = 100
+internal const val OBSERVE_IMAGE_LIMIT = 20
+
 /** Elements the observe script considers interactive. */
 internal const val INTERACTIVE_SELECTOR =
     "a[href],button,input:not([type=hidden]),textarea,select,summary," +
         "[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem]," +
         "[role=option],[role=switch],[role=combobox],[role=searchbox],[role=textbox]," +
         "[contenteditable=true],[contenteditable='']"
+
+/** A path ending in one of these is a file `download` may take from a link's href. Shared with the scripts. */
+internal const val DOWNLOAD_EXT_PATTERN = "\\.(jpe?g|png|gif|webp|svg|pdf|zip|csv|xlsx|docx|txt|mp4|mp3)$"
+
+/**
+ * Pure URL/srcset helpers for images and downloads, part of [OBSERVE_HELPERS_JS] (`fileLabel` needs
+ * its `norm`). ES5 only. A URL segment containing ':' is a wiki namespace page (`File:X.jpg`), never
+ * a file.
+ */
+private val IMAGE_HELPERS_JS: String =
+    "var FILE_EXT = new RegExp(${DOWNLOAD_EXT_PATTERN.asJsString()}, 'i'); " +
+        "function urlPath(u) { return String(u == null ? '' : u).split('#')[0].split('?')[0]" +
+        ".replace(/^[a-z][a-z0-9+.-]*:\\/\\/[^\\/]*/i, '').replace(/^\\/\\/[^\\/]*/, ''); } " +
+        "function lastSegment(u) { var p = urlPath(u).replace(/\\/+$/, ''); return p.slice(p.lastIndexOf('/') + 1); } " +
+        "function decodeSeg(s) { try { return decodeURIComponent(s); } catch (e) { return s; } } " +
+        "function opaqueUrl(u) { return /^\\s*(data|blob|javascript):/i.test(String(u == null ? '' : u)); } " +
+        "function fileExt(u) { if (!u || opaqueUrl(u)) { return null; } var seg = decodeSeg(lastSegment(u)); " +
+        "if (seg.indexOf(':') !== -1) { return null; } var m = FILE_EXT.exec(seg); return m ? m[1].toLowerCase() : null; } " +
+        // File:Persian_cat.jpg -> "Persian cat.jpg"; 330px-X.jpg -> "X.jpg".
+        "function fileLabel(u) { if (!u || opaqueUrl(u)) { return ''; } var seg = decodeSeg(lastSegment(u)); " +
+        "seg = seg.slice(seg.indexOf(':') + 1).replace(/^\\d+px-/, '').replace(/_/g, ' '); return norm(seg).slice(0, $LABEL_MAX); } " +
+        // Largest srcset candidate (w beats x; no descriptor is 1x), else currentSrc, else src.
+        "function pickSrc(srcset, currentSrc, src) { var re = /\\s*(\\S+?)(?:\\s+([^,]*))?(?:,|$)/g, set = String(srcset || ''), m, " +
+        "w = null, wn = -1, x = null, xn = -1; while ((m = re.exec(set)) !== null) { " +
+        "var d = /([\\d.]+)([wx])/.exec(m[2] || ''), n = d ? parseFloat(d[1]) : 1; " +
+        "if (d && d[2] === 'w') { if (n > wn) { wn = n; w = m[1]; } } else if (n > xn) { xn = n; x = m[1]; } } " +
+        "return w || x || currentSrc || src || null; } " +
+        "function safeSrc(u) { if (!u) { return null; } return (/^data:/i.test(u) && u.length > $DATA_URI_MAX) ? null : u; } "
 
 /**
  * Pure helper functions of the observe script (no DOM beyond what each takes as an argument), kept
@@ -309,7 +370,14 @@ internal val OBSERVE_HELPERS_JS: String =
         "if (type === 'password') { return true; } " +
         "var ac = (autocomplete || '').toLowerCase(); " +
         "if (/(^|\\s)cc-/.test(ac) || ac.indexOf('one-time-code') !== -1) { return true; } " +
-        "return SENSITIVE.test(name || '') || SENSITIVE.test(id || ''); } "
+        "return SENSITIVE.test(name || '') || SENSITIVE.test(id || ''); } " +
+        IMAGE_HELPERS_JS
+
+/** DOM-touching image helpers, shared by the observe and download scripts. Expects [OBSERVE_HELPERS_JS]. */
+private const val IMAGE_DOM_JS: String =
+    "function imgIn(el, tag) { return tag === 'img' ? el : el.querySelector('img'); } " +
+        "function absUrl(u) { if (!u) { return null; } try { return new URL(u, document.baseURI).href; } catch (e) { return null; } } " +
+        "function bestSrc(img) { return absUrl(pickSrc(img.getAttribute('srcset'), img.currentSrc, img.getAttribute('src'))); } "
 
 /** The DOM-walking part of the observe script. Expects [OBSERVE_HELPERS_JS] in scope and `MAX`. */
 private val OBSERVE_BODY_JS: String =
@@ -346,6 +414,19 @@ private val OBSERVE_BODY_JS: String =
         "s = el.querySelector(CONTROLS) ? textOf(el) : norm(el.innerText); if (s) { return s; } " +
         "var img = el.querySelector('img[alt]'); if (img) { s = norm(img.getAttribute('alt')); if (s) { return s; } } } " +
         "s = norm(el.getAttribute('name')); return s || null; } " +
+        IMAGE_DOM_JS +
+        "function imageOf(img, min) { if (!img) { return null; } var r = img.getBoundingClientRect(); " +
+        "if (r.width < min || r.height < min) { return null; } " +
+        "return { src: safeSrc(bestSrc(img)), alt: norm(img.getAttribute('alt')) || null, " +
+        "width: Math.round(r.width), height: Math.round(r.height) }; } " +
+        // Only once the accessible-name chain is empty: alt, title, figure caption, then a file name.
+        "function imageLabel(el, tag, img) { if (!img) { return null; } " +
+        "var s = norm(img.getAttribute('alt')) || norm(img.getAttribute('title')); if (s) { return s; } " +
+        "var fig = img.closest('figure'), cap = fig ? fig.querySelector('figcaption') : null; " +
+        "if (cap) { s = textOf(cap); if (s) { return s; } } " +
+        "s = tag === 'a' ? fileLabel(el.getAttribute('href')) : ''; " +
+        "return s || fileLabel(img.currentSrc || img.getAttribute('src')) || null; } " +
+        "function byView(a, b) { return (a.v === b.v) ? a.i - b.i : (a.v ? -1 : 1); } " +
         "function uniqueCss(sel, el) { try { var m = document.querySelectorAll(sel); " +
         "return m.length === 1 && m[0] === el; } catch (e) { return false; } } " +
         "function xpathOf(el) { var parts = []; " +
@@ -368,9 +449,9 @@ private val OBSERVE_BODY_JS: String =
         "var all = Array.prototype.slice.call(document.querySelectorAll(${'$'}SELECTOR)); " +
         "var seen = []; for (var i = 0; i < all.length; i++) { var el = all[i]; " +
         "if (!disabled(el) && rendered(el)) { seen.push({ el: el, v: inView(el), i: seen.length }); } } " +
-        "seen.sort(function (a, b) { return (a.v === b.v) ? a.i - b.i : (a.v ? -1 : 1); }); " +
-        "var items = seen.slice(0, MAX).map(function (c) { var el = c.el; " +
-        "var tag = el.tagName.toLowerCase(); " +
+        "seen.sort(byView); var picked = seen.slice(0, MAX); " +
+        "var items = picked.map(function (c) { var el = c.el; " +
+        "var tag = el.tagName.toLowerCase(); var img = imgIn(el, tag); " +
         "var type = (tag === 'input' || tag === 'button') ? (el.getAttribute('type') || (tag === 'button' ? 'submit' : 'text')).toLowerCase() : null; " +
         "var explicit = norm(el.getAttribute('role')).split(' ')[0]; " +
         "var role = explicit || (el.isContentEditable && tag !== 'input' && tag !== 'textarea' ? 'textbox' : implicitRole(tag, type)); " +
@@ -379,12 +460,24 @@ private val OBSERVE_BODY_JS: String =
         "else if (role === 'checkbox' || role === 'radio') { checked = el.getAttribute('aria-checked') === 'true'; } " +
         "var options = null; if (tag === 'select') { options = Array.prototype.slice.call(el.options || [], 0, 30)" +
         ".map(function (o) { return norm(o.label || o.text); }); } " +
-        "return { tag: tag, role: role || null, label: labelOf(el, tag, role, type), type: type, " +
+        "return { tag: tag, role: role || null, label: labelOf(el, tag, role, type) || imageLabel(el, tag, img), type: type, " +
         "placeholder: el.getAttribute('placeholder'), href: tag === 'a' ? (typeof el.href === 'string' ? el.href : el.getAttribute('href')) : null, " +
-        "options: options, checked: checked, " +
+        "image: imageOf(img, $IMAGE_MIN_PX), options: options, checked: checked, " +
         "sensitive: isSensitive(type, el.getAttribute('autocomplete'), el.getAttribute('name'), el.getAttribute('id')), " +
         "inViewport: c.v, selector: selectorOf(el, tag) }; }); " +
-        "return JSON.stringify({ url: location.href, title: document.title, total: seen.length, items: items });"
+        // Standalone images come after, with their own cap, so they never displace an interactive element.
+        "var pics = [], imgs = document.querySelectorAll('img'); " +
+        "for (var k = 0; k < imgs.length; k++) { var im = imgs[k], ir = im.getBoundingClientRect(); " +
+        "if (ir.width < $STANDALONE_IMAGE_MIN_PX || ir.height < $STANDALONE_IMAGE_MIN_PX || !rendered(im)) { continue; } " +
+        "var inside = false; for (var j = 0; j < picked.length && !inside; j++) { inside = picked[j].el.contains(im); } " +
+        "if (!inside) { pics.push({ el: im, v: inView(im), i: pics.length }); } } " +
+        "pics.sort(byView); " +
+        "var images = pics.slice(0, $OBSERVE_IMAGE_LIMIT).map(function (c) { var el = c.el; " +
+        "return { tag: 'img', role: 'img', label: labelOf(el, 'img', 'img', null) || imageLabel(el, 'img', el), type: null, " +
+        "placeholder: null, href: null, image: imageOf(el, 0), options: null, checked: null, sensitive: false, " +
+        "inViewport: c.v, selector: selectorOf(el, 'img') }; }); " +
+        "return JSON.stringify({ url: location.href, title: document.title, total: seen.length, imageTotal: pics.length, " +
+        "items: items.concat(images) });"
 
 /**
  * One JS expression that snapshots the interactive elements of the page, as `JSON.stringify`
@@ -428,13 +521,141 @@ internal fun removeHighlightScript(token: String): String =
         "n[i].parentNode.removeChild(n[i]); } } return true; })()"
 
 // ---------------------------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------------------------
+
+internal const val DOWNLOAD_POLL_MS = 200L
+internal const val DOWNLOAD_TIMEOUT_MS = 10_000L
+
+/** The blob URL outlives the click by this long, so the browser has read it before it is revoked. */
+internal const val DOWNLOAD_REVOKE_MS = 60_000
+internal const val DOWNLOAD_FALLBACK_NAME = "download"
+
+internal const val DOWNLOAD_CROSS_ORIGIN_ERROR =
+    "The site does not allow downloading this file from script; open it instead"
+
+/** What the target script resolves: the URL to fetch, or why there is none. */
+@Serializable
+internal data class DownloadTarget(val url: String? = null, val source: String? = null, val error: String? = null)
+
+/** One poll of `window.__rpaDownloads[token]`; state is pending|done|failed, or missing after a navigation. */
+@Serializable
+internal data class DownloadStatus(
+    val state: String,
+    val bytes: Long? = null,
+    val error: String? = null,
+    val method: String? = null,
+)
+
+private val DOWNLOADABLE_SCHEME = Regex("(?:https?://|blob:|data:)\\S*", RegexOption.IGNORE_CASE)
+
+internal fun isDownloadableUrl(url: String): Boolean = DOWNLOADABLE_SCHEME.matchEntire(url.trim()) != null
+
+/**
+ * The saved file's name: the URL path's last segment, percent-decoded, without a thumbnail size
+ * prefix (`330px-`) and with characters no file system accepts replaced. [DOWNLOAD_FALLBACK_NAME]
+ * for data:/blob: URLs or when nothing is left.
+ */
+internal fun downloadFileName(url: String): String {
+    val u = url.trim()
+    if (Regex("^(data|blob|javascript):", RegexOption.IGNORE_CASE).containsMatchIn(u)) return DOWNLOAD_FALLBACK_NAME
+    val path = u.substringBefore('#').substringBefore('?')
+        .replace(Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*"), "")
+        .replace(Regex("^//[^/]*"), "")
+    val name = percentDecode(path.trimEnd('/').substringAfterLast('/'))
+        .replace(Regex("^\\d+px-"), "")
+        .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_")
+        .trim().trim('.')
+    return name.take(120).ifEmpty { DOWNLOAD_FALLBACK_NAME }
+}
+
+/** %XX sequences as UTF-8; a malformed escape is kept as written. `+` stays `+` (this is a path). */
+private fun percentDecode(s: String): String {
+    if ('%' !in s) return s
+    val out = java.io.ByteArrayOutputStream()
+    var i = 0
+    while (i < s.length) {
+        val hi = if (s[i] == '%' && i + 2 <= s.lastIndex) s[i + 1].digitToIntOrNull(16) else null
+        val lo = if (hi != null) s[i + 2].digitToIntOrNull(16) else null
+        if (hi != null && lo != null) {
+            out.write(hi * 16 + lo)
+            i += 3
+        } else {
+            out.write(s[i].toString().toByteArray(Charsets.UTF_8))
+            i++
+        }
+    }
+    return out.toString(Charsets.UTF_8)
+}
+
+/**
+ * Resolves what `download` would fetch from the element [locate] names, side-effect free. A link
+ * whose href is a file wins over its image (the href is the full file, the image a thumbnail);
+ * otherwise the element's own or first descendant `<img>`, best source.
+ */
+internal fun downloadTargetScript(locate: String): String =
+    "(function () { try { " + OBSERVE_HELPERS_JS + IMAGE_DOM_JS +
+        "var el = $locate; if (!el) { return JSON.stringify({ error: 'The element is gone' }); } " +
+        "var tag = el.tagName.toLowerCase(), link = el.closest('a[href]'); " +
+        "var href = link ? absUrl(link.getAttribute('href')) : null; " +
+        "if (href && fileExt(href)) { return JSON.stringify({ url: href, source: 'link' }); } " +
+        "var img = imgIn(el, tag), src = img ? safeSrc(bestSrc(img)) : null; " +
+        "if (src) { return JSON.stringify({ url: src, source: 'image' }); } " +
+        "return JSON.stringify({ error: img ? 'The image has no downloadable source' : 'No image or file link at the target' }); " +
+        "} catch (e) { return JSON.stringify({ error: String(e && e.message || e) }); } })()"
+
+/**
+ * Starts the download and returns at once: `executeJavaScript` does not await a promise, so
+ * progress goes to `window.__rpaDownloads[token]` for [downloadPollScript]. fetch -> blob -> a
+ * temporary `<a download>`; when fetch fails outright (CORS), a same-origin URL is clicked directly
+ * instead and a cross-origin one fails. Never navigates the page. An HTTP error does not fall back:
+ * the server answered, and the direct link would only save its error page.
+ */
+internal fun downloadStartScript(url: String, file: String, token: String): String =
+    "(function () { try { var url = ${url.asJsString()}, file = ${file.asJsString()}; " +
+        "var reg = window.__rpaDownloads || (window.__rpaDownloads = {}); " +
+        "var st = { state: 'pending', bytes: null, error: null, method: null, ctl: null }; reg[${token.asJsString()}] = st; " +
+        "function save(href) { var a = document.createElement('a'); a.href = href; a.download = file; a.rel = 'noopener'; " +
+        "a.style.display = 'none'; (document.body || document.documentElement).appendChild(a); a.click(); " +
+        "window.setTimeout(function () { if (a.parentNode) { a.parentNode.removeChild(a); } }, 1000); } " +
+        "function direct() { var same = false; try { same = new URL(url, location.href).origin === location.origin; } catch (e) {} " +
+        "if (same) { save(url); st.method = 'direct'; st.state = 'done'; } " +
+        "else { st.state = 'failed'; st.error = ${DOWNLOAD_CROSS_ORIGIN_ERROR.asJsString()}; } } " +
+        "if (!window.fetch) { direct(); return true; } " +
+        "if (window.AbortController) { st.ctl = new AbortController(); } " +
+        "fetch(url, { mode: 'cors', credentials: 'omit', signal: st.ctl ? st.ctl.signal : undefined })" +
+        ".then(function (r) { if (!r.ok) { throw { http: r.status }; } return r.blob(); })" +
+        ".then(function (b) { if (st.state !== 'pending') { return; } var u = URL.createObjectURL(b); save(u); " +
+        "window.setTimeout(function () { URL.revokeObjectURL(u); }, $DOWNLOAD_REVOKE_MS); " +
+        "st.bytes = b.size; st.method = 'blob'; st.state = 'done'; }, " +
+        "function (e) { if (st.state !== 'pending') { return; } " +
+        "if (e && e.http) { st.state = 'failed'; st.error = 'The server answered HTTP ' + e.http; } else { direct(); } }); " +
+        "return true; } catch (e) { return 'threw: ' + e.message; } })()"
+
+/** Reads the download's state; a settled entry is removed as it is read. */
+internal fun downloadPollScript(token: String): String =
+    "(function () { var reg = window.__rpaDownloads, t = ${token.asJsString()}, st = reg && reg[t]; " +
+        "if (!st) { return JSON.stringify({ state: 'missing' }); } " +
+        "if (st.state !== 'pending') { delete reg[t]; } " +
+        "return JSON.stringify({ state: st.state, bytes: st.bytes, error: st.error, method: st.method }); })()"
+
+/** Gives up on a pending download: aborts the fetch, and a late blob is not saved. */
+internal fun downloadAbortScript(token: String): String =
+    "(function () { var reg = window.__rpaDownloads, t = ${token.asJsString()}, st = reg && reg[t]; " +
+        "if (st) { st.state = 'failed'; st.error = 'timeout'; try { if (st.ctl) { st.ctl.abort(); } } catch (e) {} " +
+        "delete reg[t]; } return true; })()"
+
+// ---------------------------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------------------------
 
 /** Settle after the action before reading the URL again. */
 internal const val STEP_URL_SETTLE_MS = 300L
 
-internal class TabActions(private val activeTabsProvider: () -> ActiveTabsProvider?) {
+internal class TabActions(
+    private val downloadTimeoutMs: Long = DOWNLOAD_TIMEOUT_MS,
+    private val activeTabsProvider: () -> ActiveTabsProvider?,
+) {
 
     // rpa_step results carry the outcome; the runner's fallback warning has nowhere to go.
     private val runner = ActionRunner { _, _ -> }
@@ -493,7 +714,12 @@ internal class TabActions(private val activeTabsProvider: () -> ActiveTabsProvid
         val before = currentUrl(browser)
         val hook = if (args.highlightMs > 0) highlightHook(args.highlightMs) else null
         // execute() already maps script errors and thrown exceptions to (false, reason).
-        val (ok, error) = runner.execute(browser, args.action, hook)
+        val (ok, error, download) =
+            if (args.action.type == ActionTypes.DOWNLOAD) {
+                download(browser, args.action.selector, hook)
+            } else {
+                runner.execute(browser, args.action, hook).let { Triple(it.first, it.second, null) }
+            }
         delay(STEP_URL_SETTLE_MS)
         val after = currentUrl(browser)
         return StepResult(
@@ -503,8 +729,70 @@ internal class TabActions(private val activeTabsProvider: () -> ActiveTabsProvid
             urlAfter = after,
             navigated = before != null && after != null && before != after,
             durationMs = Clock.System.now().toEpochMilliseconds() - started,
+            download = download,
         )
     }
+
+    /** Same failure semantics as a runner verb: an exception is (false, reason), cancellation rethrows. */
+    private suspend fun download(
+        browser: BrowserIntegration,
+        selector: SelectorInfo,
+        hook: ElementHook?,
+    ): Triple<Boolean, String?, DownloadInfo?> {
+        fun fail(reason: String) = Triple(false, reason, null)
+        return try {
+            val locate =
+                when (val target = runner.findTarget(browser, selector, hook)) {
+                    TargetLookup.Unsupported -> return fail(runner.unsupportedSelector(selector))
+                    TargetLookup.Missing -> return fail("No element matched ${selector.value}")
+                    is TargetLookup.Found -> target.locate
+                }
+            val target = decodeOrNull(browser.executeJavaScript(downloadTargetScript(locate)), DownloadTarget.serializer())
+                ?: return fail("Could not read the download target (the page may be navigating)")
+            target.error?.let { return fail(it) }
+            val url = target.url?.takeIf(::isDownloadableUrl)
+                ?: return fail("The target's URL is not http(s), blob or data")
+            val file = downloadFileName(url)
+            val token = "d" + Clock.System.now().toEpochMilliseconds().toString(36) + (0..9999).random()
+            val started = browser.executeJavaScript(downloadStartScript(url, file, token))
+            if (!started.isJsTrue()) return fail("Could not start the download: $started")
+            val status =
+                try {
+                    awaitDownload(browser, token)
+                } catch (e: CancellationException) {
+                    abortDownload(browser, token)
+                    throw e
+                }
+            if (status.state != "done") return fail(status.error ?: "The download failed")
+            Triple(true, null, DownloadInfo(url, file, status.bytes, status.method ?: "blob"))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            fail("Error executing action: ${e.message}")
+        }
+    }
+
+    /** Polls until the download settles; a navigation or the timeout comes back as a failed status. */
+    private suspend fun awaitDownload(browser: BrowserIntegration, token: String): DownloadStatus {
+        val deadline = Clock.System.now().toEpochMilliseconds() + downloadTimeoutMs
+        while (Clock.System.now().toEpochMilliseconds() < deadline) {
+            delay(DOWNLOAD_POLL_MS)
+            val status = decodeOrNull(browser.executeJavaScript(downloadPollScript(token)), DownloadStatus.serializer())
+            when (status?.state) {
+                "done", "failed" -> return status
+                "missing" -> return DownloadStatus("failed", error = "The page navigated before the download finished")
+            }
+        }
+        abortDownload(browser, token)
+        return DownloadStatus("failed", error = "The download did not finish within ${downloadTimeoutMs / 1000}s")
+    }
+
+    private suspend fun abortDownload(browser: BrowserIntegration, token: String) {
+        withContext(NonCancellable) { runCatching { browser.executeJavaScript(downloadAbortScript(token)) } }
+    }
+
+    private fun <T> decodeOrNull(result: Any?, serializer: KSerializer<T>): T? =
+        (result as? String)?.let { runCatching { TabJson.decodeFromString(serializer, it) }.getOrNull() }
 
     private fun highlightHook(ms: Int): ElementHook = { b, locate -> highlight(b, locate, ms) }
 
@@ -544,13 +832,15 @@ internal class TabActions(private val activeTabsProvider: () -> ActiveTabsProvid
     companion object {
         const val OBSERVE_DESCRIPTION =
             "List the interactive elements (links, buttons, fields, selects, ARIA widgets) currently rendered " +
-                "in a browser tab, in-viewport first. Each element has a label, role and a selector that rpa_step " +
-                "accepts as-is. Field values are never returned; password/payment/OTP fields are flagged sensitive. " +
+                "in a browser tab, in-viewport first, then up to 20 large standalone images (role img). Each element " +
+                "has a label, role and a selector that rpa_step accepts as-is, and an image {src, alt, width, height} " +
+                "when it is or contains one. Field values are never returned; password/payment/OTP fields are flagged sensitive. " +
                 "Works on any browser tab by id; no RPA Engine panel needed."
 
         const val STEP_DESCRIPTION =
             "Perform exactly one action in a browser tab by id: click, input, select, keypress, submit, scroll, " +
-                "navigate or wait, with the same semantics as an RPA Engine plan step. Selectors are " +
+                "navigate, wait or download, with the same semantics as an RPA Engine plan step; download saves " +
+                "the element's image or linked file through the browser. Selectors are " +
                 "{type: id|css|xpath|text, value}; use the ones rpa_observe returns. The target element is briefly " +
                 "outlined first (highlight_ms, 0 to disable). Returns ok/error plus the URL before and after. " +
                 "run_script, screenshot, switch_frame and assert are refused."
@@ -565,8 +855,8 @@ internal class TabActions(private val activeTabsProvider: () -> ActiveTabsProvid
             """{"type":"object","properties":{""" +
                 """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list)."},""" +
                 """"action":{"type":"object","properties":{""" +
-                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait"]},""" +
-                """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit; optional for keypress (defaults to the focused element)."},""" +
+                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download"]},""" +
+                """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit, download; optional for keypress (defaults to the focused element)."},""" +
                 """"value":{"type":"string","description":"input: text to type; select: option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000)."}""" +
                 """},"required":["type"]},""" +
                 """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."}""" +

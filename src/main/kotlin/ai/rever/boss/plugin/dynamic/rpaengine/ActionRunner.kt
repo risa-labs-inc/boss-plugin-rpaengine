@@ -235,6 +235,8 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                 // indistinguishable from a working one in the log.
                 ActionTypes.SCREENSHOT, ActionTypes.SWITCH_FRAME ->
                     Pair(false, "'${action.type}' is not supported when driving a real browser")
+                // Needs async polling and reports extra fields, so it lives in TabActions.
+                ActionTypes.DOWNLOAD -> Pair(false, "'download' is only available through rpa_step")
                 else -> Pair(false, "Unknown action type '${action.type}'")
             }
         } catch (e: CancellationException) {
@@ -278,7 +280,32 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
         body: String,
         onFailure: String,
     ): Pair<Boolean, String?>? {
-        val primary = locateExpression(selector) ?: return null
+        val locate =
+            when (val target = findTarget(this, selector, beforeAct)) {
+                TargetLookup.Unsupported -> return null
+                TargetLookup.Missing -> return Pair(false, onFailure)
+                is TargetLookup.Found -> target.locate
+            }
+        // Wrapped: `var` at eval top level lands on the page's global object, so `el` would
+        // clobber a page global of that name.
+        val outcome =
+            executeJavaScript(
+                "(function () { var el = $locate; if (!el) { return false; } " +
+                    "try { $body } catch (e) { return 'threw: ' + e.message; } return true; })();",
+            )
+        return interpretOutcome(outcome, onFailure)
+    }
+
+    /**
+     * Wait for [selector]'s element, then run [beforeAct] on it. The lookup half of [runOn], for
+     * verbs that act through more than one script (`download`).
+     */
+    suspend fun findTarget(
+        browser: BrowserIntegration,
+        selector: SelectorInfo,
+        beforeAct: ElementHook?,
+    ): TargetLookup {
+        val primary = locateExpression(selector) ?: return TargetLookup.Unsupported
         // A tag-qualified CSS selector gets its tag dropped as an alternative in the SAME probe.
         // Two sequential deadlines made every miss cost 10s and let the fallback win only after
         // the primary had exhausted its own - so it is an alternative, not a retry.
@@ -290,22 +317,15 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                 null
             }
         val locate = if (fallback == null) primary else "($primary) || ($fallback)"
-        if (!awaitElement(locate)) return Pair(false, onFailure)
-        beforeAct?.invoke(this, locate)
-        if (fallback != null && !matches(primary)) {
+        if (!browser.awaitElement(locate)) return TargetLookup.Missing
+        beforeAct?.invoke(browser, locate)
+        if (fallback != null && !browser.matches(primary)) {
             log(
                 LogLevel.WARNING,
                 "Selector '${selector.value}' matched nothing; used '$stripped' instead",
             )
         }
-        // Wrapped: `var` at eval top level lands on the page's global object, so `el` would
-        // clobber a page global of that name.
-        val outcome =
-            executeJavaScript(
-                "(function () { var el = $locate; if (!el) { return false; } " +
-                    "try { $body } catch (e) { return 'threw: ' + e.message; } return true; })();",
-            )
-        return interpretOutcome(outcome, onFailure)
+        return TargetLookup.Found(locate)
     }
 
     /**
@@ -335,9 +355,16 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
     private suspend fun BrowserIntegration.matches(locate: String): Boolean =
         executeJavaScript("(function () { return !!($locate); })();").isJsTrue()
 
-    private fun unsupportedSelector(selector: SelectorInfo): String =
+    fun unsupportedSelector(selector: SelectorInfo): String =
         "Cannot resolve a '${selector.type}' selector" +
             if (selector.value.isNullOrBlank()) " with no value" else ""
+}
+
+/** [ActionRunner.findTarget]'s outcome: the same unresolvable / no-match split as `runOn`. */
+internal sealed interface TargetLookup {
+    data object Unsupported : TargetLookup
+    data object Missing : TargetLookup
+    data class Found(val locate: String) : TargetLookup
 }
 
 internal object ActionTiming {

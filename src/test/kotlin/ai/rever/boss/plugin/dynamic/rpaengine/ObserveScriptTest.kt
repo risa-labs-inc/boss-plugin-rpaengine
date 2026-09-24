@@ -38,6 +38,11 @@ class ObserveScriptTest {
         File("build/tmp/observe.js").writeText(observeScript(80))
         File("build/tmp/highlight.js").writeText(highlightScript("document.querySelector('button')", "tok", 600))
         File("build/tmp/highlight-remove.js").writeText(removeHighlightScript("tok"))
+        File("build/tmp/download-target.js").writeText(downloadTargetScript("document.querySelector('a.mw-file-description')"))
+        File("build/tmp/download-start.js").writeText(
+            downloadStartScript("https://upload.wikimedia.org/wikipedia/commons/a/ab/Persialainen.jpg", "Persialainen.jpg", "tok"),
+        )
+        File("build/tmp/download-poll.js").writeText(downloadPollScript("tok"))
     }
 
     @Test
@@ -48,6 +53,106 @@ class ObserveScriptTest {
         // textContent only ever comes from the scrubbed clone in textOf.
         assertEquals(1, Regex("""textContent""").findAll(js).count(), js)
         assertTrue(js.contains("var drop = c.querySelectorAll(CONTROLS"), "textOf must strip form controls from the clone")
+        // Image fields and labels come from attributes, currentSrc, and a figcaption through textOf.
+        assertTrue(js.contains("if (cap) { s = textOf(cap);"), "figcaption text must go through the scrubbed textOf")
+        assertTrue(js.contains("alt: norm(img.getAttribute('alt')) || null"))
+    }
+
+    @Test
+    fun `standalone images never displace interactive elements`() {
+        val js = observeScript(80)
+        // Interactive elements are cut to MAX first; images get their own cap and are appended after.
+        assertTrue(js.contains("var picked = seen.slice(0, MAX); var items = picked.map("))
+        assertTrue(js.contains("pics.slice(0, $OBSERVE_IMAGE_LIMIT)"))
+        assertTrue(js.contains("items: items.concat(images)"))
+        // Only images outside a reported element, and only from 100x100.
+        assertTrue(js.contains("inside = picked[j].el.contains(im)"))
+        assertTrue(js.contains("ir.width < $STANDALONE_IMAGE_MIN_PX || ir.height < $STANDALONE_IMAGE_MIN_PX"))
+        assertTrue(js.contains("image: imageOf(img, $IMAGE_MIN_PX)"))
+    }
+
+    @Test
+    fun `image label falls back only after the accessible name`() {
+        assertTrue(observeScript(80).contains("label: labelOf(el, tag, role, type) || imageLabel(el, tag, img)"))
+    }
+
+    @Test
+    fun `pickSrc takes the largest srcset candidate, then currentSrc, then src`() {
+        val e = helpers()
+        val wiki = "//upload.wikimedia.org/t/250px-X.jpg 1.5x, //upload.wikimedia.org/t/330px-X.jpg 2x"
+        assertEquals("//upload.wikimedia.org/t/330px-X.jpg", e.eval("pickSrc(${wiki.asJsString()}, 'cur', 'src')"))
+        assertEquals("b.jpg", e.eval("pickSrc('a.jpg 320w, b.jpg 1024w, c.jpg 640w', 'cur', 'src')"))
+        assertEquals("b.jpg", e.eval("pickSrc('a.jpg 1x,b.jpg 3x', null, null)"), "no space after the comma")
+        assertEquals("b.jpg", e.eval("pickSrc('a.jpg, b.jpg 2x', null, null)"), "no descriptor is 1x")
+        assertEquals("a.jpg", e.eval("pickSrc('a.jpg', null, null)"))
+        assertEquals("w.jpg", e.eval("pickSrc('x.jpg 3x, w.jpg 100w', null, null)"), "a width descriptor wins")
+        assertEquals("cur", e.eval("pickSrc('', 'cur', 'src')"))
+        assertEquals("src", e.eval("pickSrc(null, '', 'src')"))
+        assertNull(e.eval("pickSrc(null, '', null)"))
+    }
+
+    @Test
+    fun `safeSrc drops long data URIs only`() {
+        val e = helpers()
+        assertEquals("data:image/gif;base64,R0", e.eval("safeSrc('data:image/gif;base64,R0')"))
+        assertNull(e.eval("safeSrc('data:' + new Array(197).join('x'))"), "201 chars")
+        assertEquals(200.0, (e.eval("safeSrc('data:' + new Array(196).join('x')).length") as Number).toDouble())
+        assertEquals("https://x.test/a.jpg", e.eval("safeSrc('https://x.test/a.jpg')"))
+        assertNull(e.eval("safeSrc('')"))
+    }
+
+    @Test
+    fun `fileLabel humanises a file name`() {
+        val e = helpers()
+        mapOf(
+            "/wiki/File:Persialainen.jpg" to "Persialainen.jpg",
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Persian_cat.jpg/330px-Persian_cat.jpg?x=1" to "Persian cat.jpg",
+            "/wiki/File:Caf%C3%A9_cat.jpg#top" to "Café cat.jpg",
+            "/files/%E0%A4%A.png" to "%E0%A4%A.png",
+            "https://x.test/" to "",
+            "data:image/png;base64,iVBOR" to "",
+        ).forEach { (u, label) -> assertEquals(label, e.eval("fileLabel(${u.asJsString()})"), u) }
+        assertEquals(80, (e.eval("fileLabel('/f/' + new Array(200).join('a') + '.jpg').length") as Number).toInt())
+    }
+
+    @Test
+    fun `fileExt recognises direct file links only`() {
+        val e = helpers()
+        mapOf(
+            "https://x.test/a/report.PDF?dl=1" to "pdf",
+            "https://x.test/a.jpeg#frag" to "jpeg",
+            "/data/export.csv" to "csv",
+            "//cdn.x.test/v/clip.mp4" to "mp4",
+        ).forEach { (u, ext) -> assertEquals(ext, e.eval("fileExt(${u.asJsString()})"), u) }
+        // A wiki File: page, a page, a .zip TLD with no path, and script URLs are not files.
+        listOf("/wiki/File:Persialainen.jpg", "https://x.test/page", "https://example.zip", "https://example.zip/",
+            "javascript:x.pdf", "data:application/pdf;base64,x", "").forEach {
+            assertNull(e.eval("fileExt(${it.asJsString()})"), it)
+        }
+    }
+
+    @Test
+    fun `download scripts are single expressions`() {
+        assertSingleExpression(downloadTargetScript(locateExpression(SelectorInfo("xpath", "//a[@class='x']"))!!))
+        assertSingleExpression(downloadStartScript("https://x.test/it's.jpg", "it's.jpg", "t'1"))
+        assertSingleExpression(downloadPollScript("t'1"))
+        assertSingleExpression(downloadAbortScript("t'1"))
+    }
+
+    @Test
+    fun `download start never navigates and only falls back same-origin`() {
+        val js = downloadStartScript("https://x.test/a.jpg", "a.jpg", "t")
+        assertFalse(js.contains("location.href =") || js.contains("location.assign") || js.contains("window.open"))
+        assertTrue(js.contains("fetch(url, { mode: 'cors', credentials: 'omit'"))
+        assertTrue(js.contains("if (same) { save(url); st.method = 'direct';"))
+        assertTrue(js.contains("if (e && e.http) { st.state = 'failed';"), "an HTTP error must not fall back")
+        assertTrue(js.contains("if (st.state !== 'pending') { return; } var u = URL.createObjectURL"), "no save after abort")
+    }
+
+    @Test
+    fun `download target prefers a file href, and a wiki File page is not one`() {
+        val js = downloadTargetScript("el0")
+        assertTrue(js.indexOf("if (href && fileExt(href))") < js.indexOf("var img = imgIn(el, tag)"))
     }
 
     @Test
