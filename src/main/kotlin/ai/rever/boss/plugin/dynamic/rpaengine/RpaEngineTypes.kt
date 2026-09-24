@@ -144,6 +144,9 @@ object ActionTypes {
     /** Submitting the form an element belongs to. */
     const val SUBMIT = "submit"
 
+    /** Saving an element's image or linked file. `rpa_step` only; see TabActions. */
+    const val DOWNLOAD = "download"
+
     fun getDisplayName(type: String): String = when (type) {
         CLICK -> "Click"
         INPUT -> "Type Input"
@@ -155,6 +158,7 @@ object ActionTypes {
         ASSERT -> "Assert"
         SWITCH_FRAME -> "Switch Frame"
         RUN_SCRIPT -> "Run Script"
+        DOWNLOAD -> "Download"
         else -> type.replaceFirstChar { it.uppercase() }
     }
 }

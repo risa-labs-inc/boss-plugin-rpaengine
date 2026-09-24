@@ -36,9 +36,57 @@ run.
 | `rpa_status` | Execution state, current action, result count |
 | `rpa_run` | Start or resume execution |
 | `rpa_stop` | Stop execution |
+| `rpa_observe` | List the interactive elements and large images rendered in a browser tab, with a selector for each |
+| `rpa_step` | Perform one action in a browser tab, including downloading an element's image or linked file |
 
-These act on the most recently opened panel instance and return an error if the panel is
-closed. None of them is permission-gated, including the two that start automation.
+`rpa_status`, `rpa_run` and `rpa_stop` act on the most recently opened panel instance and return
+an error if the panel is closed. None of the tools is permission-gated, including the ones that
+start automation or act on a page.
+
+`rpa_observe` and `rpa_step` take a `tab_id` (from `tabs_list`) and work on any browser tab with
+no panel open.
+
+- `rpa_observe {tab_id, max_elements?}` (read-only; `max_elements` 1-200, default 80). Returns
+  `{tab_id, url, title, truncated, elements[]}`. Each element has `id` (`e1`..`eN`, in-viewport
+  first, then document order), `role`, `tag`, `label` (accessible name, at most 80 chars),
+  `type`, `placeholder`, `href`, `image`, `options` (a select's first 30 option labels), `checked`
+  (checkbox/radio), `sensitive`, `in_viewport` and a `selector` (`id`, `css` or `xpath`) checked
+  in-page to match only that element. Disabled and unrendered elements are skipped. Field values
+  and contenteditable text are never read. `sensitive` is true for password fields,
+  `cc-*`/`one-time-code` autocomplete, and names/ids matching `pass|pwd|card|cvv|ssn|otp`.
+  - `image` is `{src, alt, width, height}` when the element is an `<img>` or contains one rendered
+    at 48x48 or larger, else null. `src` is absolute: the largest `srcset` candidate, else
+    `currentSrc`, else `src`; a `data:` URI over 200 chars is reported as null. `width`/`height`
+    are the rendered size.
+  - When an element with an image has no accessible name, `label` falls back to the image's `alt`,
+    then `title`, then the enclosing `<figure>`'s `figcaption`, then a file name from the link
+    href or image src (`/wiki/File:Persian_cat.jpg` -> `Persian cat.jpg`).
+  - After the interactive elements (capped by `max_elements`), up to 20 rendered `<img>` elements
+    of 100x100 or larger that are not inside a reported element are appended with role and tag
+    `img`. `truncated` is true when either list was cut.
+- `rpa_step {tab_id, action: {type, selector?, value?}, highlight_ms?}`. `type` is one of
+  `click`, `input`, `select`, `keypress`, `submit`, `scroll`, `navigate`, `wait`, `download`;
+  all but `download` run through the same code as a plan step. `selector` is
+  `{type: id|css|xpath|text, value}`; it is required for `click`, `input`, `select`, `submit` and
+  `download`, and a `keypress` without one targets the focused element. `wait` is capped at 10000 ms. `run_script`, `screenshot`, `switch_frame`, `assert`
+  and unknown types are refused with `UNSUPPORTED_ACTION`. The target is outlined for
+  `highlight_ms` (0-2000, default 600) before the action runs, and the outline is removed first.
+  Returns `{ok, error, url_before, url_after, navigated, duration_ms, download}`; an action that
+  runs but fails is `ok: false`, not a tool error. `download` is null except after a successful
+  download.
+- `download` saves a file through the browser. It takes the target's link href when that path ends
+  in `jpg|jpeg|png|gif|webp|svg|pdf|zip|csv|xlsx|docx|txt|mp4|mp3` (a segment containing `:`,
+  such as `File:X.jpg`, is not a file), otherwise the target's own or first descendant `<img>`
+  (best source, as in `image`). The page fetches it (`mode: cors`, no credentials) and clicks a
+  temporary `<a download>` on a blob URL; progress is polled every 200 ms for up to 10 s. If the
+  fetch fails, a same-origin URL is clicked directly (`method: "direct"`, `bytes: null`) and a
+  cross-origin one fails with "The site does not allow downloading this file from script; open it
+  instead". An HTTP error status fails without fallback. The page is never navigated. The file
+  name is the URL's last path segment, decoded, without a `NNNpx-` thumbnail prefix, else
+  `download`. Success adds `download: {url, file, bytes, method}`. A plan step of type `download`
+  in the panel fails with "only available through rpa_step".
+- Tool errors are `{"error": {"code", "message"}}` with `isError` set. Codes: `INVALID_INPUT`,
+  `TAB_NOT_FOUND`, `NO_BROWSER`, `SCRIPT_FAILED` (observe), `UNSUPPORTED_ACTION` (step).
 
 ## Requirements
 
