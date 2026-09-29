@@ -8,6 +8,8 @@ import ai.rever.boss.plugin.api.McpToolResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
@@ -18,6 +20,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.time.Clock
 
 /*
@@ -31,6 +34,7 @@ internal object TabErrorCodes {
     const val NO_BROWSER = "NO_BROWSER"
     const val SCRIPT_FAILED = "SCRIPT_FAILED"
     const val UNSUPPORTED_ACTION = "UNSUPPORTED_ACTION"
+    const val TAB_BUSY = "TAB_BUSY"
 }
 
 internal class TabToolException(val code: String, message: String) : Exception(message)
@@ -51,7 +55,12 @@ private fun TabToolException.toResult() = McpToolResult(toolErrorJson(code, mess
 
 internal data class ObserveArgs(val tabId: String, val maxElements: Int)
 
-internal data class StepArgs(val tabId: String, val action: RpaActionConfig, val highlightMs: Int)
+internal data class StepArgs(
+    val tabId: String,
+    val action: RpaActionConfig,
+    val highlightMs: Int,
+    val allowSensitive: Boolean = false,
+)
 
 internal const val OBSERVE_DEFAULT_MAX = 80
 internal const val OBSERVE_MAX_LIMIT = 200
@@ -86,6 +95,13 @@ private fun JsonObject.requiredString(key: String): String {
     return p.content.trim().takeIf { it.isNotEmpty() } ?: invalid("'$key' must not be empty")
 }
 
+private fun JsonObject.optionalBoolean(key: String): Boolean {
+    val p = this[key] ?: return false
+    if (p is JsonNull) return false
+    return (p as? JsonPrimitive)?.takeIf { !it.isString }?.content?.toBooleanStrictOrNull()
+        ?: invalid("'$key' must be a boolean")
+}
+
 /** Integer in [range], or [default] when absent/null. Accepts numeric strings; rejects fractions. */
 private fun JsonObject.optionalInt(key: String, default: Int, range: IntRange): Int {
     val el = this[key] ?: return default
@@ -108,6 +124,7 @@ internal fun parseStepArgs(raw: String): StepArgs {
     val o = parseObject(raw)
     val tabId = o.requiredString("tab_id")
     val highlight = o.optionalInt("highlight_ms", STEP_DEFAULT_HIGHLIGHT_MS, 0..STEP_MAX_HIGHLIGHT_MS)
+    val allowSensitive = o.optionalBoolean("allow_sensitive")
     val action = o["action"] as? JsonObject ?: invalid("'action' is required and must be an object")
     val type = (action["type"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.trim()?.lowercase()
         ?: invalid("'action.type' is required and must be a string")
@@ -141,12 +158,18 @@ internal fun parseStepArgs(raw: String): StepArgs {
     }
     when (type) {
         ActionTypes.NAVIGATE -> if (value.isNullOrBlank()) invalid("'navigate' requires action.value (a URL)")
+        ActionTypes.SELECT -> if (value == null) invalid("'select' requires action.value (an option value or label)")
         ActionTypes.WAIT -> if (value != null) {
             val ms = value.trim().toLongOrNull()
             if (ms == null || ms !in 0..STEP_MAX_WAIT_MS) invalid("'wait' value must be milliseconds between 0 and $STEP_MAX_WAIT_MS")
         }
     }
-    return StepArgs(tabId, RpaActionConfig(name = "rpa_step", type = type, selector = selector, value = value), highlight)
+    return StepArgs(
+        tabId,
+        RpaActionConfig(name = "rpa_step", type = type, selector = selector, value = value),
+        highlight,
+        allowSensitive,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -198,13 +221,33 @@ internal data class StepResult(
 )
 
 @Serializable
-internal data class DownloadInfo(val url: String, val file: String, val bytes: Long?, val method: String)
+internal data class DownloadInfo(
+    val url: String,
+    val file: String,
+    val bytes: Long?,
+    /** `blob-click` (fetched, then a temporary `<a download>` clicked) or `direct` (the URL's own link clicked). */
+    val method: String,
+    /** Always false: the page can trigger a download but cannot see whether the host saved it. */
+    @SerialName("save_verified") val saveVerified: Boolean = false,
+    val note: String,
+)
+
+internal fun downloadNote(method: String, bytes: Long?): String =
+    if (method == DOWNLOAD_METHOD_BLOB && bytes != null) {
+        "The page fetched $bytes bytes and triggered a browser download; whether the host saved the file is not confirmed"
+    } else {
+        "The page clicked a same-origin download link; whether the host saved the file is not confirmed"
+    }
+
+internal const val DOWNLOAD_METHOD_BLOB = "blob-click"
+internal const val DOWNLOAD_METHOD_DIRECT = "direct"
 
 /** What the observe script hands back, before ids and labels are finalised here. */
 @Serializable
 internal data class PageSnapshot(
     val url: String? = null,
     val title: String? = null,
+    /** Interactive candidates kept; the script stops at MAX + 1, so this is a lower bound once past MAX. */
     val total: Int = 0,
     /** Standalone images found, before the image cap. They follow the interactive ones in [items]. */
     val imageTotal: Int = 0,
@@ -254,11 +297,21 @@ internal const val GENERATED_ID_PATTERN = "^[0-9]|[0-9a-f]{8,}|:r[0-9a-z]+:"
 
 internal fun looksGeneratedId(id: String): Boolean = Regex(GENERATED_ID_PATTERN).containsMatchIn(id)
 
-/** Field names/ids that mark a credential or payment field. Shared with the observe script (case-insensitive). */
-internal const val SENSITIVE_NAME_PATTERN = "pass|pwd|card|cvv|ssn|otp"
+/**
+ * Field names/ids that mark a credential or payment field, matched against [sensitiveNameKey]'s form.
+ * Short tokens only as whole words, so passenger/compass/discard/footprint/classname are not flagged.
+ * Shared with the observe script.
+ */
+internal const val SENSITIVE_NAME_PATTERN =
+    "password|passwd|passcode|passphrase|pwd|cvv|cvc|card_?(?:num|no)|one_?time_?(?:code|pass)|" +
+        "(?:^|_)(?:pass|pin|otp|ssn|card|csc|cc|cc_?num(?:ber)?)(?:_|$)"
+
+/** camelCase split and every non-alphanumeric run folded to `_`, lowercased: `userPass-1` -> `user_pass_1`. */
+internal fun sensitiveNameKey(nameOrId: String): String =
+    nameOrId.replace(Regex("([a-z0-9])([A-Z])"), "$1_$2").lowercase().replace(Regex("[^a-z0-9]+"), "_")
 
 internal fun looksSensitiveName(nameOrId: String): Boolean =
-    Regex(SENSITIVE_NAME_PATTERN, RegexOption.IGNORE_CASE).containsMatchIn(nameOrId)
+    Regex(SENSITIVE_NAME_PATTERN).containsMatchIn(sensitiveNameKey(nameOrId))
 
 /** Longest data: URI reported as an image source; past it the source is null. Shared with the observe script. */
 internal const val DATA_URI_MAX = 200
@@ -339,6 +392,32 @@ private val IMAGE_HELPERS_JS: String =
         "return w || x || currentSrc || src || null; } " +
         "function safeSrc(u) { if (!u) { return null; } return (/^data:/i.test(u) && u.length > $DATA_URI_MAX) ? null : u; } "
 
+internal const val TEXT_WALK_CHARS = 1000
+internal const val TEXT_WALK_NODES = 2000
+
+/**
+ * Text of a subtree without its form controls, scripts or styles, read from text nodes so no field
+ * value is touched. Bounded ([TEXT_WALK_CHARS], [TEXT_WALK_NODES]) because aria-labelledby can point
+ * at a whole region. ES5, and only node properties, so tests can run it on plain objects.
+ */
+private const val TEXT_OF_JS: String =
+    "function textOf(n) { if (n.matches && n.matches(CONTROLS)) { return ''; } " +
+        "var out = '', stack = [n], visits = 0; " +
+        "while (stack.length && out.length < $TEXT_WALK_CHARS && visits++ < $TEXT_WALK_NODES) { var c = stack.pop(); " +
+        "if (c.nodeType === 3) { out += c.nodeValue + ' '; continue; } " +
+        "if (c.nodeType !== 1 || (c !== n && c.matches && c.matches(CONTROLS + ',script,style'))) { continue; } " +
+        "for (var k = c.childNodes.length - 1; k >= 0; k--) { stack.push(c.childNodes[k]); } } " +
+        "return norm(out); } "
+
+/**
+ * One xpath step. Unprefixed name tests never match an SVG/MathML element in an HTML document, so a
+ * foreign-namespace node is named through local-name().
+ */
+private const val XPATH_STEP_JS: String =
+    "function xpathStep(ns, localName, nodeName, i) { " +
+        "if (!ns || ns === 'http://www.w3.org/1999/xhtml') { return String(nodeName).toLowerCase() + '[' + i + ']'; } " +
+        "return \"*[local-name()='\" + localName + \"'][\" + i + ']'; } "
+
 /**
  * Pure helper functions of the observe script (no DOM beyond what each takes as an argument), kept
  * apart so tests can evaluate them. ES5 only.
@@ -348,7 +427,7 @@ private val IMAGE_HELPERS_JS: String =
  */
 internal val OBSERVE_HELPERS_JS: String =
     "var GEN_ID = new RegExp(${GENERATED_ID_PATTERN.asJsString()}); " +
-        "var SENSITIVE = new RegExp(${SENSITIVE_NAME_PATTERN.asJsString()}, 'i'); " +
+        "var SENSITIVE = new RegExp(${SENSITIVE_NAME_PATTERN.asJsString()}); " +
         "var CONTROLS = 'input,textarea,select,[contenteditable]'; " +
         "function norm(s) { return s == null ? '' : String(s).replace(/\\s+/g, ' ').replace(/^ | $/g, '').slice(0, 200); } " +
         // A CSS attribute value in double quotes. Values with control characters are not used at all.
@@ -366,12 +445,13 @@ internal val OBSERVE_HELPERS_JS: String =
         "case 'search': return 'searchbox'; case 'range': return 'slider'; " +
         "case 'number': return 'spinbutton'; default: return 'textbox'; } } " +
         "return null; } " +
+        "function sensitiveKey(s) { return String(s || '').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().replace(/[^a-z0-9]+/g, '_'); } " +
         "function isSensitive(type, autocomplete, name, id) { " +
         "if (type === 'password') { return true; } " +
-        "var ac = (autocomplete || '').toLowerCase(); " +
-        "if (/(^|\\s)cc-/.test(ac) || ac.indexOf('one-time-code') !== -1) { return true; } " +
-        "return SENSITIVE.test(name || '') || SENSITIVE.test(id || ''); } " +
-        IMAGE_HELPERS_JS
+        "var ac = ' ' + (autocomplete || '').toLowerCase().replace(/\\s+/g, ' ') + ' '; " +
+        "if (/ cc-/.test(ac) || / (one-time-code|current-password|new-password) /.test(ac)) { return true; } " +
+        "return SENSITIVE.test(sensitiveKey(name)) || SENSITIVE.test(sensitiveKey(id)); } " +
+        IMAGE_HELPERS_JS + TEXT_OF_JS + XPATH_STEP_JS
 
 /** DOM-touching image helpers, shared by the observe and download scripts. Expects [OBSERVE_HELPERS_JS]. */
 private const val IMAGE_DOM_JS: String =
@@ -381,21 +461,17 @@ private const val IMAGE_DOM_JS: String =
 
 /** The DOM-walking part of the observe script. Expects [OBSERVE_HELPERS_JS] in scope and `MAX`. */
 private val OBSERVE_BODY_JS: String =
-    "function textOf(n) { if (n.matches && n.matches(CONTROLS)) { return ''; } var c = n.cloneNode(true); " +
-        "var drop = c.querySelectorAll(CONTROLS + ',script,style'); " +
-        "for (var i = 0; i < drop.length; i++) { if (drop[i].parentNode) { drop[i].parentNode.removeChild(drop[i]); } } " +
-        "return norm(c.textContent); } " +
-        "function rendered(el) { var r = el.getBoundingClientRect(); " +
-        "if (!(r.width > 0 && r.height > 0)) { return false; } " +
-        "var cs = window.getComputedStyle(el); " +
+    "function hasSize(r) { return r.width > 0 && r.height > 0; } " +
+        "function styledVisible(el) { var cs = window.getComputedStyle(el); " +
         "if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') { return false; } " +
         "return !el.closest('[hidden],[aria-hidden=\"true\"]'); } " +
+        "function rendered(el) { return hasSize(el.getBoundingClientRect()) && styledVisible(el); } " +
         "function disabled(el) { if (el.getAttribute('aria-disabled') === 'true') { return true; } " +
         "try { return el.matches(':disabled'); } catch (e) { return false; } } " +
-        "function inView(el) { var r = el.getBoundingClientRect(); " +
-        "var w = window.innerWidth || document.documentElement.clientWidth; " +
-        "var h = window.innerHeight || document.documentElement.clientHeight; " +
-        "return r.bottom > 0 && r.right > 0 && r.top < h && r.left < w; } " +
+        "var VW = window.innerWidth || document.documentElement.clientWidth; " +
+        "var VH = window.innerHeight || document.documentElement.clientHeight; " +
+        "function rectInView(r) { return r.bottom > 0 && r.right > 0 && r.top < VH && r.left < VW; } " +
+        "function inView(el) { return rectInView(el.getBoundingClientRect()); } " +
         "function entry(el, tag, role) { return tag === 'input' || tag === 'textarea' || tag === 'select' || " +
         "el.isContentEditable || role === 'textbox' || role === 'searchbox' || role === 'combobox'; } " +
         "function labelOf(el, tag, role, type) { var s; " +
@@ -433,7 +509,7 @@ private val OBSERVE_BODY_JS: String =
         "for (var n = el; n && n.nodeType === 1; n = n.parentNode) { var i = 1; " +
         "for (var s = n.previousSibling; s; s = s.previousSibling) { " +
         "if (s.nodeType === 1 && s.nodeName === n.nodeName) { i++; } } " +
-        "parts.unshift(n.nodeName.toLowerCase() + '[' + i + ']'); } " +
+        "parts.unshift(xpathStep(n.namespaceURI, n.localName, n.nodeName, i)); } " +
         "return '/' + parts.join('/'); } " +
         "function selectorOf(el, tag) { var id = el.getAttribute('id'); " +
         "if (usableAttr(id) && !generatedId(id) && document.getElementById(id) === el && " +
@@ -446,10 +522,14 @@ private val OBSERVE_BODY_JS: String =
         "if (usableAttr(ty) && usableAttr(nm)) { var tn = tag + '[type=' + cssq(ty) + '][name=' + cssq(nm) + ']'; " +
         "if (uniqueCss(tn, el)) { return { type: 'css', value: tn }; } } " +
         "return { type: 'xpath', value: xpathOf(el) }; } " +
-        "var all = Array.prototype.slice.call(document.querySelectorAll(${'$'}SELECTOR)); " +
-        "var seen = []; for (var i = 0; i < all.length; i++) { var el = all[i]; " +
-        "if (!disabled(el) && rendered(el)) { seen.push({ el: el, v: inView(el), i: seen.length }); } } " +
-        "seen.sort(byView); var picked = seen.slice(0, MAX); " +
+        // Rects first (cheap) to split in-viewport from the rest; computed style only on candidates
+        // taken in that order, stopping at MAX + 1 so `truncated` stays exact without styling the page.
+        "var all = document.querySelectorAll(${'$'}SELECTOR), inv = [], outv = []; " +
+        "for (var i = 0; i < all.length; i++) { var r = all[i].getBoundingClientRect(); " +
+        "if (hasSize(r)) { (rectInView(r) ? inv : outv).push(all[i]); } } " +
+        "var seen = []; function take(list, v) { for (var i = 0; i < list.length && seen.length <= MAX; i++) { " +
+        "var el = list[i]; if (!disabled(el) && styledVisible(el)) { seen.push({ el: el, v: v, i: seen.length }); } } } " +
+        "take(inv, true); take(outv, false); var picked = seen.slice(0, MAX); " +
         "var items = picked.map(function (c) { var el = c.el; " +
         "var tag = el.tagName.toLowerCase(); var img = imgIn(el, tag); " +
         "var type = (tag === 'input' || tag === 'button') ? (el.getAttribute('type') || (tag === 'button' ? 'submit' : 'text')).toLowerCase() : null; " +
@@ -619,7 +699,7 @@ internal fun downloadStartScript(url: String, file: String, token: String): Stri
         "a.style.display = 'none'; (document.body || document.documentElement).appendChild(a); a.click(); " +
         "window.setTimeout(function () { if (a.parentNode) { a.parentNode.removeChild(a); } }, 1000); } " +
         "function direct() { var same = false; try { same = new URL(url, location.href).origin === location.origin; } catch (e) {} " +
-        "if (same) { save(url); st.method = 'direct'; st.state = 'done'; } " +
+        "if (same) { save(url); st.method = '$DOWNLOAD_METHOD_DIRECT'; st.state = 'done'; } " +
         "else { st.state = 'failed'; st.error = ${DOWNLOAD_CROSS_ORIGIN_ERROR.asJsString()}; } } " +
         "if (!window.fetch) { direct(); return true; } " +
         "if (window.AbortController) { st.ctl = new AbortController(); } " +
@@ -627,7 +707,7 @@ internal fun downloadStartScript(url: String, file: String, token: String): Stri
         ".then(function (r) { if (!r.ok) { throw { http: r.status }; } return r.blob(); })" +
         ".then(function (b) { if (st.state !== 'pending') { return; } var u = URL.createObjectURL(b); save(u); " +
         "window.setTimeout(function () { URL.revokeObjectURL(u); }, $DOWNLOAD_REVOKE_MS); " +
-        "st.bytes = b.size; st.method = 'blob'; st.state = 'done'; }, " +
+        "st.bytes = b.size; st.method = '$DOWNLOAD_METHOD_BLOB'; st.state = 'done'; }, " +
         "function (e) { if (st.state !== 'pending') { return; } " +
         "if (e && e.http) { st.state = 'failed'; st.error = 'The server answered HTTP ' + e.http; } else { direct(); } }); " +
         "return true; } catch (e) { return 'threw: ' + e.message; } })()"
@@ -649,23 +729,56 @@ internal fun downloadAbortScript(token: String): String =
 // Execution
 // ---------------------------------------------------------------------------------------------
 
+/** Different documents: a fragment-only change (`#section`) is not a navigation. */
+internal fun isNavigation(before: String?, after: String?): Boolean =
+    before != null && after != null && before.substringBefore('#') != after.substringBefore('#')
+
 /** Settle after the action before reading the URL again. */
 internal const val STEP_URL_SETTLE_MS = 300L
 
+/** Is this element one [isSensitive] flags? Same inputs as the observe script, so both agree. */
+internal fun sensitiveTargetScript(locate: String): String =
+    "(function () { try { " + OBSERVE_HELPERS_JS +
+        "var el = $locate; if (!el || !el.getAttribute) { return false; } var tag = el.tagName.toLowerCase(); " +
+        "var type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : null; " +
+        "return isSensitive(type, el.getAttribute('autocomplete'), el.getAttribute('name'), el.getAttribute('id')); " +
+        "} catch (e) { return 'threw: ' + e.message; } })()"
+
+/** [block]'s value, or null when it throws - except cancellation, which always propagates. */
+internal suspend inline fun <T> orNullUnlessCancelled(block: () -> T): T? =
+    try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
+    }
+
+/**
+ * [busyTabIds] names the tabs an RPA Engine panel run is currently driving; rpa_step refuses those,
+ * since a step landing mid-plan interleaves with the run the way a second rpa_run would.
+ */
 internal class TabActions(
     private val downloadTimeoutMs: Long = DOWNLOAD_TIMEOUT_MS,
+    private val busyTabIds: () -> Set<String> = { emptySet() },
     private val activeTabsProvider: () -> ActiveTabsProvider?,
 ) {
 
     // rpa_step results carry the outcome; the runner's fallback warning has nowhere to go.
     private val runner = ActionRunner { _, _ -> }
 
+    // One step at a time per tab: two concurrent steps interleave their awaitElement polls and a
+    // highlight overlay. Entries are never removed; there is one per tab id ever stepped.
+    private val tabLocks = ConcurrentHashMap<String, Mutex>()
+
     fun tools(): List<McpToolDefinition> = listOf(
         McpToolDefinition(
             name = "rpa_observe",
             description = OBSERVE_DESCRIPTION,
             inputSchema = OBSERVE_SCHEMA,
-            readOnly = true,
+            // Not read-only: it reads page content (link text, hrefs, captions) from any tab, including
+            // logged-in ones, so the host should ask rather than auto-approve.
+            readOnly = false,
             handler = McpToolHandler { args -> observe(args.raw) },
         ),
         McpToolDefinition(
@@ -704,9 +817,49 @@ internal class TabActions(
     suspend fun step(raw: String): McpToolResult = try {
         val args = parseStepArgs(raw)
         val browser = resolveTab(args.tabId)
-        McpToolResult(TabJson.encodeToString(StepResult.serializer(), runStep(browser, args)))
+        refuseIfEngineRunning(args.tabId)
+        val result = tabLocks.getOrPut(args.tabId) { Mutex() }.withLock {
+            // Re-checked under the lock: a run may have started while this step waited.
+            refuseIfEngineRunning(args.tabId)
+            runStep(browser, args)
+        }
+        McpToolResult(TabJson.encodeToString(StepResult.serializer(), result))
     } catch (e: TabToolException) {
         e.toResult()
+    }
+
+    private fun refuseIfEngineRunning(tabId: String) {
+        if (tabId in runCatching(busyTabIds).getOrDefault(emptySet())) {
+            throw TabToolException(
+                TabErrorCodes.TAB_BUSY,
+                "An RPA Engine run is driving tab '$tabId'; call rpa_stop first or step a different tab",
+            )
+        }
+    }
+
+    /**
+     * Refuses `input` into a field the observe script would flag sensitive, unless the caller opted
+     * in. Returns a failure when the element is missing, so the step does not wait for it twice.
+     */
+    private suspend fun sensitiveGate(browser: BrowserIntegration, action: RpaActionConfig): Pair<Boolean, String?>? {
+        val locate =
+            when (val target = runner.findTarget(browser, action.selector, null)) {
+                TargetLookup.Unsupported -> return Pair(false, runner.unsupportedSelector(action.selector))
+                TargetLookup.Missing ->
+                    return Pair(false, "Could not type into '${action.selector.value}' (no match, or it has no value)")
+                is TargetLookup.Found -> target.locate
+            }
+        val sensitive = browser.executeJavaScript(sensitiveTargetScript(locate))
+        if (sensitive == false || sensitive == "false") return null
+        // Anything but an explicit false fails closed, without typing.
+        if (!sensitive.isJsTrue()) {
+            return Pair(false, "Could not check whether '${action.selector.value}' is a sensitive field (the page may be navigating)")
+        }
+        throw TabToolException(
+            TabErrorCodes.INVALID_INPUT,
+            "'${action.selector.value}' is a password, payment or one-time-code field; " +
+                "pass allow_sensitive: true to type into it",
+        )
     }
 
     private suspend fun runStep(browser: BrowserIntegration, args: StepArgs): StepResult {
@@ -714,11 +867,13 @@ internal class TabActions(
         val before = currentUrl(browser)
         val hook = if (args.highlightMs > 0) highlightHook(args.highlightMs) else null
         // execute() already maps script errors and thrown exceptions to (false, reason).
+        val refused =
+            if (args.action.type == ActionTypes.INPUT && !args.allowSensitive) sensitiveGate(browser, args.action) else null
         val (ok, error, download) =
-            if (args.action.type == ActionTypes.DOWNLOAD) {
-                download(browser, args.action.selector, hook)
-            } else {
-                runner.execute(browser, args.action, hook).let { Triple(it.first, it.second, null) }
+            when {
+                refused != null -> Triple(refused.first, refused.second, null)
+                args.action.type == ActionTypes.DOWNLOAD -> download(browser, args.action.selector, hook)
+                else -> runner.execute(browser, args.action, hook).let { Triple(it.first, it.second, null) }
             }
         delay(STEP_URL_SETTLE_MS)
         val after = currentUrl(browser)
@@ -727,7 +882,7 @@ internal class TabActions(
             error = error,
             urlBefore = before,
             urlAfter = after,
-            navigated = before != null && after != null && before != after,
+            navigated = isNavigation(before, after),
             durationMs = Clock.System.now().toEpochMilliseconds() - started,
             download = download,
         )
@@ -764,7 +919,8 @@ internal class TabActions(
                     throw e
                 }
             if (status.state != "done") return fail(status.error ?: "The download failed")
-            Triple(true, null, DownloadInfo(url, file, status.bytes, status.method ?: "blob"))
+            val method = status.method ?: DOWNLOAD_METHOD_BLOB
+            Triple(true, null, DownloadInfo(url, file, status.bytes, method, note = downloadNote(method, status.bytes)))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -788,7 +944,7 @@ internal class TabActions(
     }
 
     private suspend fun abortDownload(browser: BrowserIntegration, token: String) {
-        withContext(NonCancellable) { runCatching { browser.executeJavaScript(downloadAbortScript(token)) } }
+        withContext(NonCancellable) { orNullUnlessCancelled { browser.executeJavaScript(downloadAbortScript(token)) } }
     }
 
     private fun <T> decodeOrNull(result: Any?, serializer: KSerializer<T>): T? =
@@ -798,21 +954,20 @@ internal class TabActions(
 
     private suspend fun highlight(browser: BrowserIntegration, locate: String, ms: Int) {
         val token = "h" + Clock.System.now().toEpochMilliseconds().toString(36) + (0..9999).random()
-        val drawn = runCatching { browser.executeJavaScript(highlightScript(locate, token, ms)) }
-            .getOrNull().isJsTrue()
+        val drawn = orNullUnlessCancelled { browser.executeJavaScript(highlightScript(locate, token, ms)) }.isJsTrue()
         if (!drawn) return
         try {
             delay(ms.toLong())
         } finally {
             withContext(NonCancellable) {
-                runCatching { browser.executeJavaScript(removeHighlightScript(token)) }
+                orNullUnlessCancelled { browser.executeJavaScript(removeHighlightScript(token)) }
             }
         }
     }
 
     private suspend fun currentUrl(browser: BrowserIntegration): String? =
-        runCatching { browser.getCurrentUrl() }.getOrNull()?.takeIf { it.isNotBlank() }
-            ?: (runCatching { browser.executeJavaScript("location.href") }.getOrNull() as? String)
+        orNullUnlessCancelled { browser.getCurrentUrl() }?.takeIf { it.isNotBlank() }
+            ?: (orNullUnlessCancelled { browser.executeJavaScript("location.href") } as? String)
 
     private fun resolveTab(tabId: String): BrowserIntegration {
         val provider = activeTabsProvider()
@@ -834,15 +989,21 @@ internal class TabActions(
             "List the interactive elements (links, buttons, fields, selects, ARIA widgets) currently rendered " +
                 "in a browser tab, in-viewport first, then up to 20 large standalone images (role img). Each element " +
                 "has a label, role and a selector that rpa_step accepts as-is, and an image {src, alt, width, height} " +
-                "when it is or contains one. Field values are never returned; password/payment/OTP fields are flagged sensitive. " +
-                "Works on any browser tab by id; no RPA Engine panel needed."
+                "when it is or contains one. Typed text and selected options are never returned (checkbox/radio " +
+                "checked state is); password/payment/OTP fields are flagged sensitive. Shadow DOM and iframe " +
+                "contents are not observed. Works on any browser tab by id, including logged-in ones; " +
+                "no RPA Engine panel needed."
 
         const val STEP_DESCRIPTION =
             "Perform exactly one action in a browser tab by id: click, input, select, keypress, submit, scroll, " +
-                "navigate, wait or download, with the same semantics as an RPA Engine plan step; download saves " +
-                "the element's image or linked file through the browser. Selectors are " +
+                "navigate, wait or download, with the same semantics as an RPA Engine plan step. download " +
+                "(rpa_step only, not a plan verb) fetches the element's image or linked file without cookies " +
+                "(so a file behind a login answers HTTP 401/403) and triggers a browser download; the result " +
+                "reports save_verified false, since the page cannot see whether the host saved it. Selectors are " +
                 "{type: id|css|xpath|text, value}; use the ones rpa_observe returns. The target element is briefly " +
-                "outlined first (highlight_ms, 0 to disable). Returns ok/error plus the URL before and after. " +
+                "outlined first (highlight_ms, 0 to disable). Returns ok/error plus the URL before and after; " +
+                "navigated ignores a fragment-only change. input into a field rpa_observe flags sensitive is " +
+                "refused unless allow_sensitive is true. A tab an RPA Engine run is driving is refused (TAB_BUSY). " +
                 "run_script, screenshot, switch_frame and assert are refused."
 
         const val OBSERVE_SCHEMA =
@@ -857,9 +1018,10 @@ internal class TabActions(
                 """"action":{"type":"object","properties":{""" +
                 """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download"]},""" +
                 """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit, download; optional for keypress (defaults to the focused element)."},""" +
-                """"value":{"type":"string","description":"input: text to type; select: option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000)."}""" +
+                """"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000)."}""" +
                 """},"required":["type"]},""" +
-                """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."}""" +
+                """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."},""" +
+                """"allow_sensitive":{"type":"boolean","default":false,"description":"input only: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."}""" +
                 """},"required":["tab_id","action"]}"""
     }
 }

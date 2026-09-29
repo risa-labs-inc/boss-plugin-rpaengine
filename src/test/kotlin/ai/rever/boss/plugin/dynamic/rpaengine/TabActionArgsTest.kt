@@ -84,11 +84,48 @@ class TabActionArgsTest {
     fun `schema and description offer download`() {
         assertTrue(TabActions.STEP_SCHEMA.contains(""""enum":["click","input","select","keypress","submit","scroll","navigate","wait","download"]"""))
         assertTrue(TabActions.STEP_SCHEMA.contains("Required for click, input, select, submit, download;"))
-        assertTrue(TabActions.STEP_DESCRIPTION.contains("download saves the element's image or linked file"))
+        assertTrue(TabActions.STEP_DESCRIPTION.contains("download (rpa_step only, not a plan verb)"))
+        assertTrue(TabActions.STEP_DESCRIPTION.contains("HTTP 401/403"), "credentials are omitted; say what that costs")
+        assertTrue(TabActions.STEP_DESCRIPTION.contains("save_verified false"))
         // Parseable JSON, with the enum matching what the parser allows.
         val enum = Json.parseToJsonElement(TabActions.STEP_SCHEMA).jsonObject["properties"]!!.jsonObject["action"]!!
             .jsonObject["properties"]!!.jsonObject["type"]!!.jsonObject["enum"]!!.jsonArray.map { it.jsonPrimitive.content }
         assertEquals(STEP_ALLOWED_TYPES, enum.toSet())
+    }
+
+    @Test
+    fun `select requires a value, input may omit it`() {
+        assertEquals(
+            TabErrorCodes.INVALID_INPUT,
+            code { parseStepArgs("""{"tab_id":"t","action":{"type":"select","selector":{"type":"id","value":"s"}}}""") },
+        )
+        assertEquals("", parseStepArgs("""{"tab_id":"t","action":{"type":"select","selector":{"type":"id","value":"s"},"value":""}}""").action.value)
+        assertNull(parseStepArgs("""{"tab_id":"t","action":{"type":"input","selector":{"type":"id","value":"q"}}}""").action.value)
+        assertTrue(TabActions.STEP_SCHEMA.contains("empty or absent clears the field"))
+    }
+
+    @Test
+    fun `allow_sensitive defaults off and must be a boolean`() {
+        val base = """{"tab_id":"t","action":{"type":"input","selector":{"type":"id","value":"pw"},"value":"x"}"""
+        assertEquals(false, parseStepArgs("$base}").allowSensitive)
+        assertEquals(false, parseStepArgs("""$base,"allow_sensitive":null}""").allowSensitive)
+        assertEquals(true, parseStepArgs("""$base,"allow_sensitive":true}""").allowSensitive)
+        listOf("\"true\"", "1", "{}").forEach {
+            assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs("""$base,"allow_sensitive":$it}""") }, it)
+        }
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""allow_sensitive":{"type":"boolean""""))
+    }
+
+    @Test
+    fun `rpa_observe is not read-only`() {
+        val tools = TabActions { null }.tools().associateBy { it.name }
+        assertEquals(false, tools.getValue("rpa_observe").readOnly)
+        assertEquals(false, tools.getValue("rpa_step").readOnly)
+    }
+
+    @Test
+    fun `download is marked rpa_step-only wherever it is displayed`() {
+        assertEquals("Download (rpa_step only)", ActionTypes.getDisplayName(ActionTypes.DOWNLOAD))
     }
 
     @Test

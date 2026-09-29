@@ -44,16 +44,22 @@ an error if the panel is closed. None of the tools is permission-gated, includin
 start automation or act on a page.
 
 `rpa_observe` and `rpa_step` take a `tab_id` (from `tabs_list`) and work on any browser tab with
-no panel open.
+no panel open, including the user's logged-in tabs. That is deliberate (LLM RPA drives the tab the
+user chose); see "Any-tab reach" in AGENTS.md for the mitigations. Both are declared non-read-only,
+so a host that asks before non-read-only tools asks for them.
 
-- `rpa_observe {tab_id, max_elements?}` (read-only; `max_elements` 1-200, default 80). Returns
+- `rpa_observe {tab_id, max_elements?}` (`max_elements` 1-200, default 80). Returns
   `{tab_id, url, title, truncated, elements[]}`. Each element has `id` (`e1`..`eN`, in-viewport
   first, then document order), `role`, `tag`, `label` (accessible name, at most 80 chars),
   `type`, `placeholder`, `href`, `image`, `options` (a select's first 30 option labels), `checked`
   (checkbox/radio), `sensitive`, `in_viewport` and a `selector` (`id`, `css` or `xpath`) checked
-  in-page to match only that element. Disabled and unrendered elements are skipped. Field values
-  and contenteditable text are never read. `sensitive` is true for password fields,
-  `cc-*`/`one-time-code` autocomplete, and names/ids matching `pass|pwd|card|cvv|ssn|otp`.
+  in-page to match only that element (an SVG/MathML element's xpath names it by `local-name()`).
+  Disabled and unrendered elements are skipped; shadow DOM and iframe contents are not observed.
+  Typed text, selected options and contenteditable text are never read; checkbox/radio `checked`
+  state is. `sensitive` is true for password fields, `cc-*`, `one-time-code`, `current-password`
+  and `new-password` autocomplete, and names/ids containing `password|passwd|passcode|pwd|cvv|cvc`
+  or a whole word `pass|pin|otp|ssn|card|csc|cc` (camelCase and `-`/`_` split words, so
+  `userPass` is flagged and `passenger`, `compass`, `discard` are not).
   - `image` is `{src, alt, width, height}` when the element is an `<img>` or contains one rendered
     at 48x48 or larger, else null. `src` is absolute: the largest `srcset` candidate, else
     `currentSrc`, else `src`; a `data:` URI over 200 chars is reported as null. `width`/`height`
@@ -64,16 +70,21 @@ no panel open.
   - After the interactive elements (capped by `max_elements`), up to 20 rendered `<img>` elements
     of 100x100 or larger that are not inside a reported element are appended with role and tag
     `img`. `truncated` is true when either list was cut.
-- `rpa_step {tab_id, action: {type, selector?, value?}, highlight_ms?}`. `type` is one of
+- `rpa_step {tab_id, action: {type, selector?, value?}, highlight_ms?, allow_sensitive?}`. `type` is one of
   `click`, `input`, `select`, `keypress`, `submit`, `scroll`, `navigate`, `wait`, `download`;
   all but `download` run through the same code as a plan step. `selector` is
   `{type: id|css|xpath|text, value}`; it is required for `click`, `input`, `select`, `submit` and
-  `download`, and a `keypress` without one targets the focused element. `wait` is capped at 10000 ms. `run_script`, `screenshot`, `switch_frame`, `assert`
+  `download`, and a `keypress` without one targets the focused element. `select` requires a
+  `value`; an `input` with an empty or absent `value` clears the field. `wait` is capped at 10000 ms. `run_script`, `screenshot`, `switch_frame`, `assert`
   and unknown types are refused with `UNSUPPORTED_ACTION`. The target is outlined for
   `highlight_ms` (0-2000, default 600) before the action runs, and the outline is removed first.
   Returns `{ok, error, url_before, url_after, navigated, duration_ms, download}`; an action that
-  runs but fails is `ok: false`, not a tool error. `download` is null except after a successful
-  download.
+  runs but fails is `ok: false`, not a tool error. `navigated` ignores a fragment-only change.
+  `download` is null except after a successful download.
+  - `input` into a field that `rpa_observe` would flag `sensitive` is refused with `INVALID_INPUT`
+    unless `allow_sensitive: true` is passed.
+  - A tab an RPA Engine panel run is driving is refused with `TAB_BUSY`, and steps on one tab run
+    one at a time.
 - `download` saves a file through the browser. It takes the target's link href when that path ends
   in `jpg|jpeg|png|gif|webp|svg|pdf|zip|csv|xlsx|docx|txt|mp4|mp3` (a segment containing `:`,
   such as `File:X.jpg`, is not a file), otherwise the target's own or first descendant `<img>`
@@ -83,10 +94,14 @@ no panel open.
   cross-origin one fails with "The site does not allow downloading this file from script; open it
   instead". An HTTP error status fails without fallback. The page is never navigated. The file
   name is the URL's last path segment, decoded, without a `NNNpx-` thumbnail prefix, else
-  `download`. Success adds `download: {url, file, bytes, method}`. A plan step of type `download`
-  in the panel fails with "only available through rpa_step".
+  `download`. Success adds `download: {url, file, bytes, method, save_verified, note}`: `method` is
+  `blob-click` or `direct`, and `save_verified` is always false, because the page can trigger a
+  download but cannot see whether the host saved it. Credentials are omitted, so a file behind a
+  login fails with HTTP 401/403. `download` is not a plan verb: a plan step of that type fails in
+  the panel with "only available through rpa_step". Verified in BOSS's embedded browser
+  (JxBrowser), where the file lands in `~/Downloads`.
 - Tool errors are `{"error": {"code", "message"}}` with `isError` set. Codes: `INVALID_INPUT`,
-  `TAB_NOT_FOUND`, `NO_BROWSER`, `SCRIPT_FAILED` (observe), `UNSUPPORTED_ACTION` (step).
+  `TAB_NOT_FOUND`, `NO_BROWSER`, `SCRIPT_FAILED` (observe), `UNSUPPORTED_ACTION` and `TAB_BUSY` (step).
 
 ## Requirements
 

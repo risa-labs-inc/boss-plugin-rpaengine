@@ -74,6 +74,8 @@ class RpaengineComponent(
     val executionSummary: StateFlow<ExecutionSummary?> = _executionSummary.asStateFlow()
 
     // Browser tab and integration for real execution
+    // Volatile: read from MCP tool threads by liveRunTabId.
+    @Volatile
     private var currentTabId: String? = null
     private var browserIntegration: BrowserIntegration? = null
 
@@ -244,6 +246,15 @@ class RpaengineComponent(
         data class Busy(val status: ExecutionStatus) : LoadOutcome
         data class NoMatch(val available: List<String>) : LoadOutcome
     }
+
+    /** The tab this panel's run is driving, while one is live; rpa_step refuses it. */
+    fun liveRunTabId(): String? =
+        currentTabId?.takeIf {
+            when (_executionStatus.value) {
+                ExecutionStatus.EXECUTING, ExecutionStatus.PAUSED, ExecutionStatus.LOADING -> true
+                else -> false
+            }
+        }
 
     /** The loaded configuration's name, so a caller can tell what a run would execute. */
     fun loadedConfigurationName(): String? = _selectedConfig.value?.name

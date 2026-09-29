@@ -8,7 +8,14 @@ import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.vector.ImageVector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.boolean
@@ -135,12 +142,33 @@ class TabActionsTest {
         )
         assertEquals(
             """{"ok":true,"error":null,"url_before":"a","url_after":"a","navigated":false,"duration_ms":5,""" +
-                """"download":{"url":"https://x.test/a.jpg","file":"a.jpg","bytes":null,"method":"direct"}}""",
+                """"download":{"url":"https://x.test/a.jpg","file":"a.jpg","bytes":null,"method":"direct",""" +
+                """"save_verified":false,"note":"${downloadNote(DOWNLOAD_METHOD_DIRECT, null)}"}}""",
             TabJson.encodeToString(
                 StepResult.serializer(),
-                StepResult(true, null, "a", "a", false, 5, DownloadInfo("https://x.test/a.jpg", "a.jpg", null, "direct")),
+                StepResult(
+                    true, null, "a", "a", false, 5,
+                    DownloadInfo("https://x.test/a.jpg", "a.jpg", null, DOWNLOAD_METHOD_DIRECT, note = downloadNote(DOWNLOAD_METHOD_DIRECT, null)),
+                ),
             ),
         )
+    }
+
+    @Test
+    fun `a fragment-only change is not a navigation`() {
+        assertFalse(isNavigation("https://a.test/p", "https://a.test/p#section"))
+        assertFalse(isNavigation("https://a.test/p#a", "https://a.test/p#b"))
+        assertTrue(isNavigation("https://a.test/p#a", "https://a.test/q#a"))
+        assertTrue(isNavigation("https://a.test/p", "https://a.test/p?x=1"))
+        assertFalse(isNavigation(null, "https://a.test/"))
+    }
+
+    @Test
+    fun `download notes never claim the file was saved`() {
+        val blob = downloadNote(DOWNLOAD_METHOD_BLOB, 20481)
+        assertTrue(blob.contains("fetched 20481 bytes") && blob.contains("not confirmed"), blob)
+        assertTrue(downloadNote(DOWNLOAD_METHOD_DIRECT, null).contains("not confirmed"))
+        assertFalse(blob.contains("saved to") || blob.contains("was saved"))
     }
 
     // ---- end to end against fakes -----------------------------------------------------------
@@ -149,7 +177,7 @@ class TabActionsTest {
         val scripts = mutableListOf<String>()
         var respond: (String) -> Any? = { true }
         override suspend fun executeJavaScript(script: String): Any? {
-            scripts += script
+            synchronized(scripts) { scripts += script }
             return respond(script)
         }
         override fun isBrowserAvailable() = true
@@ -289,7 +317,7 @@ class TabActionsTest {
 
     @Test
     fun `download highlights, resolves, starts, polls - and reports the file`() = runBlocking {
-        val b = downloadPage("""{"state":"pending"}""", """{"state":"done","bytes":20481,"method":"blob"}""")
+        val b = downloadPage("""{"state":"pending"}""", """{"state":"done","bytes":20481,"method":"blob-click"}""")
         val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(downloadStep)
         assertFalse(r.isError, r.text)
         val o = Json.parseToJsonElement(r.text).jsonObject
@@ -299,7 +327,9 @@ class TabActionsTest {
         assertEquals(thumb, d["url"]!!.jsonPrimitive.content)
         assertEquals("Persialainen.jpg", d["file"]!!.jsonPrimitive.content)
         assertEquals("20481", d["bytes"]!!.jsonPrimitive.content)
-        assertEquals("blob", d["method"]!!.jsonPrimitive.content)
+        assertEquals(DOWNLOAD_METHOD_BLOB, d["method"]!!.jsonPrimitive.content)
+        assertEquals(false, d["save_verified"]!!.jsonPrimitive.boolean)
+        assertEquals(downloadNote(DOWNLOAD_METHOD_BLOB, 20481), d["note"]!!.jsonPrimitive.content)
 
         val draw = b.scripts.indexOfFirst { it.contains(HIGHLIGHT_ATTR) && it.contains("createElement") }
         val resolve = b.scripts.indexOfFirst { it.contains("source: 'link'") }
@@ -345,5 +375,98 @@ class TabActionsTest {
         assertEquals(false, t["ok"]!!.jsonPrimitive.boolean)
         assertTrue(t["error"]!!.jsonPrimitive.content.startsWith("The download did not finish"))
         assertTrue(slow.scripts.last { it.contains("__rpaDownloads") }.contains("ctl.abort()"), "the fetch is aborted")
+    }
+
+    @Test
+    fun `cancelling a pending download aborts it in the page`() = runBlocking {
+        val b = downloadPage()
+        val job = launch(Dispatchers.Default) { TabActions { FakeTabs(mapOf("t" to b)) }.step(downloadStep) }
+        withTimeout(5_000) { while (synchronized(b.scripts) { b.scripts.none { it.contains("state: 'missing'") } }) delay(10) }
+        job.cancelAndJoin()
+        val last = synchronized(b.scripts) { b.scripts.last { it.contains("__rpaDownloads") } }
+        assertTrue(last.contains("ctl.abort()"), "cancellation must abort the fetch: $last")
+    }
+
+    // ---- sensitive fields, engine-run tabs, per-tab serialisation ------------------------------
+
+    private fun inputStep(allow: Boolean? = null) =
+        """{"tab_id":"t","action":{"type":"input","selector":{"type":"id","value":"pw"},"value":"hunter2"},"highlight_ms":0""" +
+            (allow?.let { ""","allow_sensitive":$it""" } ?: "") + "}"
+
+    @Test
+    fun `input into a sensitive field is refused without allow_sensitive, and types nothing`() = runBlocking {
+        val b = FakeBrowser() // answers true to everything, including the sensitivity check
+        val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep())
+        assertTrue(r.isError, r.text)
+        assertEquals(TabErrorCodes.INVALID_INPUT, errorCode(r.text))
+        assertTrue(r.text.contains("allow_sensitive"))
+        assertFalse(r.text.contains("hunter2"))
+        assertTrue(b.scripts.none { it.contains("hunter2") }, "nothing may be typed")
+    }
+
+    @Test
+    fun `allow_sensitive skips the check and types`() = runBlocking {
+        val b = FakeBrowser()
+        val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep(allow = true))
+        assertFalse(r.isError, r.text)
+        assertTrue(b.scripts.none { it.contains("function isSensitive") })
+        assertTrue(b.scripts.any { it.contains("hunter2") })
+    }
+
+    @Test
+    fun `a non-sensitive field is typed into without opting in`() = runBlocking {
+        val b = FakeBrowser()
+        b.respond = { s -> if (s.contains("function isSensitive")) false else true }
+        val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep())
+        assertFalse(r.isError, r.text)
+        assertEquals(true, Json.parseToJsonElement(r.text).jsonObject["ok"]!!.jsonPrimitive.boolean)
+        assertTrue(b.scripts.any { it.contains("hunter2") })
+    }
+
+    @Test
+    fun `an unreadable sensitivity check fails the step without typing`() = runBlocking {
+        val b = FakeBrowser()
+        b.respond = { s -> if (s.contains("function isSensitive")) null else true }
+        val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep())
+        assertFalse(r.isError, r.text)
+        assertEquals(false, Json.parseToJsonElement(r.text).jsonObject["ok"]!!.jsonPrimitive.boolean)
+        assertTrue(b.scripts.none { it.contains("hunter2") })
+    }
+
+    @Test
+    fun `a tab an engine run is driving is refused before anything runs`() = runBlocking {
+        val b = FakeBrowser()
+        val r = TabActions(busyTabIds = { setOf("t") }) { FakeTabs(mapOf("t" to b)) }
+            .step("""{"tab_id":"t","action":{"type":"click","selector":{"type":"id","value":"go"}},"highlight_ms":0}""")
+        assertTrue(r.isError)
+        assertEquals(TabErrorCodes.TAB_BUSY, errorCode(r.text))
+        assertTrue(b.scripts.isEmpty())
+        // Other tabs are unaffected.
+        val other = FakeBrowser()
+        val ok = TabActions(busyTabIds = { setOf("t") }) { FakeTabs(mapOf("t" to b, "u" to other)) }
+            .step("""{"tab_id":"u","action":{"type":"wait","value":"0"},"highlight_ms":0}""")
+        assertFalse(ok.isError, ok.text)
+    }
+
+    @Test
+    fun `two steps on one tab never overlap`() = runBlocking {
+        var inFlight = 0
+        var maxInFlight = 0
+        val b = object : BrowserIntegration {
+            override suspend fun executeJavaScript(script: String): Any? {
+                val now = synchronized(this) { ++inFlight }
+                synchronized(this) { maxInFlight = maxOf(maxInFlight, now) }
+                delay(20)
+                synchronized(this) { inFlight-- }
+                return true
+            }
+            override fun isBrowserAvailable() = true
+            override suspend fun getCurrentUrl() = "https://a.test/"
+        }
+        val tools = TabActions { FakeTabs(mapOf("t" to b)) }
+        val click = """{"tab_id":"t","action":{"type":"click","selector":{"type":"id","value":"go"}},"highlight_ms":0}"""
+        listOf(async(Dispatchers.Default) { tools.step(click) }, async(Dispatchers.Default) { tools.step(click) }).awaitAll()
+            .forEach { assertFalse(it.isError, it.text) }
+        assertEquals(1, maxInFlight, "scripts from two steps interleaved")
     }
 }

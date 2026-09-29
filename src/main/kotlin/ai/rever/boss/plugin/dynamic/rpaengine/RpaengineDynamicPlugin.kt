@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.rpaengine
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
+import java.util.concurrent.CopyOnWriteArraySet
 
 /**
  * RPA Engine dynamic plugin - Loaded from external JAR.
@@ -25,6 +26,9 @@ class RpaengineDynamicPlugin : DynamicPlugin {
     @Volatile
     private var lastComponent: RpaengineComponent? = null
 
+    // Every open panel, so rpa_step can refuse a tab any of their runs is driving.
+    private val liveComponents = CopyOnWriteArraySet<RpaengineComponent>()
+
     override fun register(context: PluginContext) {
         // Get services from context
         val browserService = context.browserService
@@ -38,22 +42,33 @@ class RpaengineDynamicPlugin : DynamicPlugin {
                 activeTabsProvider = activeTabsProvider
             ).also { comp ->
                 lastComponent = comp
+                liveComponents += comp
                 // Clear on panel close: the component's scope is cancelled on
                 // destroy, so MCP tools driving it would silently no-op while
                 // reporting success. Better to answer "open the panel first".
-                ctx.lifecycle.doOnDestroy { if (lastComponent === comp) lastComponent = null }
+                ctx.lifecycle.doOnDestroy {
+                    liveComponents -= comp
+                    if (lastComponent === comp) lastComponent = null
+                }
             }
         }
 
         // Contribute the MCP tools; auto-removed on disable/unload. rpa_observe/rpa_step take the
         // tab provider from the plugin context so they work with no panel open.
         context.registerMcpToolProvider(
-            RpaengineMcpToolProvider(pluginId, { lastComponent }, TabActions { activeTabsProvider }),
+            RpaengineMcpToolProvider(
+                pluginId,
+                { lastComponent },
+                TabActions(busyTabIds = { liveComponents.mapNotNullTo(HashSet()) { it.liveRunTabId() } }) {
+                    activeTabsProvider
+                },
+            ),
         )
     }
 
     override fun dispose() {
         lastComponent = null
+        liveComponents.clear()
     }
 
     /**

@@ -50,9 +50,10 @@ class ObserveScriptTest {
         val js = observeScript(80)
         assertFalse(Regex("""\.value\b""").containsMatchIn(js), "observe must not read .value")
         assertFalse(js.contains("valueAsNumber") || js.contains("selectedIndex") || js.contains("selectedOptions"))
-        // textContent only ever comes from the scrubbed clone in textOf.
-        assertEquals(1, Regex("""textContent""").findAll(js).count(), js)
-        assertTrue(js.contains("var drop = c.querySelectorAll(CONTROLS"), "textOf must strip form controls from the clone")
+        // Text comes only from text nodes reached by textOf's walk, which never enters a control.
+        assertEquals(0, Regex("""textContent""").findAll(js).count(), js)
+        assertEquals(1, Regex("""nodeValue""").findAll(js).count(), js)
+        assertTrue(js.contains("c.matches(CONTROLS + ',script,style')"), "textOf must not descend into form controls")
         // Image fields and labels come from attributes, currentSrc, and a figcaption through textOf.
         assertTrue(js.contains("if (cap) { s = textOf(cap);"), "figcaption text must go through the scrubbed textOf")
         assertTrue(js.contains("alt: norm(img.getAttribute('alt')) || null"))
@@ -149,6 +150,83 @@ class ObserveScriptTest {
         assertTrue(js.contains("if (st.state !== 'pending') { return; } var u = URL.createObjectURL"), "no save after abort")
     }
 
+    /**
+     * A page stub for the download scripts: a synchronous thenable stands in for fetch's promise
+     * (Nashorn has none), and `settle` delivers the fetch outcome when the test chooses.
+     */
+    private fun downloadPage(origin: String = "https://x.test"): ScriptEngine = engine().also {
+        it.eval(
+            "var clicks = [], aborted = false, pendingFetch = null; " +
+                "function P(ok, v) { return { then: function (f, r) { var h = ok ? f : r; if (!h) { return this; } " +
+                "try { var x = h(v); return (x && x.then) ? x : P(true, x); } catch (e) { return P(false, e); } } }; } " +
+                "function Deferred() { var cbs = []; return { then: function (f, r) { var d = Deferred(); cbs.push([f, r, d]); return d; }, " +
+                "settle: function (ok, v) { cbs.forEach(function (c) { var h = ok ? c[0] : c[1]; if (!h) { c[2].settle(ok, v); return; } " +
+                "try { var x = h(v); if (x && x.then) { x.then(function (y) { c[2].settle(true, y); }, function (y) { c[2].settle(false, y); }); } " +
+                "else { c[2].settle(true, x); } } catch (e) { c[2].settle(false, e); } }); } }; } " +
+                "function fetch(u, opts) { pendingFetch = Deferred(); pendingFetch.opts = opts; return pendingFetch; } " +
+                "function AbortController() { this.signal = {}; this.abort = function () { aborted = true; }; } " +
+                "function URL(u, base) { var m = /^([a-z]+:\\/\\/[^\\/]+)/.exec(u); this.origin = m ? m[1] : base; } " +
+                "URL.createObjectURL = function () { return 'blob:x'; }; URL.revokeObjectURL = function () {}; " +
+                "var location = { href: '$origin/page', origin: '$origin' }; " +
+                "var document = { body: { appendChild: function () {} }, createElement: function () { " +
+                "return { style: {}, click: function () { clicks.push(this.href); } }; } }; " +
+                "var window = { fetch: fetch, AbortController: AbortController, setTimeout: function () {} }; " +
+                "function ok(bytes) { return { ok: true, status: 200, blob: function () { return P(true, { size: bytes }); } }; } ",
+        )
+    }
+
+    private fun ScriptEngine.poll(): String = eval(downloadPollScript("t")) as String
+
+    @Test
+    fun `download blob path reports blob-click with the fetched size`() {
+        val e = downloadPage()
+        assertEquals(true, e.eval(downloadStartScript("https://cdn.test/a.jpg", "a.jpg", "t")))
+        assertEquals("omit", e.eval("pendingFetch.opts.credentials"))
+        assertTrue(e.poll().contains("\"state\":\"pending\""))
+        e.eval("pendingFetch.settle(true, ok(20481))")
+        val done = e.poll()
+        assertTrue(done.contains("\"state\":\"done\"") && done.contains("\"bytes\":20481") && done.contains("\"method\":\"$DOWNLOAD_METHOD_BLOB\""), done)
+        assertEquals("blob:x", e.eval("clicks[0]"))
+        assertTrue(e.poll().contains("missing"), "a settled entry is removed as it is read")
+    }
+
+    @Test
+    fun `download HTTP error fails without clicking anything`() {
+        val e = downloadPage()
+        e.eval(downloadStartScript("https://x.test/a.pdf", "a.pdf", "t"))
+        e.eval("pendingFetch.settle(true, { ok: false, status: 403 })")
+        val st = e.poll()
+        assertTrue(st.contains("\"state\":\"failed\"") && st.contains("HTTP 403"), st)
+        assertEquals(0, (e.eval("clicks.length") as Number).toInt(), "an HTTP error must not fall back to the direct link")
+    }
+
+    @Test
+    fun `download network failure falls back to the direct link same-origin only`() {
+        val same = downloadPage()
+        same.eval(downloadStartScript("https://x.test/a.pdf", "a.pdf", "t"))
+        same.eval("pendingFetch.settle(false, new Error('cors'))")
+        assertTrue(same.poll().contains("\"method\":\"$DOWNLOAD_METHOD_DIRECT\""))
+        assertEquals("https://x.test/a.pdf", same.eval("clicks[0]"))
+
+        val cross = downloadPage()
+        cross.eval(downloadStartScript("https://cdn.test/a.pdf", "a.pdf", "t"))
+        cross.eval("pendingFetch.settle(false, new Error('cors'))")
+        val st = cross.poll()
+        assertTrue(st.contains("\"state\":\"failed\"") && st.contains(DOWNLOAD_CROSS_ORIGIN_ERROR), st)
+        assertEquals(0, (cross.eval("clicks.length") as Number).toInt())
+    }
+
+    @Test
+    fun `an aborted download aborts the fetch and never saves a late blob`() {
+        val e = downloadPage()
+        e.eval(downloadStartScript("https://cdn.test/a.jpg", "a.jpg", "t"))
+        e.eval(downloadAbortScript("t"))
+        assertEquals(true, e.eval("aborted"))
+        assertTrue(e.poll().contains("missing"))
+        e.eval("pendingFetch.settle(true, ok(5))")
+        assertEquals(0, (e.eval("clicks.length") as Number).toInt(), "a blob arriving after abort must not be saved")
+    }
+
     @Test
     fun `download target prefers a file href, and a wiki File page is not one`() {
         val js = downloadTargetScript("el0")
@@ -201,6 +279,100 @@ class ObserveScriptTest {
             assertEquals(generated, looksGeneratedId(id), id)
             assertEquals(generated, e.eval("generatedId(${id.asJsString()})"), id)
         }
+    }
+
+    /** A plain-object DOM node: enough for textOf, which only reads node properties. */
+    private val nodeJs =
+        "function el(tag, kids) { return { nodeType: 1, tag: tag, childNodes: kids || [], " +
+            "matches: function (sel) { return sel.split(',').some(function (s) { " +
+            "return s === this.tag || (s === '[contenteditable]' && this.tag === 'editable'); }, this); } }; } " +
+            "function tx(s) { return { nodeType: 3, nodeValue: s }; } "
+
+    @Test
+    fun `textOf skips controls, scripts and styles and reads in document order`() {
+        val e = helpers().also { it.eval(nodeJs) }
+        assertEquals(
+            "Card number ends 42",
+            e.eval("textOf(el('div', [tx('Card'), el('span', [tx(' number ')]), el('input', [tx('SECRET')]), " +
+                "el('textarea', [tx('TYPED')]), el('editable', [tx('DRAFT')]), el('script', [tx('x=1')]), tx('ends 42')]))"),
+        )
+        assertEquals("", e.eval("textOf(el('input', [tx('SECRET')]))"), "a control itself has no text")
+    }
+
+    @Test
+    fun `textOf is bounded on a huge subtree`() {
+        val e = helpers().also { it.eval(nodeJs) }
+        e.eval("var kids = []; for (var i = 0; i < 50000; i++) { kids.push(tx('word ')); } var big = el('div', kids);")
+        val t = e.eval("textOf(big)") as String
+        assertTrue(t.length <= 200, "norm caps the label")
+        // The walk stops at the char cap long before visiting every node.
+        e.eval("var visited = 0; for (var j = 0; j < kids.length; j++) { (function (k) { var v = k.nodeValue; " +
+            "Object.defineProperty(k, 'nodeValue', { get: function () { visited++; return v; } }); })(kids[j]); }")
+        e.eval("textOf(big)")
+        assertTrue((e.eval("visited") as Number).toInt() <= TEXT_WALK_CHARS, "visited ${e.eval("visited")}")
+    }
+
+    @Test
+    fun `xpath steps name foreign-namespace elements by local-name`() {
+        val e = helpers()
+        assertEquals("div[2]", e.eval("xpathStep('http://www.w3.org/1999/xhtml', 'div', 'DIV', 2)"))
+        assertEquals("a[1]", e.eval("xpathStep(null, 'a', 'A', 1)"))
+        assertEquals("*[local-name()='svg'][1]", e.eval("xpathStep('http://www.w3.org/2000/svg', 'svg', 'svg', 1)"))
+        assertEquals(
+            "*[local-name()='linearGradient'][3]",
+            e.eval("xpathStep('http://www.w3.org/2000/svg', 'linearGradient', 'linearGradient', 3)"),
+        )
+        assertTrue(observeScript(80).contains("parts.unshift(xpathStep(n.namespaceURI, n.localName, n.nodeName, i))"))
+    }
+
+    @Test
+    fun `computed style only runs on candidates taken, stopping past MAX`() {
+        val js = observeScript(80)
+        // Rects bucket every candidate; styledVisible runs inside take(), which stops at MAX + 1.
+        assertTrue(js.contains("if (hasSize(r)) { (rectInView(r) ? inv : outv).push(all[i]); }"))
+        assertTrue(js.contains("i < list.length && seen.length <= MAX; i++) { var el = list[i]; if (!disabled(el) && styledVisible(el))"))
+        assertTrue(js.contains("take(inv, true); take(outv, false);"), "in-viewport first")
+        assertEquals(1, Regex("""getComputedStyle""").findAll(js).count(), "one getComputedStyle, in styledVisible")
+    }
+
+    @Test
+    fun `sensitive names match whole words, not substrings of ordinary words`() {
+        val e = helpers()
+        val flagged = listOf(
+            "password", "passwd", "user_pass", "userPass", "loginPwd", "new-password", "passcode",
+            "cardNumber", "card_no", "credit-card", "cc", "cc_number", "ccNumber", "cvv", "cvc", "csc",
+            "ssn", "otp", "OTP_input", "one_time_code", "oneTimeCode", "pin",
+        )
+        val clean = listOf(
+            "passenger", "compass", "discard", "footprint", "hotpot", "classname", "email", "q", "search",
+            "cardholder", "pinterest", "spinner", "account", "accnum", "bypass_cache", "success",
+        )
+        flagged.forEach {
+            assertTrue(looksSensitiveName(it), it)
+            assertEquals(true, e.eval("isSensitive('text', null, ${it.asJsString()}, null)"), it)
+            assertEquals(true, e.eval("isSensitive('text', null, null, ${it.asJsString()})"), it)
+        }
+        clean.forEach {
+            assertFalse(looksSensitiveName(it), it)
+            assertEquals(false, e.eval("isSensitive('text', null, ${it.asJsString()}, ${it.asJsString()})"), it)
+        }
+    }
+
+    @Test
+    fun `sensitive autocomplete tokens`() {
+        val e = helpers()
+        listOf("current-password", "new-password", "cc-number", "cc-csc", "section-a cc-exp", "one-time-code", "shipping  cc-name")
+            .forEach { assertEquals(true, e.eval("isSensitive('text', ${it.asJsString()}, null, null)"), it) }
+        listOf("email", "username", "account", "off", "tel", "password-hint")
+            .forEach { assertEquals(false, e.eval("isSensitive('text', ${it.asJsString()}, null, null)"), it) }
+    }
+
+    @Test
+    fun `sensitive target script checks the resolved element with the observe rules`() {
+        val js = sensitiveTargetScript("document.getElementById('pw')")
+        assertSingleExpression(js)
+        assertTrue(js.contains("return isSensitive(type, el.getAttribute('autocomplete'), el.getAttribute('name'), el.getAttribute('id'));"))
+        assertFalse(Regex("""\.value\b""").containsMatchIn(js), "the check must not read the field")
     }
 
     @Test

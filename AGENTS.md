@@ -121,6 +121,38 @@ MCP tools are `rpa_status`, `rpa_load`, `rpa_run`, `rpa_stop`, `rpa_results`, pl
 execution for both the panel and `rpa_step` lives in `ActionRunner`. `rpa_load` exists
 because loading a configuration was UI-only, which made the whole plugin undriveable by an agent.
 
+### Any-tab reach (`rpa_observe` / `rpa_step`)
+
+**These two tools work on any browser tab by id, not only tabs the engine created. That is
+deliberate.** LLM RPA drives the tab the user chose, usually one they are logged into, through
+these tools; scoping them to engine-created tabs would break that. It is the opposite trade-off
+from `rpa_load`'s `isManagedPath` gate, so the mitigations are the policy:
+
+- `rpa_observe` is declared **not read-only**. It returns link text, hrefs and captions from
+  whatever tab it is pointed at, and hosts often auto-approve read-only tools.
+- `rpa_step` refuses `input` into a field `isSensitive` flags (password, `cc-*`,
+  `one-time-code`, credential-like names) unless the caller passes `allow_sensitive: true`. The
+  check runs in-page on the resolved element with the observe script's own rule, and anything but
+  an explicit "not sensitive" fails the step without typing.
+- `SENSITIVE_NAME_PATTERN` matches short tokens (`pass`, `pin`, `otp`, `card`, `cc`...) only as
+  whole camelCase/`_`/`-` words, since it now gates: `passenger`, `compass`, `discard`,
+  `footprint` were all flagged by the old substring pattern. Tests pin both lists.
+- `rpa_step` refuses a tab an RPA Engine panel run is driving (`TAB_BUSY`, via `liveRunTabId`
+  across every open panel) and serialises steps per tab with a `Mutex`, for the same interleaving
+  reason `rpa_run` refuses to start over a live run.
+- Field values are never read by observe; `checked` is the one piece of form state it reports.
+
+A change that narrows the reach should be discussed with LLM RPA's owners; a change that widens
+it (reading values, dropping the sensitive gate) needs the same discussion as removing
+`isManagedPath` would.
+
+**`download` reports what the page can see, nothing more.** `ok: true` means the page fetched the
+file (or clicked a same-origin link) and clicked `<a download>`; whether the host saved it is not
+visible to the page, so the result carries `save_verified: false`, `method` and a `note` rather
+than claiming a saved file. Verified live in BOSS's embedded browser (JxBrowser), which saves to
+`~/Downloads`. Fetches omit credentials, so a file behind a login is an honest HTTP 401/403.
+`download` is `rpa_step`-only and displayed as such; the panel's run loop refuses it.
+
 ### Testing
 
 `./gradlew test` - pure functions only (`asJsString`, `matchByName`, `stripTagQualifier`,
@@ -136,9 +168,8 @@ entries where nothing else contained the query, so a substring-first implementat
 on its first pass and returned the exact match anyway: the test passed on the very mutation it
 named. The earlier entry has to actually contain the query.
 
-Nothing runs `./gradlew test` in CI - `build.yml` fires only on push to `main` and delegates to
-the shared release workflow. These tests protect local development only; a PR-triggered job
-running `./gradlew test` would make the policy above enforceable, and is worth adding.
+`.github/workflows/test.yml` runs `./gradlew test` on every pull request (`build.yml` only fires
+on push to `main`), so the policy above is enforced before merge.
 
 `TextSelectorScriptTest` dumps the generated script to `build/tmp/text-selector-images.js`. String
 assertions cannot show that a locator picks the right *node*, so paste that file into a real page

@@ -158,7 +158,7 @@ object ActionTypes {
         ASSERT -> "Assert"
         SWITCH_FRAME -> "Switch Frame"
         RUN_SCRIPT -> "Run Script"
-        DOWNLOAD -> "Download"
+        DOWNLOAD -> "Download (rpa_step only)"
         else -> type.replaceFirstChar { it.uppercase() }
     }
 }
