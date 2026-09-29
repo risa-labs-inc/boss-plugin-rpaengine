@@ -367,12 +367,46 @@ class ObserveScriptTest {
             .forEach { assertEquals(false, e.eval("isSensitive('text', ${it.asJsString()}, null, null)"), it) }
     }
 
+    /** A plain-object form field for sensitiveEl. */
+    private val fieldJs =
+        "function field(tag, attrs, labelText) { var a = attrs || {}; return { tagName: tag.toUpperCase(), " +
+            "getAttribute: function (k) { return a.hasOwnProperty(k) ? a[k] : null; }, isContentEditable: false, " +
+            "labels: labelText == null ? [] : [{ nodeType: 1, childNodes: [{ nodeType: 3, nodeValue: labelText }], " +
+            "matches: function () { return false; } }], closest: function () { return null; }, " +
+            "focus: function () { typed = true; } }; } var typed = false; "
+
     @Test
-    fun `sensitive target script checks the resolved element with the observe rules`() {
-        val js = sensitiveTargetScript("document.getElementById('pw')")
-        assertSingleExpression(js)
-        assertTrue(js.contains("return isSensitive(type, el.getAttribute('autocomplete'), el.getAttribute('name'), el.getAttribute('id'));"))
-        assertFalse(Regex("""\.value\b""").containsMatchIn(js), "the check must not read the field")
+    fun `a masked text field is sensitive by its accessible name, a link never`() {
+        val e = helpers().also { it.eval(SENSITIVE_DOM_JS); it.eval(fieldJs) }
+        mapOf(
+            "field('input', { type: 'text', 'aria-label': 'Password' })" to true,
+            "field('input', { type: 'text', name: 'field_7' }, 'PIN')" to true,
+            "field('input', { placeholder: 'Card number' })" to true,
+            "field('textarea', { title: 'One-time code' })" to true,
+            "field('input', { type: 'text', 'aria-label': 'Passenger name' })" to false,
+            "field('input', { type: 'text' }, 'Compass heading')" to false,
+            "field('input', { type: 'email', placeholder: 'Email' })" to false,
+            "field('a', { href: '/reset', 'aria-label': 'Forgot password?' })" to false,
+            "field('input', { type: 'submit', 'aria-label': 'Reset password' })" to false,
+            "field('input', { type: 'password' })" to true,
+        ).forEach { (expr, want) -> assertEquals(want, e.eval("sensitiveEl($expr)"), expr) }
+    }
+
+    @Test
+    fun `the input guard stops the body on the same element, and a throwing guard fails closed`() {
+        val e = helpers().also { it.eval(fieldJs) }
+        val body = typeValueScript("hunter2")
+        val sensitive = actScript("field('input', { type: 'text', 'aria-label': 'Password' })", body, SENSITIVE_GUARD_JS)
+        assertSingleExpression(sensitive.trimEnd(';'))
+        assertEquals(GUARD_REFUSED, e.eval(sensitive))
+        assertEquals(false, e.eval("typed"), "the body must not run")
+
+        val throwing = actScript("field('input', {})", body, "(function () { throw new Error('boom'); })()")
+        assertEquals("threw: boom", e.eval(throwing))
+        assertEquals(false, e.eval("typed"))
+
+        assertFalse(Regex("""\.value\b""").containsMatchIn(SENSITIVE_GUARD_JS), "the check must not read the field")
+        assertEquals(actScript("x", "b;"), "(function () { var el = x; if (!el) { return false; } try { b; } catch (e) { return 'threw: ' + e.message; } return true; })();")
     }
 
     @Test

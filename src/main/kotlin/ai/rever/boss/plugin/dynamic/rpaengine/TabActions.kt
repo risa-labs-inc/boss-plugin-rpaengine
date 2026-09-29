@@ -20,6 +20,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.time.Clock
 
@@ -236,7 +237,8 @@ internal fun downloadNote(method: String, bytes: Long?): String =
     if (method == DOWNLOAD_METHOD_BLOB && bytes != null) {
         "The page fetched $bytes bytes and triggered a browser download; whether the host saved the file is not confirmed"
     } else {
-        "The page clicked a same-origin download link; whether the host saved the file is not confirmed"
+        "The fetch failed, so the page clicked the same-origin link directly (the browser sends cookies for it); " +
+            "whether the host saved the file is not confirmed"
     }
 
 internal const val DOWNLOAD_METHOD_BLOB = "blob-click"
@@ -446,12 +448,28 @@ internal val OBSERVE_HELPERS_JS: String =
         "case 'number': return 'spinbutton'; default: return 'textbox'; } } " +
         "return null; } " +
         "function sensitiveKey(s) { return String(s || '').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().replace(/[^a-z0-9]+/g, '_'); } " +
-        "function isSensitive(type, autocomplete, name, id) { " +
+        "function isSensitive(type, autocomplete, name, id, label) { " +
         "if (type === 'password') { return true; } " +
         "var ac = ' ' + (autocomplete || '').toLowerCase().replace(/\\s+/g, ' ') + ' '; " +
         "if (/ cc-/.test(ac) || / (one-time-code|current-password|new-password) /.test(ac)) { return true; } " +
-        "return SENSITIVE.test(sensitiveKey(name)) || SENSITIVE.test(sensitiveKey(id)); } " +
+        "return SENSITIVE.test(sensitiveKey(name)) || SENSITIVE.test(sensitiveKey(id)) || SENSITIVE.test(sensitiveKey(label)); } " +
         IMAGE_HELPERS_JS + TEXT_OF_JS + XPATH_STEP_JS
+
+/**
+ * Whether [isSensitive] flags an element. A text field masked in JS often has only its accessible
+ * name to go on (`aria-label="Password"`, a `<label>` saying PIN), so a field's aria-label, label
+ * text, placeholder and title count too; a link's or button's never do ("Forgot password?").
+ * Shared by the observe script and rpa_step's input guard, so the flag and the gate agree.
+ * Expects [OBSERVE_HELPERS_JS].
+ */
+internal const val SENSITIVE_DOM_JS: String =
+    "function sensitiveEl(el) { var tag = el.tagName.toLowerCase(), role = el.getAttribute('role'); " +
+        "var type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : null; " +
+        "var field = (tag === 'input' && type !== 'submit' && type !== 'button' && type !== 'reset' && type !== 'image') || " +
+        "tag === 'textarea' || el.isContentEditable || role === 'textbox' || role === 'searchbox'; " +
+        "var label = ''; if (field) { var lab = (el.labels && el.labels.length) ? el.labels[0] : (el.closest ? el.closest('label') : null); " +
+        "label = [el.getAttribute('aria-label'), lab ? textOf(lab) : '', el.getAttribute('placeholder'), el.getAttribute('title')].join(' '); } " +
+        "return isSensitive(type, el.getAttribute('autocomplete'), el.getAttribute('name'), el.getAttribute('id'), label); } "
 
 /** DOM-touching image helpers, shared by the observe and download scripts. Expects [OBSERVE_HELPERS_JS]. */
 private const val IMAGE_DOM_JS: String =
@@ -490,7 +508,7 @@ private val OBSERVE_BODY_JS: String =
         "s = el.querySelector(CONTROLS) ? textOf(el) : norm(el.innerText); if (s) { return s; } " +
         "var img = el.querySelector('img[alt]'); if (img) { s = norm(img.getAttribute('alt')); if (s) { return s; } } } " +
         "s = norm(el.getAttribute('name')); return s || null; } " +
-        IMAGE_DOM_JS +
+        IMAGE_DOM_JS + SENSITIVE_DOM_JS +
         "function imageOf(img, min) { if (!img) { return null; } var r = img.getBoundingClientRect(); " +
         "if (r.width < min || r.height < min) { return null; } " +
         "return { src: safeSrc(bestSrc(img)), alt: norm(img.getAttribute('alt')) || null, " +
@@ -543,7 +561,7 @@ private val OBSERVE_BODY_JS: String =
         "return { tag: tag, role: role || null, label: labelOf(el, tag, role, type) || imageLabel(el, tag, img), type: type, " +
         "placeholder: el.getAttribute('placeholder'), href: tag === 'a' ? (typeof el.href === 'string' ? el.href : el.getAttribute('href')) : null, " +
         "image: imageOf(img, $IMAGE_MIN_PX), options: options, checked: checked, " +
-        "sensitive: isSensitive(type, el.getAttribute('autocomplete'), el.getAttribute('name'), el.getAttribute('id')), " +
+        "sensitive: sensitiveEl(el), " +
         "inViewport: c.v, selector: selectorOf(el, tag) }; }); " +
         // Standalone images come after, with their own cap, so they never displace an interactive element.
         "var pics = [], imgs = document.querySelectorAll('img'); " +
@@ -736,13 +754,12 @@ internal fun isNavigation(before: String?, after: String?): Boolean =
 /** Settle after the action before reading the URL again. */
 internal const val STEP_URL_SETTLE_MS = 300L
 
-/** Is this element one [isSensitive] flags? Same inputs as the observe script, so both agree. */
-internal fun sensitiveTargetScript(locate: String): String =
-    "(function () { try { " + OBSERVE_HELPERS_JS +
-        "var el = $locate; if (!el || !el.getAttribute) { return false; } var tag = el.tagName.toLowerCase(); " +
-        "var type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : null; " +
-        "return isSensitive(type, el.getAttribute('autocomplete'), el.getAttribute('name'), el.getAttribute('id')); " +
-        "} catch (e) { return 'threw: ' + e.message; } })()"
+/**
+ * rpa_step's `input` guard: a JS expression over `el`, run by [ActionRunner] in the same script as the
+ * typing and before it, so the element checked is the element typed into.
+ */
+internal val SENSITIVE_GUARD_JS: String =
+    "(function (el) { " + OBSERVE_HELPERS_JS + SENSITIVE_DOM_JS + "return sensitiveEl(el); })(el)"
 
 /** [block]'s value, or null when it throws - except cancellation, which always propagates. */
 internal suspend inline fun <T> orNullUnlessCancelled(block: () -> T): T? =
@@ -768,8 +785,15 @@ internal class TabActions(
     private val runner = ActionRunner { _, _ -> }
 
     // One step at a time per tab: two concurrent steps interleave their awaitElement polls and a
-    // highlight overlay. Entries are never removed; there is one per tab id ever stepped.
+    // highlight overlay. Closed tabs' entries are dropped when a new tab is first stepped.
     private val tabLocks = ConcurrentHashMap<String, Mutex>()
+
+    private fun lockFor(tabId: String): Mutex =
+        tabLocks[tabId] ?: run {
+            val open = runCatching { activeTabsProvider()?.activeTabs?.value?.mapTo(HashSet()) { it.tabId } }.getOrNull()
+            if (open != null) tabLocks.keys.retainAll(open + tabId)
+            tabLocks.getOrPut(tabId) { Mutex() }
+        }
 
     fun tools(): List<McpToolDefinition> = listOf(
         McpToolDefinition(
@@ -812,13 +836,17 @@ internal class TabActions(
         McpToolResult(TabJson.encodeToString(ObserveResult.serializer(), buildObserveResult(args.tabId, snapshot)))
     } catch (e: TabToolException) {
         e.toResult()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        TabToolException(TabErrorCodes.SCRIPT_FAILED, "rpa_observe failed: ${e.message}").toResult()
     }
 
     suspend fun step(raw: String): McpToolResult = try {
         val args = parseStepArgs(raw)
         val browser = resolveTab(args.tabId)
         refuseIfEngineRunning(args.tabId)
-        val result = tabLocks.getOrPut(args.tabId) { Mutex() }.withLock {
+        val result = lockFor(args.tabId).withLock {
             // Re-checked under the lock: a run may have started while this step waited.
             refuseIfEngineRunning(args.tabId)
             runStep(browser, args)
@@ -826,6 +854,11 @@ internal class TabActions(
         McpToolResult(TabJson.encodeToString(StepResult.serializer(), result))
     } catch (e: TabToolException) {
         e.toResult()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        // Backstop: a bridge failure outside the runner (a tab closing mid-step) is still structured.
+        TabToolException(TabErrorCodes.SCRIPT_FAILED, "rpa_step failed: ${e.message}").toResult()
     }
 
     private fun refuseIfEngineRunning(tabId: String) {
@@ -837,44 +870,28 @@ internal class TabActions(
         }
     }
 
-    /**
-     * Refuses `input` into a field the observe script would flag sensitive, unless the caller opted
-     * in. Returns a failure when the element is missing, so the step does not wait for it twice.
-     */
-    private suspend fun sensitiveGate(browser: BrowserIntegration, action: RpaActionConfig): Pair<Boolean, String?>? {
-        val locate =
-            when (val target = runner.findTarget(browser, action.selector, null)) {
-                TargetLookup.Unsupported -> return Pair(false, runner.unsupportedSelector(action.selector))
-                TargetLookup.Missing ->
-                    return Pair(false, "Could not type into '${action.selector.value}' (no match, or it has no value)")
-                is TargetLookup.Found -> target.locate
-            }
-        val sensitive = browser.executeJavaScript(sensitiveTargetScript(locate))
-        if (sensitive == false || sensitive == "false") return null
-        // Anything but an explicit false fails closed, without typing.
-        if (!sensitive.isJsTrue()) {
-            return Pair(false, "Could not check whether '${action.selector.value}' is a sensitive field (the page may be navigating)")
-        }
-        throw TabToolException(
-            TabErrorCodes.INVALID_INPUT,
-            "'${action.selector.value}' is a password, payment or one-time-code field; " +
-                "pass allow_sensitive: true to type into it",
-        )
-    }
 
     private suspend fun runStep(browser: BrowserIntegration, args: StepArgs): StepResult {
         val started = Clock.System.now().toEpochMilliseconds()
         val before = currentUrl(browser)
         val hook = if (args.highlightMs > 0) highlightHook(args.highlightMs) else null
         // execute() already maps script errors and thrown exceptions to (false, reason).
-        val refused =
-            if (args.action.type == ActionTypes.INPUT && !args.allowSensitive) sensitiveGate(browser, args.action) else null
+        // input without the opt-in is guarded in the typing script itself; a guard that throws fails
+        // the step without typing.
+        val guard = if (args.action.type == ActionTypes.INPUT && !args.allowSensitive) SENSITIVE_GUARD_JS else null
         val (ok, error, download) =
-            when {
-                refused != null -> Triple(refused.first, refused.second, null)
-                args.action.type == ActionTypes.DOWNLOAD -> download(browser, args.action.selector, hook)
-                else -> runner.execute(browser, args.action, hook).let { Triple(it.first, it.second, null) }
+            if (args.action.type == ActionTypes.DOWNLOAD) {
+                download(browser, args.action.selector, hook)
+            } else {
+                runner.execute(browser, args.action, hook, guard).let { Triple(it.first, it.second, null) }
             }
+        if (guard != null && error == GUARD_REFUSED) {
+            throw TabToolException(
+                TabErrorCodes.INVALID_INPUT,
+                "'${args.action.selector.value}' is a password, payment or one-time-code field; " +
+                    "pass allow_sensitive: true to type into it",
+            )
+        }
         delay(STEP_URL_SETTLE_MS)
         val after = currentUrl(browser)
         return StepResult(
@@ -908,7 +925,7 @@ internal class TabActions(
             val url = target.url?.takeIf(::isDownloadableUrl)
                 ?: return fail("The target's URL is not http(s), blob or data")
             val file = downloadFileName(url)
-            val token = "d" + Clock.System.now().toEpochMilliseconds().toString(36) + (0..9999).random()
+            val token = "d" + UUID.randomUUID().toString().replace("-", "")
             val started = browser.executeJavaScript(downloadStartScript(url, file, token))
             if (!started.isJsTrue()) return fail("Could not start the download: $started")
             val status =
@@ -953,7 +970,7 @@ internal class TabActions(
     private fun highlightHook(ms: Int): ElementHook = { b, locate -> highlight(b, locate, ms) }
 
     private suspend fun highlight(browser: BrowserIntegration, locate: String, ms: Int) {
-        val token = "h" + Clock.System.now().toEpochMilliseconds().toString(36) + (0..9999).random()
+        val token = "h" + UUID.randomUUID().toString().replace("-", "")
         val drawn = orNullUnlessCancelled { browser.executeJavaScript(highlightScript(locate, token, ms)) }.isJsTrue()
         if (!drawn) return
         try {
@@ -978,7 +995,7 @@ internal class TabActions(
             if (known) throw TabToolException(TabErrorCodes.NO_BROWSER, "Tab '$tabId' is not a browser tab")
             throw TabToolException(TabErrorCodes.TAB_NOT_FOUND, "No tab with id '$tabId'")
         }
-        if (!browser.isBrowserAvailable()) {
+        if (!runCatching { browser.isBrowserAvailable() }.getOrDefault(false)) {
             throw TabToolException(TabErrorCodes.NO_BROWSER, "Tab '$tabId' has no live browser")
         }
         return browser
@@ -998,7 +1015,8 @@ internal class TabActions(
             "Perform exactly one action in a browser tab by id: click, input, select, keypress, submit, scroll, " +
                 "navigate, wait or download, with the same semantics as an RPA Engine plan step. download " +
                 "(rpa_step only, not a plan verb) fetches the element's image or linked file without cookies " +
-                "(so a file behind a login answers HTTP 401/403) and triggers a browser download; the result " +
+                "(so a file behind a login answers HTTP 401/403; only a same-origin link clicked after a failed " +
+                "fetch goes with cookies) and triggers a browser download; the result " +
                 "reports save_verified false, since the page cannot see whether the host saved it. Selectors are " +
                 "{type: id|css|xpath|text, value}; use the ones rpa_observe returns. The target element is briefly " +
                 "outlined first (highlight_ms, 0 to disable). Returns ok/error plus the URL before and after; " +

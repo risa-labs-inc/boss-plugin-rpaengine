@@ -57,7 +57,8 @@ so a host that asks before non-read-only tools asks for them.
   Disabled and unrendered elements are skipped; shadow DOM and iframe contents are not observed.
   Typed text, selected options and contenteditable text are never read; checkbox/radio `checked`
   state is. `sensitive` is true for password fields, `cc-*`, `one-time-code`, `current-password`
-  and `new-password` autocomplete, and names/ids containing `password|passwd|passcode|pwd|cvv|cvc`
+  and `new-password` autocomplete, a field whose aria-label, label, placeholder or title matches the
+  same words, and names/ids containing `password|passwd|passcode|pwd|cvv|cvc`
   or a whole word `pass|pin|otp|ssn|card|csc|cc` (camelCase and `-`/`_` split words, so
   `userPass` is flagged and `passenger`, `compass`, `discard` are not).
   - `image` is `{src, alt, width, height}` when the element is an `<img>` or contains one rendered
@@ -82,7 +83,8 @@ so a host that asks before non-read-only tools asks for them.
   runs but fails is `ok: false`, not a tool error. `navigated` ignores a fragment-only change.
   `download` is null except after a successful download.
   - `input` into a field that `rpa_observe` would flag `sensitive` is refused with `INVALID_INPUT`
-    unless `allow_sensitive: true` is passed.
+    unless `allow_sensitive: true` is passed. The check runs in the typing script, on the same
+    element, before anything is typed.
   - A tab an RPA Engine panel run is driving is refused with `TAB_BUSY`, and steps on one tab run
     one at a time.
 - `download` saves a file through the browser. It takes the target's link href when that path ends
@@ -98,7 +100,8 @@ so a host that asks before non-read-only tools asks for them.
   `blob-click` or `direct`, and `save_verified` is always false, because the page can trigger a
   download but cannot see whether the host saved it. Credentials are omitted, so a file behind a
   login fails with HTTP 401/403. `download` is not a plan verb: a plan step of that type fails in
-  the panel with "only available through rpa_step". Verified in BOSS's embedded browser
+  the panel with "only available through rpa_step". The `direct` fallback is a real link click, so
+  it does send cookies. Verified in BOSS's embedded browser
   (JxBrowser), where the file lands in `~/Downloads`.
 - Tool errors are `{"error": {"code", "message"}}` with `isError` set. Codes: `INVALID_INPUT`,
   `TAB_NOT_FOUND`, `NO_BROWSER`, `SCRIPT_FAILED` (observe), `UNSUPPORTED_ACTION` and `TAB_BUSY` (step).

@@ -130,10 +130,12 @@ from `rpa_load`'s `isManagedPath` gate, so the mitigations are the policy:
 
 - `rpa_observe` is declared **not read-only**. It returns link text, hrefs and captions from
   whatever tab it is pointed at, and hosts often auto-approve read-only tools.
-- `rpa_step` refuses `input` into a field `isSensitive` flags (password, `cc-*`,
-  `one-time-code`, credential-like names) unless the caller passes `allow_sensitive: true`. The
-  check runs in-page on the resolved element with the observe script's own rule, and anything but
-  an explicit "not sensitive" fails the step without typing.
+- `rpa_step` refuses `input` into a field `sensitiveEl` flags (password type, `cc-*`,
+  `one-time-code`, credential-like names, or a field whose aria-label/label/placeholder/title says
+  so) unless the caller passes `allow_sensitive: true`. The check is a guard **inside the typing
+  script**, before the body and on the same `el` (`actScript`), so what is checked is what is typed
+  into; a separate check-then-act was a TOCTOU across two `(primary) || (fallback)` evaluations. A
+  guard that throws fails the step without typing. Observe's `sensitive` flag uses the same function.
 - `SENSITIVE_NAME_PATTERN` matches short tokens (`pass`, `pin`, `otp`, `card`, `cc`...) only as
   whole camelCase/`_`/`-` words, since it now gates: `passenger`, `compass`, `discard`,
   `footprint` were all flagged by the old substring pattern. Tests pin both lists.
@@ -150,7 +152,10 @@ it (reading values, dropping the sensitive gate) needs the same discussion as re
 file (or clicked a same-origin link) and clicked `<a download>`; whether the host saved it is not
 visible to the page, so the result carries `save_verified: false`, `method` and a `note` rather
 than claiming a saved file. Verified live in BOSS's embedded browser (JxBrowser), which saves to
-`~/Downloads`. Fetches omit credentials, so a file behind a login is an honest HTTP 401/403.
+`~/Downloads`. Fetches omit credentials, so a file behind a login is an honest HTTP 401/403; the
+one exception is the same-origin `direct` fallback after a failed fetch, a real link click that
+carries cookies. `window.__rpaDownloads` lives in the page, which can read or forge it, so `bytes`
+and `state` are the page's word, not proof.
 `download` is `rpa_step`-only and displayed as such; the panel's run loop refuses it.
 
 ### Testing

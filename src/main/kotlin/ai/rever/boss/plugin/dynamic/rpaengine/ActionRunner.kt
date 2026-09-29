@@ -22,11 +22,15 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
      * [beforeAct] runs once the target element is known to exist and immediately before the body
      * touches it, with the JS expression that resolves it. The panel passes none; `rpa_step` uses
      * it to highlight the element.
+     *
+     * [inputGuard] is a JS expression over `el`, checked in the same script as an `input` body
+     * and before it; when truthy nothing is typed and the result is `(false, GUARD_REFUSED)`.
      */
     suspend fun execute(
         browser: BrowserIntegration,
         action: RpaActionConfig,
         beforeAct: ElementHook? = null,
+        inputGuard: String? = null,
     ): Pair<Boolean, String?> {
         return try {
             when (action.type) {
@@ -84,6 +88,7 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                             beforeAct,
                             typeValueScript(value),
                             "Could not type into '${action.selector.value}' (no match, or it has no value)",
+                            inputGuard,
                         ) ?: return Pair(false, unsupportedSelector(action.selector))
                     delay(ActionTiming.INPUT_SETTLE_MS)
                     outcome
@@ -279,6 +284,7 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
         beforeAct: ElementHook?,
         body: String,
         onFailure: String,
+        guard: String? = null,
     ): Pair<Boolean, String?>? {
         val locate =
             when (val target = findTarget(this, selector, beforeAct)) {
@@ -286,13 +292,8 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                 TargetLookup.Missing -> return Pair(false, onFailure)
                 is TargetLookup.Found -> target.locate
             }
-        // Wrapped: `var` at eval top level lands on the page's global object, so `el` would
-        // clobber a page global of that name.
-        val outcome =
-            executeJavaScript(
-                "(function () { var el = $locate; if (!el) { return false; } " +
-                    "try { $body } catch (e) { return 'threw: ' + e.message; } return true; })();",
-            )
+        val outcome = executeJavaScript(actScript(locate, body, guard))
+        if (guard != null && outcome == GUARD_REFUSED) return Pair(false, GUARD_REFUSED)
         return interpretOutcome(outcome, onFailure)
     }
 
@@ -359,6 +360,20 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
         "Cannot resolve a '${selector.type}' selector" +
             if (selector.value.isNullOrBlank()) " with no value" else ""
 }
+
+/** What an `input` body returns, and `execute` reports as its error, when [ActionRunner.execute]'s guard refused. */
+internal const val GUARD_REFUSED = "__rpa_guard_refused__"
+
+/**
+ * The script that runs [body] once on the element [locate] resolves to. Wrapped because `var` at eval
+ * top level lands on the page's global object, so `el` would clobber a page global of that name.
+ * [guard] runs first on the same `el`, so what is checked is what is acted on; a guard that throws
+ * is a failure and the body does not run.
+ */
+internal fun actScript(locate: String, body: String, guard: String? = null): String =
+    "(function () { var el = $locate; if (!el) { return false; } " +
+        "try { " + (if (guard != null) "if ($guard) { return '$GUARD_REFUSED'; } " else "") +
+        "$body } catch (e) { return 'threw: ' + e.message; } return true; })();"
 
 /** [ActionRunner.findTarget]'s outcome: the same unresolvable / no-match split as `runOn`. */
 internal sealed interface TargetLookup {

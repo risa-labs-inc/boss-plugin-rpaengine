@@ -394,14 +394,18 @@ class TabActionsTest {
             (allow?.let { ""","allow_sensitive":$it""" } ?: "") + "}"
 
     @Test
-    fun `input into a sensitive field is refused without allow_sensitive, and types nothing`() = runBlocking {
-        val b = FakeBrowser() // answers true to everything, including the sensitivity check
+    fun `input into a sensitive field is refused without allow_sensitive`() = runBlocking {
+        val b = FakeBrowser()
+        // The guarded typing script reports the refusal; everything else (the probe) succeeds.
+        b.respond = { s -> if (s.contains("function sensitiveEl")) GUARD_REFUSED else true }
         val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep())
         assertTrue(r.isError, r.text)
         assertEquals(TabErrorCodes.INVALID_INPUT, errorCode(r.text))
         assertTrue(r.text.contains("allow_sensitive"))
         assertFalse(r.text.contains("hunter2"))
-        assertTrue(b.scripts.none { it.contains("hunter2") }, "nothing may be typed")
+        // One script checks and types, guard first, so the checked element is the typed-into one.
+        val act = b.scripts.single { it.contains("hunter2") }
+        assertTrue(act.indexOf("return sensitiveEl(el)") in 0 until act.indexOf("var want = "), act)
     }
 
     @Test
@@ -409,28 +413,43 @@ class TabActionsTest {
         val b = FakeBrowser()
         val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep(allow = true))
         assertFalse(r.isError, r.text)
-        assertTrue(b.scripts.none { it.contains("function isSensitive") })
+        assertTrue(b.scripts.none { it.contains("function sensitiveEl") })
         assertTrue(b.scripts.any { it.contains("hunter2") })
     }
 
     @Test
     fun `a non-sensitive field is typed into without opting in`() = runBlocking {
         val b = FakeBrowser()
-        b.respond = { s -> if (s.contains("function isSensitive")) false else true }
         val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep())
         assertFalse(r.isError, r.text)
         assertEquals(true, Json.parseToJsonElement(r.text).jsonObject["ok"]!!.jsonPrimitive.boolean)
-        assertTrue(b.scripts.any { it.contains("hunter2") })
+        assertTrue(b.scripts.single { it.contains("hunter2") }.contains("return sensitiveEl(el)"))
     }
 
     @Test
-    fun `an unreadable sensitivity check fails the step without typing`() = runBlocking {
+    fun `the guard only applies to input`() = runBlocking {
         val b = FakeBrowser()
-        b.respond = { s -> if (s.contains("function isSensitive")) null else true }
+        TabActions { FakeTabs(mapOf("t" to b)) }
+            .step("""{"tab_id":"t","action":{"type":"click","selector":{"type":"id","value":"pw"}},"highlight_ms":0}""")
+        assertTrue(b.scripts.none { it.contains("function sensitiveEl") })
+    }
+
+    @Test
+    fun `a bridge that throws mid-step is a structured error, not an escaped exception`() = runBlocking {
+        val b = FakeBrowser()
+        b.respond = { s -> if (s.contains("hunter2")) throw IllegalStateException("tab closed") else true }
         val r = TabActions { FakeTabs(mapOf("t" to b)) }.step(inputStep())
         assertFalse(r.isError, r.text)
         assertEquals(false, Json.parseToJsonElement(r.text).jsonObject["ok"]!!.jsonPrimitive.boolean)
-        assertTrue(b.scripts.none { it.contains("hunter2") })
+
+        val dead = object : BrowserIntegration {
+            override suspend fun executeJavaScript(script: String): Any? = throw IllegalStateException("gone")
+            override fun isBrowserAvailable(): Boolean = throw IllegalStateException("gone")
+            override suspend fun getCurrentUrl(): String = throw IllegalStateException("gone")
+        }
+        val d = TabActions { FakeTabs(mapOf("t" to dead)) }.step(inputStep())
+        assertTrue(d.isError)
+        assertEquals(TabErrorCodes.NO_BROWSER, errorCode(d.text))
     }
 
     @Test
