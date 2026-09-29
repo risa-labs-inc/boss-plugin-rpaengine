@@ -159,12 +159,13 @@ one exception is the same-origin `direct` fallback after a failed fetch, a real 
 carries cookies. `window.__rpaDownloads` lives in the page, which can read or forge it, so `bytes`
 and `state` are the page's word, not proof.
 
-**`download` never saves a `.json` file.** The panel lists `*.json` in `~/Downloads` as RPA
+**`download` never requests a `.json` file name.** The panel lists `*.json` in `~/Downloads` as RPA
 configurations, and those can carry `run_script`; a file an agent planted there would undo the
 "a person clicking a downloaded plan is choosing it" reasoning behind `isManagedPath`. A computed
 name ending in `.json` is refused, and an `<img>` target (whose src can be any URL) must fetch an
 `image/` blob, or have an image extension for the direct fallback, so it cannot be JSON in disguise.
-`download` is `rpa_step`-only and displayed as such; the panel's run loop refuses it.
+On the same-origin fallback the server's suggested name (Content-Disposition) can still override
+ours, so this narrows the risk rather than ruling it out. `download` is `rpa_step`-only and displayed as such; the panel's run loop refuses it.
 
 ### Testing
 
