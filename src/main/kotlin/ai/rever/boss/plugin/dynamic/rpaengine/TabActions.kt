@@ -138,11 +138,13 @@ internal fun parseStepArgs(raw: String): StepArgs {
             "Unknown action type '$type'; expected one of ${STEP_ALLOWED_TYPES.joinToString("|")}",
         )
     }
-    val value = when (val v = action["value"]) {
+    val raw = when (val v = action["value"]) {
         null, is JsonNull -> null
         is JsonPrimitive -> v.content
         else -> invalid("'action.value' must be a string")
     }
+    // wait is validated trimmed, so it runs trimmed: the runner parses without trimming.
+    val value = if (type == ActionTypes.WAIT) raw?.trim() else raw
     val selector = when (val s = action["selector"]) {
         null, is JsonNull -> SelectorInfo(type = SelectorTypes.NONE)
         is JsonObject -> {
@@ -650,6 +652,18 @@ private val DOWNLOADABLE_SCHEME = Regex("(?:https?://|blob:|data:)\\S*", RegexOp
 internal fun isDownloadableUrl(url: String): Boolean = DOWNLOADABLE_SCHEME.matchEntire(url.trim()) != null
 
 /**
+ * The panel lists `*.json` files in ~/Downloads as RPA configurations (and those can carry
+ * `run_script`), so a download must never plant one there.
+ */
+internal fun isRefusedDownloadName(file: String): Boolean = file.trimEnd().endsWith(".json", ignoreCase = true)
+
+internal const val DOWNLOAD_JSON_REFUSED =
+    "Refusing to save a .json file: ~/Downloads is scanned for RPA configurations"
+
+/** Image extensions a same-origin image may be clicked directly with, when its fetch failed. */
+internal const val IMAGE_EXT_PATTERN = "\\.(jpe?g|png|gif|webp|svg|avif|bmp|ico)$"
+
+/**
  * The saved file's name: the URL path's last segment, percent-decoded, without a thumbnail size
  * prefix (`330px-`) and with characters no file system accepts replaced. [DOWNLOAD_FALLBACK_NAME]
  * for data:/blob: URLs or when nothing is left.
@@ -708,22 +722,30 @@ internal fun downloadTargetScript(locate: String): String =
  * temporary `<a download>`; when fetch fails outright (CORS), a same-origin URL is clicked directly
  * instead and a cross-origin one fails. Never navigates the page. An HTTP error does not fall back:
  * the server answered, and the direct link would only save its error page.
+ *
+ * [imageOnly] (the target was an `<img>`, whose src can be any URL): the blob must be `image/`, and
+ * the direct fallback needs an image extension, so an "image" cannot be a JSON file in disguise.
  */
-internal fun downloadStartScript(url: String, file: String, token: String): String =
-    "(function () { try { var url = ${url.asJsString()}, file = ${file.asJsString()}; " +
+internal fun downloadStartScript(url: String, file: String, token: String, imageOnly: Boolean = false): String =
+    "(function () { try { var url = ${url.asJsString()}, file = ${file.asJsString()}, imageOnly = $imageOnly; " +
         "var reg = window.__rpaDownloads || (window.__rpaDownloads = {}); " +
         "var st = { state: 'pending', bytes: null, error: null, method: null, ctl: null }; reg[${token.asJsString()}] = st; " +
         "function save(href) { var a = document.createElement('a'); a.href = href; a.download = file; a.rel = 'noopener'; " +
         "a.style.display = 'none'; (document.body || document.documentElement).appendChild(a); a.click(); " +
         "window.setTimeout(function () { if (a.parentNode) { a.parentNode.removeChild(a); } }, 1000); } " +
         "function direct() { var same = false; try { same = new URL(url, location.href).origin === location.origin; } catch (e) {} " +
+        "if (same && imageOnly && !new RegExp(${IMAGE_EXT_PATTERN.asJsString()}, 'i').test(String(url).split('#')[0].split('?')[0])) { " +
+        "st.state = 'failed'; st.error = 'The image could not be fetched and its URL has no image extension'; return; } " +
         "if (same) { save(url); st.method = '$DOWNLOAD_METHOD_DIRECT'; st.state = 'done'; } " +
         "else { st.state = 'failed'; st.error = ${DOWNLOAD_CROSS_ORIGIN_ERROR.asJsString()}; } } " +
         "if (!window.fetch) { direct(); return true; } " +
         "if (window.AbortController) { st.ctl = new AbortController(); } " +
         "fetch(url, { mode: 'cors', credentials: 'omit', signal: st.ctl ? st.ctl.signal : undefined })" +
         ".then(function (r) { if (!r.ok) { throw { http: r.status }; } return r.blob(); })" +
-        ".then(function (b) { if (st.state !== 'pending') { return; } var u = URL.createObjectURL(b); save(u); " +
+        ".then(function (b) { if (st.state !== 'pending') { return; } " +
+        "if (imageOnly && !/^image\\//i.test(b.type || '')) { st.state = 'failed'; " +
+        "st.error = 'The target is not an image (' + (b.type || 'unknown type') + ')'; return; } " +
+        "var u = URL.createObjectURL(b); save(u); " +
         "window.setTimeout(function () { URL.revokeObjectURL(u); }, $DOWNLOAD_REVOKE_MS); " +
         "st.bytes = b.size; st.method = '$DOWNLOAD_METHOD_BLOB'; st.state = 'done'; }, " +
         "function (e) { if (st.state !== 'pending') { return; } " +
@@ -785,15 +807,11 @@ internal class TabActions(
     private val runner = ActionRunner { _, _ -> }
 
     // One step at a time per tab: two concurrent steps interleave their awaitElement polls and a
-    // highlight overlay. Closed tabs' entries are dropped when a new tab is first stepped.
+    // highlight overlay. Never evicted: a waiter may hold the old Mutex, and a fresh one would let a
+    // second step interleave. One Mutex per tab id ever stepped is cheap.
     private val tabLocks = ConcurrentHashMap<String, Mutex>()
 
-    private fun lockFor(tabId: String): Mutex =
-        tabLocks[tabId] ?: run {
-            val open = runCatching { activeTabsProvider()?.activeTabs?.value?.mapTo(HashSet()) { it.tabId } }.getOrNull()
-            if (open != null) tabLocks.keys.retainAll(open + tabId)
-            tabLocks.getOrPut(tabId) { Mutex() }
-        }
+    private fun lockFor(tabId: String): Mutex = tabLocks.getOrPut(tabId) { Mutex() }
 
     fun tools(): List<McpToolDefinition> = listOf(
         McpToolDefinition(
@@ -847,7 +865,9 @@ internal class TabActions(
         val browser = resolveTab(args.tabId)
         refuseIfEngineRunning(args.tabId)
         val result = lockFor(args.tabId).withLock {
-            // Re-checked under the lock: a run may have started while this step waited.
+            // Re-checked under the lock: a run may have started while this step waited. Best-effort,
+            // since a panel run takes no tab lock - but a run creates its own tab, so an agent cannot
+            // know that id before the run starts.
             refuseIfEngineRunning(args.tabId)
             runStep(browser, args)
         }
@@ -869,7 +889,6 @@ internal class TabActions(
             )
         }
     }
-
 
     private suspend fun runStep(browser: BrowserIntegration, args: StepArgs): StepResult {
         val started = Clock.System.now().toEpochMilliseconds()
@@ -925,8 +944,9 @@ internal class TabActions(
             val url = target.url?.takeIf(::isDownloadableUrl)
                 ?: return fail("The target's URL is not http(s), blob or data")
             val file = downloadFileName(url)
+            if (isRefusedDownloadName(file)) return fail(DOWNLOAD_JSON_REFUSED)
             val token = "d" + UUID.randomUUID().toString().replace("-", "")
-            val started = browser.executeJavaScript(downloadStartScript(url, file, token))
+            val started = browser.executeJavaScript(downloadStartScript(url, file, token, imageOnly = target.source != "link"))
             if (!started.isJsTrue()) return fail("Could not start the download: $started")
             val status =
                 try {

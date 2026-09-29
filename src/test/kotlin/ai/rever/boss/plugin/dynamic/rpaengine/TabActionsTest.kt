@@ -184,10 +184,14 @@ class TabActionsTest {
         override suspend fun getCurrentUrl() = url
     }
 
-    private class FakeTabs(private val browsers: Map<String, BrowserIntegration>, otherTabs: List<String> = emptyList()) :
-        ActiveTabsProvider {
+    /** [unlisted] tabs resolve to a browser but are missing from activeTabs, as tabs in another window may be. */
+    private class FakeTabs(
+        private val browsers: Map<String, BrowserIntegration>,
+        otherTabs: List<String> = emptyList(),
+        unlisted: Set<String> = emptySet(),
+    ) : ActiveTabsProvider {
         override val activeTabs: StateFlow<List<ActiveTabData>> =
-            MutableStateFlow((browsers.keys + otherTabs).map { ActiveTabData(it, "t", it, "w", "w", "p", "win") })
+            MutableStateFlow((browsers.keys - unlisted + otherTabs).map { ActiveTabData(it, "t", it, "w", "w", "p", "win") })
         override suspend fun refreshTabs() {}
         override fun selectTab(tabId: String, panelId: String) {}
         override fun getTabUrl(tabId: String): String? = null
@@ -467,25 +471,72 @@ class TabActionsTest {
         assertFalse(ok.isError, ok.text)
     }
 
+    /** Records the most scripts ever in flight at once. */
+    private class CountingBrowser : BrowserIntegration {
+        private var inFlight = 0
+        var maxInFlight = 0
+        override suspend fun executeJavaScript(script: String): Any? {
+            synchronized(this) { inFlight++; maxInFlight = maxOf(maxInFlight, inFlight) }
+            // A slow click keeps the first step inside a script while a second one would start.
+            delay(if (script.contains("el.click();")) 300 else 20)
+            synchronized(this) { inFlight-- }
+            return true
+        }
+        override fun isBrowserAvailable() = true
+        override suspend fun getCurrentUrl() = "https://a.test/"
+    }
+
+    private fun click(tab: String) =
+        """{"tab_id":"$tab","action":{"type":"click","selector":{"type":"id","value":"go"}},"highlight_ms":0}"""
+
     @Test
     fun `two steps on one tab never overlap`() = runBlocking {
-        var inFlight = 0
-        var maxInFlight = 0
-        val b = object : BrowserIntegration {
-            override suspend fun executeJavaScript(script: String): Any? {
-                val now = synchronized(this) { ++inFlight }
-                synchronized(this) { maxInFlight = maxOf(maxInFlight, now) }
-                delay(20)
-                synchronized(this) { inFlight-- }
-                return true
-            }
-            override fun isBrowserAvailable() = true
-            override suspend fun getCurrentUrl() = "https://a.test/"
-        }
+        val b = CountingBrowser()
         val tools = TabActions { FakeTabs(mapOf("t" to b)) }
-        val click = """{"tab_id":"t","action":{"type":"click","selector":{"type":"id","value":"go"}},"highlight_ms":0}"""
-        listOf(async(Dispatchers.Default) { tools.step(click) }, async(Dispatchers.Default) { tools.step(click) }).awaitAll()
-            .forEach { assertFalse(it.isError, it.text) }
-        assertEquals(1, maxInFlight, "scripts from two steps interleaved")
+        listOf(async(Dispatchers.Default) { tools.step(click("t")) }, async(Dispatchers.Default) { tools.step(click("t")) })
+            .awaitAll().forEach { assertFalse(it.isError, it.text) }
+        assertEquals(1, b.maxInFlight, "scripts from two steps interleaved")
+    }
+
+    @Test
+    fun `a tab missing from activeTabs keeps its lock while another tab is stepped`() = runBlocking {
+        val a = CountingBrowser()
+        val tools = TabActions { FakeTabs(mapOf("a" to a, "b" to FakeBrowser()), unlisted = setOf("a")) }
+        val first = async(Dispatchers.Default) { tools.step(click("a")) }
+        delay(60)
+        val other = async(Dispatchers.Default) { tools.step(click("b")) }
+        delay(20)
+        val second = async(Dispatchers.Default) { tools.step(click("a")) }
+        listOf(first, other, second).awaitAll().forEach { assertFalse(it.isError, it.text) }
+        assertEquals(1, a.maxInFlight, "stepping another tab must not evict a held lock")
+    }
+
+    @Test
+    fun `a whitespace-padded wait validates and runs`() = runBlocking {
+        val r = TabActions { FakeTabs(mapOf("t" to FakeBrowser())) }
+            .step("""{"tab_id":"t","action":{"type":"wait","value":" 5 "},"highlight_ms":0}""")
+        assertFalse(r.isError, r.text)
+        assertEquals(true, Json.parseToJsonElement(r.text).jsonObject["ok"]!!.jsonPrimitive.boolean, r.text)
+    }
+
+    @Test
+    fun `a download never plants a json file where the panel lists configurations`() = runBlocking {
+        listOf("rpa-plan.json", "x.JSON", "a.json ").forEach { assertTrue(isRefusedDownloadName(it), it) }
+        listOf("a.jpg", "json", "a.json.png", "report.pdf").forEach { assertFalse(isRefusedDownloadName(it), it) }
+        val b = downloadPage(target = """{"url":"https://attacker.test/rpa-login-helper.json","source":"image"}""")
+        val o = Json.parseToJsonElement(TabActions { FakeTabs(mapOf("t" to b)) }.step(downloadStep).text).jsonObject
+        assertEquals(false, o["ok"]!!.jsonPrimitive.boolean)
+        assertEquals(DOWNLOAD_JSON_REFUSED, o["error"]!!.jsonPrimitive.content)
+        assertTrue(b.scripts.none { it.contains("__rpaDownloads || (") })
+    }
+
+    @Test
+    fun `an image target downloads image-only, a file link does not`() = runBlocking {
+        val img = downloadPage("""{"state":"done","bytes":1,"method":"blob-click"}""")
+        TabActions { FakeTabs(mapOf("t" to img)) }.step(downloadStep)
+        assertTrue(img.scripts.single { it.contains("__rpaDownloads || (") }.contains("imageOnly = true"))
+        val link = downloadPage("""{"state":"done","bytes":1,"method":"blob-click"}""", target = """{"url":"https://x.test/a.pdf","source":"link"}""")
+        TabActions { FakeTabs(mapOf("t" to link)) }.step(downloadStep)
+        assertTrue(link.scripts.single { it.contains("__rpaDownloads || (") }.contains("imageOnly = false"))
     }
 }

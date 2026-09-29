@@ -147,7 +147,7 @@ class ObserveScriptTest {
         assertTrue(js.contains("fetch(url, { mode: 'cors', credentials: 'omit'"))
         assertTrue(js.contains("if (same) { save(url); st.method = 'direct';"))
         assertTrue(js.contains("if (e && e.http) { st.state = 'failed';"), "an HTTP error must not fall back")
-        assertTrue(js.contains("if (st.state !== 'pending') { return; } var u = URL.createObjectURL"), "no save after abort")
+        assertTrue(js.contains(".then(function (b) { if (st.state !== 'pending') { return; } "), "no save after abort")
     }
 
     /**
@@ -188,6 +188,32 @@ class ObserveScriptTest {
         assertTrue(done.contains("\"state\":\"done\"") && done.contains("\"bytes\":20481") && done.contains("\"method\":\"$DOWNLOAD_METHOD_BLOB\""), done)
         assertEquals("blob:x", e.eval("clicks[0]"))
         assertTrue(e.poll().contains("missing"), "a settled entry is removed as it is read")
+    }
+
+    @Test
+    fun `an image-only download refuses a non-image blob and an extensionless direct fallback`() {
+        val json = downloadPage()
+        json.eval(downloadStartScript("https://cdn.test/rpa-plan", "rpa-plan", "t", imageOnly = true))
+        json.eval("pendingFetch.settle(true, { ok: true, status: 200, blob: function () { return P(true, { size: 9, type: 'application/json' }); } })")
+        val st = json.poll()
+        assertTrue(st.contains("\"state\":\"failed\"") && st.contains("not an image (application/json)"), st)
+        assertEquals(0, (json.eval("clicks.length") as Number).toInt())
+
+        val png = downloadPage()
+        png.eval(downloadStartScript("https://cdn.test/p", "p", "t", imageOnly = true))
+        png.eval("pendingFetch.settle(true, { ok: true, status: 200, blob: function () { return P(true, { size: 9, type: 'image/png' }); } })")
+        assertTrue(png.poll().contains("\"state\":\"done\""))
+
+        val bare = downloadPage()
+        bare.eval(downloadStartScript("https://x.test/rpa-plan?x=.png", "rpa-plan", "t", imageOnly = true))
+        bare.eval("pendingFetch.settle(false, new Error('cors'))")
+        assertTrue(bare.poll().contains("no image extension"))
+        assertEquals(0, (bare.eval("clicks.length") as Number).toInt())
+
+        val jpg = downloadPage()
+        jpg.eval(downloadStartScript("https://x.test/a/cat.JPG?s=1", "cat.JPG", "t", imageOnly = true))
+        jpg.eval("pendingFetch.settle(false, new Error('cors'))")
+        assertTrue(jpg.poll().contains("\"method\":\"$DOWNLOAD_METHOD_DIRECT\""))
     }
 
     @Test

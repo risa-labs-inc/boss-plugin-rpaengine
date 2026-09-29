@@ -136,6 +136,8 @@ from `rpa_load`'s `isManagedPath` gate, so the mitigations are the policy:
   script**, before the body and on the same `el` (`actScript`), so what is checked is what is typed
   into; a separate check-then-act was a TOCTOU across two `(primary) || (fallback)` evaluations. A
   guard that throws fails the step without typing. Observe's `sensitive` flag uses the same function.
+  It guards against an agent's mistake, **not against a hostile page**: it runs in page JS, and a
+  page that overrides `getAttribute` or `RegExp.prototype.test` can make it say "not sensitive".
 - `SENSITIVE_NAME_PATTERN` matches short tokens (`pass`, `pin`, `otp`, `card`, `cc`...) only as
   whole camelCase/`_`/`-` words, since it now gates: `passenger`, `compass`, `discard`,
   `footprint` were all flagged by the old substring pattern. Tests pin both lists.
@@ -156,6 +158,12 @@ than claiming a saved file. Verified live in BOSS's embedded browser (JxBrowser)
 one exception is the same-origin `direct` fallback after a failed fetch, a real link click that
 carries cookies. `window.__rpaDownloads` lives in the page, which can read or forge it, so `bytes`
 and `state` are the page's word, not proof.
+
+**`download` never saves a `.json` file.** The panel lists `*.json` in `~/Downloads` as RPA
+configurations, and those can carry `run_script`; a file an agent planted there would undo the
+"a person clicking a downloaded plan is choosing it" reasoning behind `isManagedPath`. A computed
+name ending in `.json` is refused, and an `<img>` target (whose src can be any URL) must fetch an
+`image/` blob, or have an image extension for the direct fallback, so it cannot be JSON in disguise.
 `download` is `rpa_step`-only and displayed as such; the panel's run loop refuses it.
 
 ### Testing

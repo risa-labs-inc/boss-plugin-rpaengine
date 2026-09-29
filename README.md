@@ -101,7 +101,8 @@ so a host that asks before non-read-only tools asks for them.
   download but cannot see whether the host saved it. Credentials are omitted, so a file behind a
   login fails with HTTP 401/403. `download` is not a plan verb: a plan step of that type fails in
   the panel with "only available through rpa_step". The `direct` fallback is a real link click, so
-  it does send cookies. Verified in BOSS's embedded browser
+  it does send cookies. A file named `*.json` is never saved (the panel lists those from
+  `~/Downloads` as configurations), and an image target must fetch an `image/*` blob. Verified in BOSS's embedded browser
   (JxBrowser), where the file lands in `~/Downloads`.
 - Tool errors are `{"error": {"code", "message"}}` with `isError` set. Codes: `INVALID_INPUT`,
   `TAB_NOT_FOUND`, `NO_BROWSER`, `SCRIPT_FAILED` (observe), `UNSUPPORTED_ACTION` and `TAB_BUSY` (step).
