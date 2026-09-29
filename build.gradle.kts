@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.2.1"
+version = "1.3.0"
 
 // Auto-detect CI environment
 val useLocalDependencies = System.getenv("CI") != "true"
@@ -96,6 +96,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
 
     testImplementation(kotlin("test"))
+    // Evaluates the pure JS helpers of injected scripts and parses whole scripts (ES5).
+    testImplementation("org.openjdk.nashorn:nashorn-core:15.4")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.17")
 }
 
@@ -121,6 +123,9 @@ tasks.register<Jar>("buildPluginJar") {
 
 // Sync version from build.gradle.kts into plugin.json (single source of truth)
 tasks.processResources {
+    // Without this the task stays UP-TO-DATE across a version bump (plugin.json's source did not
+    // change), so a local build ships the previous version in its manifest.
+    inputs.property("pluginVersion", version)
     filesMatching("**/plugin.json") {
         filter { line ->
             line.replace(Regex(""""version"\s*:\s*"[^"]*""""), """"version": "\$version"""")

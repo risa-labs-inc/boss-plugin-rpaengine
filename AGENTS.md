@@ -116,8 +116,56 @@ user's session, so a downloaded file must not be reachable by an agent resolving
 and **false means resolved but no match**. Callers report those differently; a change that
 collapses them turns "no element matched `X`" back into a useless "cannot resolve a css selector".
 
-MCP tools are `rpa_status`, `rpa_load`, `rpa_run`, `rpa_stop`, `rpa_results`. `rpa_load` exists
+MCP tools are `rpa_status`, `rpa_load`, `rpa_run`, `rpa_stop`, `rpa_results`, plus
+`rpa_observe` and `rpa_step` (`TabActions.kt`), which take a tab id and need no panel. Step
+execution for both the panel and `rpa_step` lives in `ActionRunner`. `rpa_load` exists
 because loading a configuration was UI-only, which made the whole plugin undriveable by an agent.
+
+### Any-tab reach (`rpa_observe` / `rpa_step`)
+
+**These two tools work on any browser tab by id, not only tabs the engine created. That is
+deliberate.** LLM RPA drives the tab the user chose, usually one they are logged into, through
+these tools; scoping them to engine-created tabs would break that. It is the opposite trade-off
+from `rpa_load`'s `isManagedPath` gate, so the mitigations are the policy:
+
+- `rpa_observe` is declared **not read-only**. It returns link text, hrefs and captions from
+  whatever tab it is pointed at, and hosts often auto-approve read-only tools.
+- `rpa_step` refuses `input` into a field `sensitiveEl` flags (password type, `cc-*`,
+  `one-time-code`, credential-like names, or a field whose aria-label/label/placeholder/title says
+  so) unless the caller passes `allow_sensitive: true`. The check is a guard **inside the typing
+  script**, before the body and on the same `el` (`actScript`), so what is checked is what is typed
+  into; a separate check-then-act was a TOCTOU across two `(primary) || (fallback)` evaluations. A
+  guard that throws fails the step without typing. Observe's `sensitive` flag uses the same function.
+  It guards against an agent's mistake, **not against a hostile page**: it runs in page JS, and a
+  page that overrides `getAttribute` or `RegExp.prototype.test` can make it say "not sensitive".
+- `SENSITIVE_NAME_PATTERN` matches short tokens (`pass`, `pin`, `otp`, `card`, `cc`...) only as
+  whole camelCase/`_`/`-` words, since it now gates: `passenger`, `compass`, `discard`,
+  `footprint` were all flagged by the old substring pattern. Tests pin both lists.
+- `rpa_step` refuses a tab an RPA Engine panel run is driving (`TAB_BUSY`, via `liveRunTabId`
+  across every open panel) and serialises steps per tab with a `Mutex`, for the same interleaving
+  reason `rpa_run` refuses to start over a live run.
+- Field values are never read by observe; `checked` is the one piece of form state it reports.
+
+A change that narrows the reach should be discussed with LLM RPA's owners; a change that widens
+it (reading values, dropping the sensitive gate) needs the same discussion as removing
+`isManagedPath` would.
+
+**`download` reports what the page can see, nothing more.** `ok: true` means the page fetched the
+file (or clicked a same-origin link) and clicked `<a download>`; whether the host saved it is not
+visible to the page, so the result carries `save_verified: false`, `method` and a `note` rather
+than claiming a saved file. Verified live in BOSS's embedded browser (JxBrowser), which saves to
+`~/Downloads`. Fetches omit credentials, so a file behind a login is an honest HTTP 401/403; the
+one exception is the same-origin `direct` fallback after a failed fetch, a real link click that
+carries cookies. `window.__rpaDownloads` lives in the page, which can read or forge it, so `bytes`
+and `state` are the page's word, not proof.
+
+**`download` never requests a `.json` file name.** The panel lists `*.json` in `~/Downloads` as RPA
+configurations, and those can carry `run_script`; a file an agent planted there would undo the
+"a person clicking a downloaded plan is choosing it" reasoning behind `isManagedPath`. A computed
+name ending in `.json` is refused, and an `<img>` target (whose src can be any URL) must fetch an
+`image/` blob, or have an image extension for the direct fallback, so it cannot be JSON in disguise.
+On the same-origin fallback the server's suggested name (Content-Disposition) can still override
+ours, so this narrows the risk rather than ruling it out. `download` is `rpa_step`-only and displayed as such; the panel's run loop refuses it.
 
 ### Testing
 
@@ -134,9 +182,8 @@ entries where nothing else contained the query, so a substring-first implementat
 on its first pass and returned the exact match anyway: the test passed on the very mutation it
 named. The earlier entry has to actually contain the query.
 
-Nothing runs `./gradlew test` in CI - `build.yml` fires only on push to `main` and delegates to
-the shared release workflow. These tests protect local development only; a PR-triggered job
-running `./gradlew test` would make the policy above enforceable, and is worth adding.
+`.github/workflows/test.yml` runs `./gradlew test` on every pull request (`build.yml` only fires
+on push to `main`), so the policy above is enforced before merge.
 
 `TextSelectorScriptTest` dumps the generated script to `build/tmp/text-selector-images.js`. String
 assertions cannot show that a locator picks the right *node*, so paste that file into a real page

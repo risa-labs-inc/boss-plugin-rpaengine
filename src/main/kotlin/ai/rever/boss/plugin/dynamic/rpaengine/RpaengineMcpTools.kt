@@ -11,15 +11,19 @@ import ai.rever.boss.plugin.api.McpToolResult
  *
  * The engine's actions live on the per-panel [RpaengineComponent], so these
  * tools operate on the most recently opened RPA Engine panel (via [component]);
- * if none is open they report that. Registered in
+ * if none is open they report that. `rpa_observe` and `rpa_step` ([TabActions]) instead
+ * target any browser tab by id and need no panel. Registered in
  * [RpaengineDynamicPlugin.register]; removed automatically on disable/unload.
  */
 internal class RpaengineMcpToolProvider(
     override val providerId: String,
     private val component: () -> RpaengineComponent?,
+    private val tabActions: TabActions? = null,
 ) : McpToolProvider {
 
-    override fun tools(): List<McpToolDefinition> = listOf(
+    override fun tools(): List<McpToolDefinition> = panelTools() + tabActions?.tools().orEmpty()
+
+    private fun panelTools(): List<McpToolDefinition> = listOf(
         McpToolDefinition(
             name = "rpa_status",
             description = "Report RPA Engine execution status (state, current action, result count).",
