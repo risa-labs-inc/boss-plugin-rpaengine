@@ -603,7 +603,7 @@ class ComputerUseTest {
         assertTrue(file.isFile && file.name.endsWith(".jpg") && file.name.startsWith("t-"))
         ImageIO.read(file).let { assertEquals(800 to 640, it.width to it.height) }
         val order = rig.log.entries.filter { it in setOf("hide", "bitmap", "show") }
-        assertEquals(listOf("hide", "bitmap"), order) // no pointer was ever shown: nothing to re-inject
+        assertEquals(listOf("bitmap"), order) // default: the overlay is left alone
         assertEquals(10, s["scroll"]!!.jsonObject["x"]!!.jsonPrimitive.int)
         assertEquals(250, s["scroll"]!!.jsonObject["y"]!!.jsonPrimitive.int)
         assertEquals(1800, s["scroll"]!!.jsonObject["max_y"]!!.jsonPrimitive.int)
@@ -613,7 +613,7 @@ class ComputerUseTest {
     }
 
     @Test
-    fun `screenshot removes the overlay then re-injects the pointer at its remembered spot with its label and color`() {
+    fun `a default screenshot leaves the pointer untouched, and hide_overlay removes then re-injects it at its spot`() {
         val rig = Rig()
         val scripts = mutableListOf<String>()
         val browser = object : BrowserIntegration by rig.browser {
@@ -625,10 +625,17 @@ class ComputerUseTest {
             rig.log.entries.clear(); scripts.clear()
             tools.step("""{"tab_id":"t","action":{"type":"screenshot"},"highlight_ms":0}""")
         }
+        // default: no removal, no re-injection, no glide: the pointer is not touched at all
+        assertEquals(listOf("bitmap"), rig.log.entries.filter { it in setOf("hide", "bitmap", "pointer") })
+        assertTrue(scripts.none { it.contains("root.style.transform") || it.contains(POINTER_ATTR) && it.contains("remove") })
+        rig.log.entries.clear(); scripts.clear()
+        runBlocking { tools.step("""{"tab_id":"t","action":{"type":"screenshot","hide_overlay":true},"highlight_ms":0}""") }
         assertEquals(listOf("hide", "bitmap", "pointer"), rig.log.entries.filter { it in setOf("hide", "bitmap", "pointer") })
         val reinject = scripts.last { it.contains("root.style.transform") }
         assertTrue(reinject.contains("translate(120px,340px)") && reinject.contains("#112233") && reinject.contains("Jev · Research"))
         assertFalse(reinject.contains("animate")) // no ripple on restore
+        // the next pointer action still re-creates the overlay (e.g. after a navigation): pointerScript builds it when absent
+        assertTrue(pointerScript(5, 6, 120 to 340, PointerSpec("Jev", "#112233"), false).contains("if(!root){"))
         rig.dir.deleteRecursively()
     }
 
@@ -640,7 +647,7 @@ class ComputerUseTest {
         rig.run("""{"type":"click_at","value":"50,60"}""", ""","pointer":{"label":"Jev"}""")
         rig.run("""{"type":"pointer_hide"}""")
         rig.log.entries.clear()
-        rig.run("""{"type":"screenshot"}""")
+        rig.run("""{"type":"screenshot","hide_overlay":true}""")
         assertFalse(rig.log.entries.contains("pointer"))
         assertEquals(ScrollInfo(1, 2, 3), ScrollInfo.parse("1,2,3"))
         assertEquals(ScrollInfo(0, 0, 0), ScrollInfo.parse("\"0.4,-1,0\""))
@@ -652,7 +659,7 @@ class ComputerUseTest {
     fun `screenshot restores the overlay even when the bitmap is missing`() {
         val rig = Rig()
         val broken = TabActions(computerUse = ComputerUse({ FakeSurface(rig.log, bitmap = null) }, ShotStore(rig.dir))) { FakeTabs(rig.browser) }
-        val out = json(runBlocking { broken.step("""{"tab_id":"t","action":{"type":"screenshot"},"highlight_ms":0}""") })
+        val out = json(runBlocking { broken.step("""{"tab_id":"t","action":{"type":"screenshot","hide_overlay":true},"highlight_ms":0}""") })
         assertFalse(out["ok"]!!.jsonPrimitive.boolean)
         assertEquals(listOf("hide", "bitmap"), rig.log.entries.filter { it in setOf("hide", "bitmap", "pointer") })
         rig.dir.deleteRecursively()

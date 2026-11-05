@@ -906,6 +906,7 @@ internal class ComputerUse(
         pointer: PointerSpec?,
         allowSensitive: Boolean,
         snap: SnapBox? = null,
+        hideOverlay: Boolean = false,
     ): CuOutcome {
         val value = action.value
         if (action.type != CuTypes.CU_END && action.type != CuTypes.DIALOG_ANSWER) startCapture(browser, tabId)
@@ -949,7 +950,7 @@ internal class ComputerUse(
                 val surface = surfaceFor(browser)
                     ?: return CuOutcome(false, "Screenshots and real input need a JxBrowser tab; none is behind this one")
                 when (action.type) {
-                    CuTypes.SCREENSHOT -> screenshot(browser, surface, tabId, value?.trim()?.toIntOrNull() ?: SHOT_DEFAULT_MAX_SIDE)
+                    CuTypes.SCREENSHOT -> screenshot(browser, surface, tabId, value?.trim()?.toIntOrNull() ?: SHOT_DEFAULT_MAX_SIDE, hideOverlay)
                     CuTypes.CLICK_AT -> clickAt(browser, surface, tabId, value, pointer, snap)
                     CuTypes.TYPE_TEXT -> typeText(browser, surface, value.orEmpty(), allowSensitive)
                     CuTypes.KEY -> key(surface, value)
@@ -981,20 +982,25 @@ internal class ComputerUse(
             ?.let { runCatching { TabJson.decodeFromString(FocusedInfo.serializer(), it) }.getOrNull() }
             ?.takeIf { it.tag != null }
 
-    private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int): CuOutcome {
+    private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int, hideOverlay: Boolean): CuOutcome {
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         val scroll = ScrollInfo.parse(orNullUnlessCancelled { browser.executeJavaScript(ScrollInfo.SCRIPT) })
         val contentHash = (orNullUnlessCancelled { browser.executeJavaScript(contentHashScript()) } as? String)?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
-        orNullUnlessCancelled { browser.executeJavaScript(overlayRemoveScript()) }
-        val image = try {
-            delay(OVERLAY_SETTLE_MS) // one compositor frame, so the bitmap no longer holds the overlay
+        // Default: the pointer stays untouched (no DOM churn, no flicker between actions). hide_overlay removes the
+        // overlay nodes for the capture and puts the pointer back at its remembered spot, without a glide.
+        val image = if (!hideOverlay) {
             surface.bitmap()
-        } finally {
-            // Put the pointer back where it was, same label and color, without a glide.
-            val at = positions[tabId]
-            val spec = specs[tabId]
-            if (at != null && spec != null) {
-                withContext(NonCancellable) { orNullUnlessCancelled { browser.executeJavaScript(pointerScript(at.first, at.second, at, spec, false)) } }
+        } else {
+            orNullUnlessCancelled { browser.executeJavaScript(overlayRemoveScript()) }
+            try {
+                delay(OVERLAY_SETTLE_MS) // one compositor frame, so the bitmap no longer holds the overlay
+                surface.bitmap()
+            } finally {
+                val at = positions[tabId]
+                val spec = specs[tabId]
+                if (at != null && spec != null) {
+                    withContext(NonCancellable) { orNullUnlessCancelled { browser.executeJavaScript(pointerScript(at.first, at.second, at, spec, false)) } }
+                }
             }
         } ?: return CuOutcome(false, "The browser returned no bitmap")
         val (w, h) = fitShotSize(image.width, image.height, maxSide)
