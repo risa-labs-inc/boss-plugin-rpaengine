@@ -42,10 +42,14 @@ class FramesTest {
         var mark: String? = null
         var hit: String? = null
         var focused: () -> String = { """{"tag":"body","editable":false,"hf":false}""" }
+        var len: () -> Any? = { -1 }
+        var markFocus: () -> String? = { null }
         val scripts = mutableListOf<String>()
 
         fun answer(script: String): Any? {
             val kind = when {
+                script.contains("/*rpa-len*/") -> "len"
+                script.contains("/*rpa-mark-focus*/") -> "mark-focus"
                 script.contains("/*rpa-look*/") -> "look"
                 script.contains("/*rpa-framed*/") -> "framed"
                 script.contains("/*rpa-mark*/") -> "mark"
@@ -62,6 +66,8 @@ class FramesTest {
                 "framed" -> framed(script)
                 "mark" -> mark
                 "hit" -> hit
+                "len" -> len()
+                "mark-focus" -> markFocus()
                 "focused", "focused+select" -> focused()
                 "quiet" -> true
                 "viewport" -> "1000,800,2"
@@ -82,11 +88,15 @@ class FramesTest {
         override suspend fun eval(script: String): Any? = doc.answer(script)
     }
 
-    private class Surface(val kids: List<FakeFrame>) : TabSurface {
+    private class Surface(val kids: List<FakeFrame>, val log: MutableList<String>? = null) : TabSurface {
         val events = mutableListOf<TabEvent>()
         var onKey: () -> Unit = {}
         override suspend fun bitmap(): BufferedImage = BufferedImage(2000, 1600, BufferedImage.TYPE_INT_RGB)
-        override suspend fun dispatch(event: TabEvent): Boolean { events += event; if (event is TabEvent.KeyUp) onKey(); return true }
+        override suspend fun focus() { log?.let { synchronized(it) { it += "focus" } } }
+        override suspend fun dispatch(event: TabEvent): Boolean {
+            events += event; log?.let { synchronized(it) { it += "ev:${event::class.simpleName}" } }
+            if (event is TabEvent.KeyUp) onKey(); return true
+        }
         override fun childFrames(): List<SubFrame> = kids
     }
 
@@ -105,7 +115,7 @@ class FramesTest {
 
     private class Rig(kids: List<FakeFrame>, val top: Doc) {
         val dir: File = Files.createTempDirectory("frames").toFile()
-        val surface = Surface(kids)
+        val surface = Surface(kids, top.log)
         val tools = TabActions(computerUse = ComputerUse({ surface }, ShotStore(dir)), uiDispatcher = kotlinx.coroutines.Dispatchers.Unconfined) { Tabs(TopBrowser(top)) }
         fun run(action: String, extra: String = ""): JsonObject =
             Json.parseToJsonElement(runBlocking { tools.step("""{"tab_id":"t","action":$action,"highlight_ms":0$extra}""") }.text).jsonObject
@@ -501,5 +511,137 @@ class FramesTest {
         """.trimIndent())
         val a = TabJson.decodeFromString(SnapAnswer.serializer(), e.eval(snapScript(100, 100, SnapBox(80.0, 80.0, 140.0, 120.0))) as String)
         assertFalse(a.moved)
+    }
+
+    // ---- typing timing -----------------------------------------------------------------------
+
+    private val addrFocused = """{"tag":"input","editable":true,"label":"Delivery address","type":"text","hf":true,"xp":"/html[1]/body[1]/input[1]"}"""
+
+    @Test
+    fun `type_text returns only once the typed length has landed, then waits for quiet`() {
+        val c = Checkout()
+        c.top.focused = { addrFocused }
+        val lens = ArrayDeque(listOf(3, 5, 8)) // the engine applies keys asynchronously: "1A 2B 9z" lands over three polls
+        c.top.len = { (if (lens.size > 1) lens.removeFirst() else lens.first()).toDouble() } // JxBrowser hands numbers back as Double
+        val r = c.rig.run("""{"type":"type_text","value":"1A 2B 9z"}""")
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean, r.toString())
+        assertFalse(r.containsKey("typed_complete"))
+        assertEquals(3, c.log.count { it == "top:len" })
+        val lastLen = c.log.lastIndexOf("top:len")
+        assertTrue(c.log.indexOf("top:quiet") > lastLen, "the quiet wait comes after the text landed")
+        assertTrue(c.log.indexOf("top:len") > c.log.lastIndexOf("ev:KeyUp"), "polled after the last key")
+        // Enter is a keystroke, not content: "ab\n" lands as length 2
+        assertEquals(2, typedLength("ab\n")); assertEquals(3, typedLength("a\tbc"))
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `type_text completes when the length stops changing, e g a maxlength or formatting field`() {
+        val c = Checkout()
+        c.top.focused = { addrFocused }
+        c.top.len = { 5 }
+        val t0 = System.currentTimeMillis()
+        val r = c.rig.run("""{"type":"type_text","value":"1A 2B 9z"}""")
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean); assertFalse(r.containsKey("typed_complete"))
+        assertTrue(System.currentTimeMillis() - t0 < TYPE_CAP_MIN_MS, "stable for 150 ms is done, not the cap")
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `type_text reports typed_complete false when the text has not landed by the cap`() {
+        val c = Checkout()
+        c.top.focused = { addrFocused }
+        var n = 0
+        c.top.len = { ++n % 7 } // keeps changing, never the expected 8
+        val t0 = System.currentTimeMillis()
+        val r = c.rig.run("""{"type":"type_text","value":"1A 2B 9z"}""")
+        val took = System.currentTimeMillis() - t0
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean)
+        assertEquals(false, r["typed_complete"]!!.jsonPrimitive.boolean)
+        assertTrue(took >= TYPE_CAP_MIN_MS, "capped at max(1500 ms, 25 ms x chars): $took")
+        assertTrue(took < TYPE_CAP_MIN_MS + 1_500, "and no longer: $took")
+        // a <select> keeps type-ahead as before: no length poll
+        c.log.clear()
+        c.top.focused = { """{"tag":"select","editable":false,"label":"Size","options":["S","L"],"hf":true}""" }
+        c.rig.run("""{"type":"type_text","value":"L"}""")
+        assertFalse(c.log.contains("top:len"))
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `type_text by element waits for the field to take focus before the select-all and the first key, with no modifier held`() {
+        val c = Checkout()
+        c.rig.run("""{"type":"look"}""")
+        c.top.mark = """{"state":"ok","x":110,"y":115,"label":"Delivery address","tag":"input"}"""
+        val focus = ArrayDeque(listOf("""{"can":true,"f":false}""", """{"can":true,"f":false}""", """{"can":true,"f":true}"""))
+        c.top.markFocus = { if (focus.size > 1) focus.removeFirst() else focus.first() }
+        c.top.focused = { addrFocused }
+        c.top.len = { 21 }
+        c.log.clear()
+        val r = c.rig.run("""{"type":"type_text","element":"m1","value":"12 MG Road, Bengaluru"}""")
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean, r.toString())
+        val log = c.log
+        val release = log.indexOf("ev:Release")
+        val focusPolls = log.withIndex().filter { it.value == "top:mark-focus" }.map { it.index }
+        val select = log.indexOf("top:focused+select")
+        val firstKey = log.indexOf("ev:KeyDown")
+        assertEquals(3, focusPolls.size, "polled until the field was the active element")
+        assertTrue(release < focusPolls.first() && focusPolls.last() < select && select < firstKey, log.toString())
+        // the browser was focused once, before the click; never again between the click and the keys
+        assertEquals(listOf(log.indexOf("focus")), log.withIndex().filter { it.value == "focus" }.map { it.index })
+        assertTrue(log.indexOf("focus") < log.indexOf("ev:Press"))
+        // the select-all is a script, not a chord: no event before the first character carries ctrl/meta, and the first key is '1'
+        val ev = c.rig.surface.events
+        val first = ev.indexOfFirst { it is TabEvent.KeyDown }
+        assertFalse(ev.any { (it is TabEvent.KeyDown && (it.mods.ctrl || it.mods.meta)) || (it is TabEvent.KeyUp && (it.mods.ctrl || it.mods.meta)) })
+        assertEquals(TabEvent.KeyDown("KEY_CODE_1", '1'), ev[first])
+        assertTrue(ev.subList(0, first).none { it is TabEvent.KeyUp || it is TabEvent.KeyChar })
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `click_at on an element that takes no text focus does not wait, and a field that never focuses waits at most 500 ms`() {
+        val c = Checkout()
+        c.rig.run("""{"type":"look"}""")
+        c.top.mark = """{"state":"ok","x":110,"y":115,"label":"Delivery address","tag":"input"}"""
+        c.top.markFocus = { """{"can":false,"f":false}""" }
+        c.log.clear()
+        c.rig.run("""{"type":"click_at","element":"m1"}""")
+        assertEquals(1, c.log.count { it == "top:mark-focus" })
+        c.top.markFocus = { """{"can":true,"f":false}""" }
+        val t0 = System.currentTimeMillis()
+        assertTrue(c.rig.run("""{"type":"click_at","element":"m1"}""")["ok"]!!.jsonPrimitive.boolean)
+        val took = System.currentTimeMillis() - t0
+        assertTrue(took in FOCUS_WAIT_MS..(FOCUS_WAIT_MS + 1_000), "$took")
+        // a plain x,y click asks nothing
+        c.log.clear()
+        c.rig.run("""{"type":"click_at","value":"5,5"}""")
+        assertFalse(c.log.contains("top:mark-focus"))
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `mark focus script tells a focused field from an unfocused one and from a button`() {
+        assertTrue(markFocusScript("m1", MarkRef("/html[1]", "x", "input")).let { it.contains("/*rpa-mark-focus*/") && !it.contains("/*rpa-mark*/") })
+        (NashornScriptEngineFactory().getScriptEngine("--language=es5") as Compilable).compile("(${markFocusScript("m1", MarkRef("/html[1]", "x", "input"))})")
+        (NashornScriptEngineFactory().getScriptEngine("--language=es5") as Compilable).compile("(${focusedLengthScript()})")
+        val e = frameDom()
+        e.eval("""
+            var field=new F('input',{rect:[0,0,10,10]});field.attrs={type:'text'};field.value='hunter2';
+            var go=new F('button',{rect:[0,0,10,10]});
+            html.contains=function(o){return o===field||o===go;};
+            window.__rpaMarks={m1:field,m2:go};
+        """.trimIndent())
+        fun ask(id: String, tag: String) = TabJson.decodeFromString(MarkFocus.serializer(), e.eval(markFocusScript(id, MarkRef(null, "", tag))) as String)
+        e.eval("document.activeElement=body;")
+        assertEquals(MarkFocus(can = true, f = false), ask("m1", "input"))
+        e.eval("document.activeElement=field;")
+        assertEquals(MarkFocus(can = true, f = true), ask("m1", "input"))
+        assertFalse(ask("m2", "button").can)
+        // the length script reports the length only
+        assertEquals(7, (e.eval(focusedLengthScript()) as Number).toInt())
+        assertFalse(focusedLengthScript().contains("return el.value") || focusedLengthScript().contains("value+"))
+        e.eval("document.activeElement=go;")
+        assertEquals(-1, (e.eval(focusedLengthScript()) as Number).toInt())
     }
 }

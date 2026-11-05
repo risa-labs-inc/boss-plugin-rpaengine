@@ -276,13 +276,16 @@ internal data class MarkAnswer(
  * stored at look time (accepted only when tag and label still match). Scrolls it into view when it left the viewport.
  * Answers JSON [MarkAnswer]: the visible centre (or another inner point that is not covered) when clickable.
  */
-internal fun markScript(id: String, mark: MarkRef): String =
-    "(function () { /*rpa-mark*/ try { " + OBSERVE_HELPERS_JS + OBSERVE_DOM_JS + MODAL_JS + MARK_COMMON_JS +
-        "var ID = ${id.asJsString()}, XP = ${(mark.xpath ?: "").asJsString()}, LAB = ${mark.label.asJsString()}, TAG = ${mark.tag.asJsString()}; " +
+/** Finds mark [id] into `el` (null when gone): the node kept in window.__rpaMarks, else the xpath when tag and label still match. */
+private fun markFindJs(id: String, mark: MarkRef): String =
+    "var ID = ${id.asJsString()}, XP = ${(mark.xpath ?: "").asJsString()}, LAB = ${mark.label.asJsString()}, TAG = ${mark.tag.asJsString()}; " +
         "var m = window.__rpaMarks, el = m ? (m.get ? m.get(ID) : m[ID]) : null; " +
         "if (el && !(el.tagName && el.tagName.toLowerCase() === TAG && document.documentElement.contains(el))) { el = null; } " +
         "if (!el && XP) { try { var n = document.evaluate(XP, document, null, 9, null).singleNodeValue; " +
-        "if (n && n.tagName.toLowerCase() === TAG && labelNow(n) === LAB) { el = n; } } catch (e0) {} } " +
+        "if (n && n.tagName.toLowerCase() === TAG && labelNow(n) === LAB) { el = n; } } catch (e0) {} } "
+
+internal fun markScript(id: String, mark: MarkRef): String =
+    "(function () { /*rpa-mark*/ try { " + OBSERVE_HELPERS_JS + OBSERVE_DOM_JS + MODAL_JS + MARK_COMMON_JS + markFindJs(id, mark) +
         "if (!el) { return JSON.stringify({ state: 'gone' }); } " +
         "var label = labelNow(el) || LAB || TAG; " +
         "if (disabled(el)) { return JSON.stringify({ state: 'disabled', label: label, tag: TAG }); } " +
@@ -299,6 +302,26 @@ internal fun markScript(id: String, mark: MarkRef): String =
         "else { cover = first ? (labelNow(first) || norm(first.getAttribute('aria-label')) || first.tagName.toLowerCase()) : 'another element'; } " +
         "return JSON.stringify({ state: 'covered', label: label, tag: TAG, cover: cover }); " +
         "} catch (e) { return null; } })()"
+
+/** The page's answer to [markFocusScript]. */
+@Serializable
+internal data class MarkFocus(
+    /** The element takes text focus (field, select, contenteditable, textbox role); others are not waited for. */
+    val can: Boolean = false,
+    /** It (or something inside it, or the control it labels) is the document's active element. */
+    val f: Boolean = false,
+)
+
+/** Whether mark [id] holds focus in its document: JSON [MarkFocus]. Run in the mark's own frame. */
+internal fun markFocusScript(id: String, mark: MarkRef): String =
+    "(function () { /*rpa-mark-focus*/ try { " + OBSERVE_HELPERS_JS + OBSERVE_DOM_JS + MODAL_JS + MARK_COMMON_JS + markFindJs(id, mark) +
+        "if (!el) { return JSON.stringify({ can: false, f: false }); } " +
+        "var a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) { a = a.shadowRoot.activeElement; } " +
+        "var tag = el.tagName.toLowerCase(), role = el.getAttribute('role'); " +
+        "var can = tag === 'textarea' || tag === 'select' || (tag === 'input' && ['button','submit','reset','image','checkbox','radio','file','range','color','hidden'].indexOf((el.getAttribute('type') || 'text').toLowerCase()) === -1) || " +
+        "el.isContentEditable === true || role === 'textbox' || role === 'searchbox' || role === 'combobox' || (tag === 'label' && !!el.control); " +
+        "var f = !!a && (a === el || el.contains(a) || (tag === 'label' && el.control === a)); " +
+        "return JSON.stringify({ can: can, f: f }); } catch (e) { return null; } })()"
 
 /** Drops null members (recursively) so optional fields vanish from the result, keeping empty lists and objects. */
 internal fun pruneNulls(e: JsonElement): JsonElement = when (e) {

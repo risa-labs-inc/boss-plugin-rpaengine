@@ -310,6 +310,8 @@ internal data class StepResult(
     val popups: List<PopupInfo>? = null,
     /** Something the caller should know about how the action went, e.g. focus moving between split code boxes. */
     val note: String? = null,
+    /** type_text only: false when the typed text had not fully landed in the field by the time cap. */
+    @SerialName("typed_complete") val typedComplete: Boolean? = null,
 )
 
 @Serializable
@@ -328,7 +330,7 @@ internal data class DownloadInfo(
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
     return JsonObject(
-        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups" || k == "note") && v is JsonNull }
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups" || k == "note" || k == "typed_complete") && v is JsonNull }
             .mapValues { (k, v) ->
                 when {
                     k == "popups" && v is kotlinx.serialization.json.JsonArray ->
@@ -1119,6 +1121,7 @@ internal class TabActions(
             look = cu?.look?.copy(popups = popupsNow, dialog = dialogNow),
             popups = popupsNow,
             note = cu?.note,
+            typedComplete = cu?.typedComplete,
         )
     }
 
@@ -1253,7 +1256,7 @@ internal class TabActions(
                 "snapped {from, to, tag, label} only when it moved; canvas or no candidate = the raw point); type_text (value: text; selects the focused field's content first, replaces it; " +
                 "on a <select> it type-aheads the option); key (value: Enter, Escape, Tab, ArrowDown, ctrl+a, ...); " +
                 "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
-                "{tag, editable, label, type, options, sensitive, frame?}, never a value; focus inside an iframe is followed into that frame; type_text adds note when the page moved focus while typing, e.g. split code boxes); pointer_hide (removes the overlay); " +
+                "{tag, editable, label, type, options, sensitive, frame?}, never a value; focus inside an iframe is followed into that frame; type_text adds note when the page moved focus while typing, e.g. split code boxes, returns once the typed text has landed in the field and adds typed_complete: false when it had not by the cap; after a click on a field element, keys wait until it has focus); pointer_hide (removes the overlay); " +
                 "page_text (read-only, value: max chars, default 20000, max 100000: returns text = the page's rendered innerText, never field values). " +
                 "look (read-only; value: a JSON string of options {max_side: 1100, quality: 0.7, locate: [phrases], elements: true, ensure_visible: false, page_text: false}) returns everything for one decision in one call: " +
                 "look {screenshot {...as above}, located {phrase: {found, count, in_view, direction, screens, rect?}}, elements [{id: 'm1'.., role, tag, label, value_kind?: text|empty|checked|unchecked|selected:<option>, rect {x,y,w,h}, disabled, covered, context, editable, href_host?, frame?}], page_text?, popups?, dialog?}; " +

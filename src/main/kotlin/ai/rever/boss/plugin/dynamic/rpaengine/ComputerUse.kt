@@ -8,6 +8,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import java.awt.RenderingHints
@@ -336,6 +337,29 @@ internal data class PageMeta(val url: String? = null, val title: String? = null,
     }
 }
 
+/** type_text completion: the focused field's content length is polled until it lands; see [focusedLengthScript]. */
+internal const val TYPE_POLL_MS = 30L
+internal const val TYPE_STABLE_MS = 150L
+internal const val TYPE_CAP_MIN_MS = 1_500L
+internal const val TYPE_CAP_PER_CHAR_MS = 25L
+
+/** After a click on an element: how long to wait for it to take focus, then one frame before any key. */
+internal const val FOCUS_WAIT_MS = 500L
+internal const val FOCUS_POLL_MS = 30L
+internal const val FRAME_MS = 20L
+
+/**
+ * The focused text field's content LENGTH (value length; text length for a contenteditable), -1 when no text field
+ * has focus. Never the content itself.
+ */
+internal fun focusedLengthScript(): String =
+    "(function(){/*rpa-len*/try{var el=document.activeElement;while(el&&el.shadowRoot&&el.shadowRoot.activeElement){el=el.shadowRoot.activeElement;}" +
+        "if(!el)return -1;var t=el.tagName.toLowerCase();if(t==='input'||t==='textarea')return typeof el.value==='string'?el.value.length:-1;" +
+        "if(el.isContentEditable)return (el.textContent||'').length;return -1;}catch(e){return -1;}})()"
+
+/** The length a replace-all of [text] leaves in a field: Enter and Tab are keystrokes, not content. */
+internal fun typedLength(text: String): Int = text.count { it != '\n' && it != '\r' && it != '\t' }
+
 internal const val REVEAL_POLL_MS = 50L
 internal const val REVEAL_TIMEOUT_MS = 1_500L
 internal const val REVEAL_FRAME_MS = 120L
@@ -413,6 +437,8 @@ internal class CuOutcome(
     val clicked: ClickedInfo? = null,
     val look: LookResult? = null,
     val note: String? = null,
+    /** type_text: false when the typed text had not landed in the field by the cap; null otherwise. */
+    val typedComplete: Boolean? = null,
 )
 
 /** The element a click_at / type_text `element` resolved to. */
@@ -1139,8 +1165,8 @@ internal class ComputerUse(
                             if (!c.ok) return c
                             clicked = c.clicked
                         }
-                        val t = typeText(browser, surface, tabId, value.orEmpty(), allowSensitive)
-                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked, note = t.note)
+                        val t = typeText(browser, surface, tabId, value.orEmpty(), allowSensitive, focusBrowser = clicked == null)
+                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked, note = t.note, typedComplete = t.typedComplete)
                     }
                     CuTypes.KEY -> key(browser, surface, tabId, value)
                     CuTypes.SCROLL_BY -> scrollBy(browser, surface, tabId, value, pointer)
@@ -1364,11 +1390,12 @@ internal class ComputerUse(
         var clicked: ClickedInfo? = null
         var resolved: Pair<Int, Int>? = null
         var frame: BrowserIntegration? = null
+        var focusRef: MarkRef? = null
         if (element != null) {
             val (a, f) = resolveMark(browser, surface, tabId, element)
             val name = a.label ?: marks[tabId]?.get(element)?.label ?: element
             when (a.state) {
-                "ok" -> { resolved = a.x to a.y; clicked = ClickedInfo(element, a.label, a.tag); frame = f }
+                "ok" -> { resolved = a.x to a.y; clicked = ClickedInfo(element, a.label, a.tag); frame = f; focusRef = marks[tabId]?.get(element) }
                 "disabled" -> return CuOutcome(false, "'$name' is disabled")
                 "covered" -> return CuOutcome(false, "'$name' is covered by ${a.cover ?: "another element"}")
                 else -> if (fallback == null) return CuOutcome(false, "Element '$element' is gone and no x,y fallback was given; take a new look")
@@ -1395,10 +1422,49 @@ internal class ComputerUse(
         // Always the top-viewport point: Chromium's input router hit-tests it and delivers it to the (out-of-process) frame under it.
         if (!surface.play(TabGestures.click(x, y))) return CuOutcome(false, "The browser did not accept the click", snapped = snapped)
         quietIn(browser, tabId, frame)
+        val ref = focusRef
+        if (ref != null && element != null) awaitFocus(frame ?: browser, ref.localId ?: element, ref)
         return CuOutcome(true, snapped = snapped, clicked = clicked)
     }
 
-    private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, tabId: String, text: String, allowSensitive: Boolean): CuOutcome {
+    /**
+     * After a click on a mark: until it (a field) is its document's active element, at most [FOCUS_WAIT_MS], then one
+     * frame, so the first key never arrives before focus has settled. Elements that take no text focus are not waited for.
+     */
+    private suspend fun awaitFocus(target: BrowserIntegration, localId: String, ref: MarkRef) {
+        val deadline = System.currentTimeMillis() + FOCUS_WAIT_MS
+        while (true) {
+            val a = (orNullUnlessCancelled { withTimeoutOrNull(QUIET_CALL_TIMEOUT_MS) { target.executeJavaScript(markFocusScript(localId, ref)) } } as? String)
+                ?.let { runCatching { TabJson.decodeFromString(MarkFocus.serializer(), it) }.getOrNull() } ?: return
+            if (!a.can) return
+            if (a.f || System.currentTimeMillis() >= deadline) break
+            delay(FOCUS_POLL_MS)
+        }
+        delay(FRAME_MS)
+    }
+
+    /**
+     * After the key events went out: polls the focused field's content length in [target] until it is [expected] or has
+     * not changed for [TYPE_STABLE_MS]; false when max([TYPE_CAP_MIN_MS], [TYPE_CAP_PER_CHAR_MS] x chars) passed first.
+     */
+    private suspend fun awaitTyped(target: BrowserIntegration, expected: Int, chars: Int): Boolean {
+        val start = System.currentTimeMillis()
+        val cap = maxOf(TYPE_CAP_MIN_MS, TYPE_CAP_PER_CHAR_MS * chars)
+        var last: Int? = null
+        var since = start
+        while (true) {
+            val n = (orNullUnlessCancelled { withTimeoutOrNull(QUIET_CALL_TIMEOUT_MS) { target.executeJavaScript(focusedLengthScript()) } } as? Number)?.toInt() ?: -1
+            val now = System.currentTimeMillis()
+            if (n == expected) return true
+            if (n != last) { last = n; since = now } else if (now - since >= TYPE_STABLE_MS) return true
+            if (now - start >= cap) return false
+            delay(TYPE_POLL_MS)
+        }
+    }
+
+    private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, tabId: String, text: String, allowSensitive: Boolean, focusBrowser: Boolean = true): CuOutcome {
+        // Before reading focus: a click already gave the browser focus, and focusing it again right before the keys could drop the first one.
+        if (focusBrowser) surface.focus()
         val read = readFocusedDeep(browser, surface)
             ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)")
         val focused = read.info
@@ -1412,23 +1478,25 @@ internal class ComputerUse(
                 "The focused field is a password, payment or one-time-code field; pass allow_sensitive: true to type into it",
             )
         }
-        surface.focus()
         val events = if (isSelect) {
             // Close the native popup, then type-ahead picks the option on the closed control.
             TabGestures.stroke(TabKeys.Combo(TabKeys.ESCAPE, '\u0000', TabEvent.Mods.NONE)) + TabEvent.Pause(60) + TabGestures.type(text)
         } else {
-            // Once, before the first key, in the document that owns the field; the keys themselves are plain real
-            // key events, so a split code box's own handler can move focus to the next box between characters.
+            // Once, before the first key, in the document that owns the field: a script selection, not a key chord, so no
+            // modifier is ever held when the first character goes out. The keys themselves are plain real key events, so a
+            // split code box's own handler can move focus to the next box between characters.
             focusOnce(read.target, selectAll = true)
             TabGestures.type(text)
         }
         if (!surface.play(events)) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
+        // The engine applies key events asynchronously: done only when the text has landed (a <select> keeps the old behaviour).
+        val complete = isSelect || awaitTyped(read.target, typedLength(text), text.length)
         quietIn(browser, tabId, read.target.takeIf { read.inFrame })
         val after = readFocusedDeep(browser, surface)
         val note = if (after != null && read.xp != null && (after.xp != read.xp || after.info.frame != read.info.frame)) {
             "Focus moved while typing from '${focused.label ?: focused.tag}' to '${after.info.label ?: after.info.tag}' (the page advanced it, as split code boxes do)"
         } else null
-        return CuOutcome(true, focused = after?.info ?: focused, note = note)
+        return CuOutcome(true, focused = after?.info ?: focused, note = note, typedComplete = if (complete) null else false)
     }
 
     private suspend fun key(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?): CuOutcome {
