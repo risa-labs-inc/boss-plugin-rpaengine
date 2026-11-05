@@ -62,9 +62,9 @@ class TabActionsTest {
         )
         val json = TabJson.encodeToString(ObserveResult.serializer(), buildObserveResult("t1", snapshot))
         assertEquals(
-            """{"tab_id":"t1","url":"https://x.test/","title":"X Test","truncated":true,"elements":[""" +
-                """{"id":"e1","role":"button","tag":"button","label":"Sign in","type":"submit","placeholder":null,"href":null,"image":null,"options":null,"checked":null,"sensitive":false,"in_viewport":true,"selector":{"type":"id","value":"go"}},""" +
-                """{"id":"e2","role":"combobox","tag":"select","label":null,"type":null,"placeholder":null,"href":null,"image":null,"options":["One"],"checked":null,"sensitive":false,"in_viewport":false,"selector":{"type":"css","value":"select[name=\"s\"]"}}]}""",
+            """{"tab_id":"t1","url":"https://x.test/","title":"X Test","truncated":true,"modal":null,"elements":[""" +
+                """{"id":"e1","role":"button","tag":"button","label":"Sign in","type":"submit","placeholder":null,"href":null,"image":null,"options":null,"checked":null,"sensitive":false,"in_viewport":true,"selector":{"type":"id","value":"go"},"covered":false},""" +
+                """{"id":"e2","role":"combobox","tag":"select","label":null,"type":null,"placeholder":null,"href":null,"image":null,"options":["One"],"checked":null,"sensitive":false,"in_viewport":false,"selector":{"type":"css","value":"select[name=\"s\"]"},"covered":false}]}""",
             json,
         )
     }

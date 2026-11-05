@@ -559,6 +559,93 @@ class ComputerUseTest {
         rig.dir.deleteRecursively()
     }
 
+    // ---- modal detection ---------------------------------------------------------------------
+
+    private fun modalEngine(): javax.script.ScriptEngine {
+        val engine = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        engine.eval("""
+            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(e){return {display:e.display||'block',visibility:e.visibility||'visible',position:e.position||'static',zIndex:e.z===undefined?'auto':String(e.z)};}};
+            function El(o){this.nodeType=1;this.rect=[0,0,100,100];this.attrs={};this.parentElement=null;this.kids=[];this.text='';this.main=false;this.overlay=false;this.hiddenAnc=false;
+              for(var k in o)this[k]=o[k];}
+            El.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
+            El.prototype.getBoundingClientRect=function(){var r=this.rect;return {left:r[0],top:r[1],right:r[2],bottom:r[3],width:r[2]-r[0],height:r[3]-r[1]};};
+            El.prototype.closest=function(sel){if(sel.indexOf('data-rpa')>=0)return this.overlay?this:null;if(sel.indexOf('aria-hidden')>=0)return this.hiddenAnc?this:null;return null;};
+            El.prototype.matches=function(){return this.main;};
+            El.prototype.querySelector=function(){return this.heading||null;};
+            Object.defineProperty(El.prototype,'innerText',{get:function(){return this.text;}});
+            var dialogs=[], under=null, ids={};
+            var location={href:'https://shop.test/'}, document={title:'Shop',visibilityState:'visible',body:new El({}),documentElement:new El({}),
+              querySelectorAll:function(){return dialogs;},elementFromPoint:function(){return under;},getElementById:function(i){return ids[i]||null;}};
+        """.trimIndent())
+        return engine
+    }
+
+    private fun modalOf(e: javax.script.ScriptEngine): ModalInfo? = PageMeta.parse(e.eval(PageMeta.SCRIPT))!!.modal
+
+    @Test
+    fun `a visible dialog is the modal, labelled by aria-label, labelledby or heading, and hidden ones are not`() {
+        assertSingleExpression(PageMeta.SCRIPT)
+        val e = modalEngine()
+        assertNull(modalOf(e))
+        e.eval("var d=new El({rect:[300,200,700,600],attrs:{role:'dialog','aria-label':'Log in'}}); dialogs.push(d);")
+        assertEquals(ModalInfo("Log in", "dialog"), modalOf(e))
+        e.eval("d.attrs={role:'alertdialog','aria-labelledby':'t1'}; ids.t1=new El({text:'  Are you   sure? '});")
+        assertEquals(ModalInfo("Are you sure?", "alertdialog"), modalOf(e))
+        e.eval("d.attrs={'aria-modal':'true'}; d.heading=new El({text:'Welcome back'});")
+        assertEquals(ModalInfo("Welcome back", "dialog"), modalOf(e))
+        e.eval("d.display='none';"); assertNull(modalOf(e))
+        e.eval("d.display='block'; d.rect=[0,0,0,0];"); assertNull(modalOf(e))
+        e.eval("d.rect=[300,200,700,600]; d.hiddenAnc=true;"); assertNull(modalOf(e))
+        e.eval("d.hiddenAnc=false; d.overlay=true;"); assertNull(modalOf(e)) // our own node
+        e.eval("d.overlay=false; d.rect=[2000,2000,2100,2100];"); assertNull(modalOf(e)) // off screen
+    }
+
+    @Test
+    fun `without ARIA a big fixed high-z-index ancestor at the viewport centre is the modal, page content is not`() {
+        val e = modalEngine()
+        e.eval("""
+            var box=new El({rect:[0,0,1000,800],position:'fixed',z:1000,heading:new El({text:'Login or Sign up'})});
+            var inner=new El({rect:[300,200,700,600],parentElement:box}); under=inner;
+        """.trimIndent())
+        assertEquals(ModalInfo("Login or Sign up", "dialog"), modalOf(e))
+        e.eval("box.z=5;"); assertNull(modalOf(e)) // low z-index
+        e.eval("box.z=1000; box.rect=[0,0,300,200];"); assertNull(modalOf(e)) // under 30% of the viewport
+        e.eval("box.rect=[0,0,1000,800]; box.position='static';"); assertNull(modalOf(e))
+        e.eval("box.position='absolute'; box.main=true;"); assertNull(modalOf(e)) // the page's main content
+        e.eval("box.main=false; box.overlay=true;"); assertNull(modalOf(e))
+    }
+
+    @Test
+    fun `observe script flags covered elements, lists modal elements first, and serializes both`() {
+        val js = observeScript(80)
+        assertSingleExpression(js)
+        assertTrue(js.contains("findModal()") && js.contains("elementsFromPoint") && js.contains("coveredEl(el)"))
+        assertTrue(js.indexOf("take(minv, true); take(moutv, false); take(inv, true)") > 0)
+        assertTrue(js.contains("mOvl(l[q])"), "the plugin's own overlay is skipped when testing what is on top")
+        assertTrue(js.contains("modal: modal ? { label: modal.label, role: modal.role } : null"))
+        val snap = TabJson.decodeFromString(PageSnapshot.serializer(),
+            """{"url":"u","title":"t","total":2,"modal":{"label":"  Log in ","role":"dialog"},"items":[
+               {"tag":"input","selector":{"type":"id","value":"phone"},"inViewport":true},
+               {"tag":"input","selector":{"type":"id","value":"q"},"inViewport":true,"covered":true}]}""")
+        val r = buildObserveResult("t1", snap)
+        assertEquals(ModalInfo("Log in", "dialog"), r.modal)
+        assertEquals(listOf(false, true), r.elements.map { it.covered })
+        val out = Json.parseToJsonElement(TabJson.encodeToString(ObserveResult.serializer(), r)).jsonObject
+        assertEquals("Log in", out["modal"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        assertTrue(out["elements"]!!.jsonArray[1].jsonObject["covered"]!!.jsonPrimitive.boolean)
+        assertNull(buildObserveResult("t1", PageSnapshot()).modal)
+    }
+
+    @Test
+    fun `screenshot carries modal only while a dialog is open`() {
+        val rig = Rig().apply { browser.meta = """{"url":"https://a.test/","title":"A","vis":"visible","modal":{"label":"Log in","role":"dialog"}}""" }
+        val s = json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject
+        assertEquals("Log in", s["modal"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        rig.browser.meta = meta("visible")
+        assertFalse(json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject.containsKey("modal"))
+        rig.dir.deleteRecursively()
+    }
+
     private fun meta(vis: String) = """{"url":"https://a.test/","title":"A","vis":"$vis"}"""
 
     @Test

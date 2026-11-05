@@ -67,7 +67,7 @@ internal const val PAGE_TEXT_LIMIT = 100_000
 /** The page's visible text (innerText: rendered text only, never form field values), cut to [max] chars. */
 internal fun pageTextScript(max: Int): String =
     "(function(){var hid=[];try{" +
-        "var n=document.querySelectorAll('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]');" +
+        "var n=document.querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]');" +
         "for(var i=0;i<n.length;i++){hid.push([n[i],n[i].style.getPropertyValue('display'),n[i].style.getPropertyPriority('display')]);n[i].style.setProperty('display','none','important');}" +
         "var t=(document.body||document.documentElement).innerText||'';return t.length>$max?t.slice(0,$max):t;}catch(e){return null;}" +
         "finally{for(var j=0;j<hid.length;j++){try{hid[j][0].style.setProperty('display',hid[j][1],hid[j][2]);}catch(e){}}}})()"
@@ -79,7 +79,7 @@ internal fun pageTextScript(max: Int): String =
  */
 internal fun contentHashScript(): String =
     "(function(){var hid=[];try{" +
-        "var n=document.querySelectorAll('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]');" +
+        "var n=document.querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]');" +
         "for(var i=0;i<n.length;i++){hid.push([n[i],n[i].style.getPropertyValue('display'),n[i].style.getPropertyPriority('display')]);n[i].style.setProperty('display','none','important');}" +
         "var parts=[(document.body||document.documentElement).innerText||'',location.hash||''];" +
         "var c=document.querySelectorAll('input,select,textarea');" +
@@ -127,7 +127,7 @@ var whole=[],part=[];
 var w=document.createTreeWalker(document.body||document.documentElement,4,null),n;
 while((n=w.nextNode())){
 var el=n.parentElement;if(!el||SKIP[el.tagName])continue;
-if(el.closest&&el.closest('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]'))continue;
+if(el.closest&&el.closest('[data-rpa-pointer],[data-rpa-highlight]'))continue;
 var t=(n.nodeValue||'').replace(/\s+/g,' ').toLowerCase();
 var at=t.indexOf(P);if(at<0)continue;
 var cs=window.getComputedStyle(el);if(cs.display==='none'||cs.visibility==='hidden')continue;
@@ -185,7 +185,7 @@ internal fun snapScript(x: Int, y: Int, box: SnapBox): String =
     """(function(){try{
 var x=$x,y=$y,B=[${box.left},${box.top},${box.right},${box.bottom}],SEL=${SNAP_INTERACTIVE_SEL.asJsString()};
 var W=window.innerWidth||1,H=window.innerHeight||1;
-function inOv(e){return !!(e.closest&&e.closest('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]'));}
+function inOv(e){return !!(e.closest&&e.closest('[data-rpa-pointer],[data-rpa-highlight]'));}
 function inter(e){
 if(!e||e.nodeType!==1||inOv(e))return false;
 if(e.disabled||e.getAttribute('aria-disabled')==='true'||e.hidden)return false;
@@ -276,18 +276,55 @@ internal data class Viewport(val width: Int, val height: Int, val dpr: Double) {
     }
 }
 
+/** An open overlay dialog on the page. */
+@Serializable
+internal data class ModalInfo(val label: String? = null, val role: String? = null)
+
+/**
+ * Defines `findModal()` -> {el, label, role} | null, self-contained. A visible [role=dialog|alertdialog], [aria-modal=true]
+ * or dialog[open] counts; failing that, the element at the viewport centre resolving to a fixed/absolute ancestor of
+ * at least 30% of the viewport with z-index >= 10 that is not the page's main content. This plugin's overlay nodes
+ * are skipped. Label: aria-label, aria-labelledby text, then the first heading inside (80 chars at most).
+ */
+internal const val MODAL_JS = """
+function mOvl(e){return !!(e&&e.closest&&e.closest('[data-rpa-pointer],[data-rpa-highlight]'));}
+function mNorm(s){return s==null?'':String(s).replace(/\s+/g,' ').trim().slice(0,80);}
+function mShown(e){try{var r=e.getBoundingClientRect();if(!(r.width>0&&r.height>0))return false;
+var W=window.innerWidth||1,H=window.innerHeight||1;if(r.bottom<=0||r.right<=0||r.top>=H||r.left>=W)return false;
+var cs=window.getComputedStyle(e);return cs.display!=='none'&&cs.visibility!=='hidden';}catch(x){return false;}}
+function mLabel(e){var s=mNorm(e.getAttribute('aria-label'));if(s)return s;
+var lb=e.getAttribute('aria-labelledby');
+if(lb){s=mNorm(lb.split(/\s+/).map(function(id){var n=document.getElementById(id);return n?(n.innerText||''):'';}).join(' '));if(s)return s;}
+var h=e.querySelector('h1,h2,h3,h4,h5,h6,[role=heading]');if(h){s=mNorm(h.innerText);if(s)return s;}return null;}
+function findModal(){try{
+var W=window.innerWidth||1,H=window.innerHeight||1,c=document.querySelectorAll('[role=dialog],[role=alertdialog],[aria-modal="true"],dialog[open]'),best=null;
+for(var i=0;i<c.length;i++){var e=c[i];if(mOvl(e)||!mShown(e))continue;if(e.closest&&e.closest('[aria-hidden="true"]'))continue;best=e;}
+if(best){var rl=mNorm(best.getAttribute('role'));return {el:best,label:mLabel(best),role:rl||'dialog'};}
+var t=document.elementFromPoint(W/2,H/2);
+for(var n=t;n&&n.nodeType===1&&n!==document.body&&n!==document.documentElement;n=n.parentElement){
+if(mOvl(n))continue;var cs=window.getComputedStyle(n),pos=cs.position;
+if(pos!=='fixed'&&pos!=='absolute')continue;
+var z=parseInt(cs.zIndex,10);if(!(z>=10))continue;
+var r=n.getBoundingClientRect();if(!(r.width*r.height>=0.3*W*H))continue;
+if(n.matches&&n.matches('main,[role=main]'))continue;
+return {el:n,label:mLabel(n),role:'dialog'};}
+return null;}catch(x){return null;}}
+"""
+
 /** The page's address, title and visibility, so a screenshot carries them without a separate observe. */
 @Serializable
-internal data class PageMeta(val url: String? = null, val title: String? = null, val vis: String? = null) {
+internal data class PageMeta(val url: String? = null, val title: String? = null, val vis: String? = null, val modal: ModalInfo? = null) {
     /** document.visibilityState == 'visible'; null when the page did not say. */
     val visible: Boolean? get() = vis?.let { it == "visible" }
 
     companion object {
-        const val SCRIPT = "(function(){try{return JSON.stringify({url:String(location.href||''),title:String(document.title||''),vis:String(document.visibilityState||'')});}catch(e){return null;}})()"
+        const val SCRIPT = "(function(){try{" + MODAL_JS +
+            "var m=findModal();return JSON.stringify({url:String(location.href||''),title:String(document.title||''),vis:String(document.visibilityState||'')," +
+            "modal:m?{label:m.label,role:m.role}:null});}catch(e){return null;}})()"
 
         fun parse(answer: Any?): PageMeta? =
             (answer as? String)?.let { runCatching { TabJson.decodeFromString(serializer(), it) }.getOrNull() }
-                ?.let { PageMeta(it.url?.takeIf(String::isNotEmpty)?.take(2000), it.title?.takeIf(String::isNotEmpty)?.take(300), it.vis?.takeIf(String::isNotEmpty)) }
+                ?.let { PageMeta(it.url?.takeIf(String::isNotEmpty)?.take(2000), it.title?.takeIf(String::isNotEmpty)?.take(300), it.vis?.takeIf(String::isNotEmpty), it.modal) }
     }
 }
 
@@ -332,6 +369,8 @@ internal data class ScreenshotInfo(
     val visible: Boolean? = null,
     /** True when ensure_visible had to select the tab first. */
     val revealed: Boolean? = null,
+    /** An open overlay dialog (see [MODAL_JS]); omitted when none. */
+    val modal: ModalInfo? = null,
 )
 
 /** What holds keyboard focus. Never the field's value. */
@@ -839,7 +878,7 @@ internal fun pointerRemoveScript(): String =
 
 /** Removes every overlay node this plugin draws (pointer, ripple, highlight): opacity did not keep them out of the bitmap. */
 internal fun overlayRemoveScript(): String =
-    "(function(){var n=document.querySelectorAll('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]');" +
+    "(function(){var n=document.querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]');" +
         "for(var i=0;i<n.length;i++){if(n[i].parentNode){n[i].parentNode.removeChild(n[i]);}}return n.length;})()"
 
 /** The viewport centre of the element [locate] resolves to, as "x,y", clamped into the viewport; null when it has no box. */
@@ -1091,7 +1130,7 @@ internal class ComputerUse(
         } ?: return CuOutcome(false, "The browser returned no bitmap")
         val (w, h) = fitShotSize(image.width, image.height, maxSide)
         val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h)))
-        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }))
+        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }, meta?.modal))
     }
 
     private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, snap: SnapBox? = null): CuOutcome {

@@ -245,6 +245,8 @@ internal data class ObservedElement(
     val sensitive: Boolean,
     @SerialName("in_viewport") val inViewport: Boolean,
     val selector: ObservedSelector,
+    /** True when something else is on top of the element's centre (a modal, a sticky bar): clicking it would hit that instead. */
+    val covered: Boolean = false,
 )
 
 @Serializable
@@ -253,6 +255,8 @@ internal data class ObserveResult(
     val url: String?,
     val title: String?,
     val truncated: Boolean,
+    /** The open overlay dialog, when there is one; its elements come first. */
+    val modal: ModalInfo? = null,
     val elements: List<ObservedElement>,
 )
 
@@ -305,7 +309,7 @@ internal fun stepResultJson(result: StepResult): String {
                 when {
                     k == "popups" && v is kotlinx.serialization.json.JsonArray ->
                         kotlinx.serialization.json.JsonArray(v.map { e -> if (e is JsonObject) JsonObject(e.filterNot { it.value is JsonNull }) else e })
-                    k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash" || sk == "url" || sk == "title" || sk == "visible" || sk == "revealed") && sv is JsonNull })
+                    k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash" || sk == "url" || sk == "title" || sk == "visible" || sk == "revealed" || sk == "modal") && sv is JsonNull })
                     (k == "dialog" || k == "snapped" || k == "located") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
                     else -> v
                 }
@@ -335,6 +339,7 @@ internal data class PageSnapshot(
     /** Standalone images found, before the image cap. They follow the interactive ones in [items]. */
     val imageTotal: Int = 0,
     val items: List<RawElement> = emptyList(),
+    val modal: ModalInfo? = null,
     val error: String? = null,
 )
 
@@ -352,6 +357,7 @@ internal data class RawElement(
     val sensitive: Boolean = false,
     val inViewport: Boolean = false,
     val selector: ObservedSelector,
+    val covered: Boolean = false,
 )
 
 @Serializable
@@ -408,6 +414,7 @@ internal fun buildObserveResult(tabId: String, snapshot: PageSnapshot): ObserveR
         url = snapshot.url,
         title = snapshot.title?.replace(Regex("\\s+"), " ")?.trim(),
         truncated = snapshot.total + snapshot.imageTotal > snapshot.items.size,
+        modal = snapshot.modal?.let { ModalInfo(normalizeLabel(it.label), normalizeLabel(it.role)) },
         elements = snapshot.items.mapIndexed { i, e ->
             ObservedElement(
                 id = "e${i + 1}",
@@ -425,6 +432,7 @@ internal fun buildObserveResult(tabId: String, snapshot: PageSnapshot): ObserveR
                 sensitive = e.sensitive,
                 inViewport = e.inViewport,
                 selector = e.selector,
+                covered = e.covered,
             )
         },
     )
@@ -621,14 +629,23 @@ private val OBSERVE_BODY_JS: String =
         "if (usableAttr(ty) && usableAttr(nm)) { var tn = tag + '[type=' + cssq(ty) + '][name=' + cssq(nm) + ']'; " +
         "if (uniqueCss(tn, el)) { return { type: 'css', value: tn }; } } " +
         "return { type: 'xpath', value: xpathOf(el) }; } " +
+        // An open overlay dialog: its elements are listed first, and any element another node sits on top of is flagged.
+        MODAL_JS +
+        "var modal = findModal(); " +
+        "function topAt(x, y) { var l = document.elementsFromPoint ? document.elementsFromPoint(x, y) : [document.elementFromPoint(x, y)]; " +
+        "for (var q = 0; q < l.length; q++) { if (l[q] && !mOvl(l[q])) { return l[q]; } } return null; } " +
+        "function coveredEl(el) { var r = el.getBoundingClientRect(), x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2); " +
+        "if (x < 0 || y < 0 || x >= VW || y >= VH) { return false; } var t = topAt(x, y); " +
+        "if (!t || t === el || el.contains(t)) { return false; } " +
+        "var lab = t.closest ? t.closest('label') : null; return !(lab && lab.contains(el)); } " +
         // Rects first (cheap) to split in-viewport from the rest; computed style only on candidates
         // taken in that order, stopping at MAX + 1 so `truncated` stays exact without styling the page.
-        "var all = document.querySelectorAll(${'$'}SELECTOR), inv = [], outv = []; " +
+        "var all = document.querySelectorAll(${'$'}SELECTOR), inv = [], outv = [], minv = [], moutv = []; " +
         "for (var i = 0; i < all.length; i++) { var r = all[i].getBoundingClientRect(); " +
-        "if (hasSize(r)) { (rectInView(r) ? inv : outv).push(all[i]); } } " +
+        "if (hasSize(r)) { var inM = !!(modal && modal.el.contains(all[i])); (rectInView(r) ? (inM ? minv : inv) : (inM ? moutv : outv)).push(all[i]); } } " +
         "var seen = []; function take(list, v) { for (var i = 0; i < list.length && seen.length <= MAX; i++) { " +
         "var el = list[i]; if (!disabled(el) && styledVisible(el)) { seen.push({ el: el, v: v, i: seen.length }); } } } " +
-        "take(inv, true); take(outv, false); var picked = seen.slice(0, MAX); " +
+        "take(minv, true); take(moutv, false); take(inv, true); take(outv, false); var picked = seen.slice(0, MAX); " +
         "var items = picked.map(function (c) { var el = c.el; " +
         "var tag = el.tagName.toLowerCase(); var img = imgIn(el, tag); " +
         "var type = (tag === 'input' || tag === 'button') ? (el.getAttribute('type') || (tag === 'button' ? 'submit' : 'text')).toLowerCase() : null; " +
@@ -643,7 +660,7 @@ private val OBSERVE_BODY_JS: String =
         "placeholder: el.getAttribute('placeholder'), href: tag === 'a' ? (typeof el.href === 'string' ? el.href : el.getAttribute('href')) : null, " +
         "image: imageOf(img, $IMAGE_MIN_PX), options: options, checked: checked, " +
         "sensitive: sensitiveEl(el), " +
-        "inViewport: c.v, selector: selectorOf(el, tag) }; }); " +
+        "inViewport: c.v, selector: selectorOf(el, tag), covered: coveredEl(el) }; }); " +
         // Standalone images come after, with their own cap, so they never displace an interactive element.
         "var pics = [], imgs = document.querySelectorAll('img'); " +
         "for (var k = 0; k < imgs.length; k++) { var im = imgs[k], ir = im.getBoundingClientRect(); " +
@@ -656,7 +673,7 @@ private val OBSERVE_BODY_JS: String =
         "placeholder: null, href: null, image: imageOf(el, 0), options: null, checked: null, sensitive: false, " +
         "inViewport: c.v, selector: selectorOf(el, 'img') }; }); " +
         "return JSON.stringify({ url: location.href, title: document.title, total: seen.length, imageTotal: pics.length, " +
-        "items: items.concat(images) });"
+        "items: items.concat(images), modal: modal ? { label: modal.label, role: modal.role } : null });"
 
 /**
  * One JS expression that snapshots the interactive elements of the page, as `JSON.stringify`
@@ -1161,7 +1178,8 @@ internal class TabActions(
         const val OBSERVE_DESCRIPTION =
             "List the interactive elements (links, buttons, fields, selects, ARIA widgets) currently rendered " +
                 "in a browser tab, in-viewport first, then up to 20 large standalone images (role img). Each element " +
-                "has a label, role and a selector that rpa_step accepts as-is, and an image {src, alt, width, height} " +
+                "has a label, role and a selector that rpa_step accepts as-is, and covered true when another node sits on top of its centre; " +
+                "modal {label, role} is set when an overlay dialog is open, and its elements come first (act inside it before anything behind it); and an image {src, alt, width, height} " +
                 "when it is or contains one. Typed text and selected options are never returned (checkbox/radio " +
                 "checked state is); password/payment/OTP fields are flagged sensitive. Shadow DOM and iframe " +
                 "contents are not observed. Works on any browser tab by id, including logged-in ones; " +
@@ -1181,7 +1199,7 @@ internal class TabActions(
                 "run_script, switch_frame and assert are refused. " +
                 "Computer-use verbs act on what is on screen, in viewport CSS px, with real browser input: " +
                 "screenshot (value: max side px, default 1568) saves a JPEG and returns screenshot " +
-                "{path, width, height, css_width, css_height, dpr, scroll, content_hash, url, title, visible, revealed} (the pointer overlay is left as is; action.hide_overlay true removes it for the capture; visible is document.visibilityState: a tab that is not the front one in its panel gives a STALE image, so action.ensure_visible true selects it first (revealed: true) and waits until it is visible; content_hash changes when the page's text or form state changes, not for video or animation); " +
+                "{path, width, height, css_width, css_height, dpr, scroll, content_hash, url, title, visible, revealed, modal} (the pointer overlay is left as is; action.hide_overlay true removes it for the capture; visible is document.visibilityState: a tab that is not the front one in its panel gives a STALE image, so action.ensure_visible true selects it first (revealed: true) and waits until it is visible; content_hash changes when the page's text or form state changes, not for video or animation); " +
                 "click_at (value 'x,y'; optional snap {box: 'left,top,right,bottom'} in viewport CSS px: when no interactive element " +
                 "is under the point, the click moves to the centre of the visible interactive element overlapping the box most, and the result adds " +
                 "snapped {from, to, tag, label} only when it moved; canvas or no candidate = the raw point); type_text (value: text; selects the focused field's content first, replaces it; " +
