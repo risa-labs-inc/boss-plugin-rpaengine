@@ -162,12 +162,11 @@ class ComputerUseTest {
     @Test
     fun `overlay hide, remove, centre and focused scripts are single expressions`() {
         listOf(
-            overlayVisibilityScript(false), overlayVisibilityScript(true), pointerRemoveScript(),
+            overlayRemoveScript(), pointerRemoveScript(), ScrollInfo.SCRIPT,
             elementCenterScript("document.getElementById('a')"), focusedScript(false), focusedScript(true),
         ).forEach(::assertSingleExpression)
-        assertTrue(overlayVisibilityScript(false).contains("setProperty('opacity','0','important')"))
-        assertTrue(overlayVisibilityScript(false).contains(POINTER_ATTR) && overlayVisibilityScript(false).contains(HIGHLIGHT_ATTR))
-        assertTrue(overlayVisibilityScript(true).contains("removeProperty('opacity')"))
+        assertTrue(overlayRemoveScript().contains("removeChild") && !overlayRemoveScript().contains("opacity"))
+        assertTrue(overlayRemoveScript().contains(POINTER_ATTR) && overlayRemoveScript().contains(HIGHLIGHT_ATTR))
         // Privacy: describing the focused element never reads its value or content.
         assertFalse(focusedScript(true).contains("el.value") || focusedScript(true).contains("textContent"))
         assertTrue(focusedScript(true).contains("el.select()") && !focusedScript(false).contains("el.select()"))
@@ -202,9 +201,11 @@ class ComputerUseTest {
     private class FakeBrowser(val log: Log) : BrowserIntegration {
         var focusedJson = """{"tag":"input","editable":true,"label":"Search","type":"text"}"""
         var viewport = "1000,800,2"
+        var scroll: Any? = "10,250,1800"
         override suspend fun executeJavaScript(script: String): Any? {
             val r: Any? = when {
                 script == Viewport.SCRIPT -> viewport
+                script == ScrollInfo.SCRIPT -> scroll
                 script.contains("JSON.stringify({ tag: tag") -> focusedJson
                 script.contains("getBoundingClientRect") && script.contains("Math.round(r.left") -> "40,50"
                 script.contains(".innerText") -> "Best: A, B, C"
@@ -212,8 +213,8 @@ class ComputerUseTest {
             }
             log.add(
                 when {
-                    script.contains("setProperty('opacity'") -> "hide"
-                    script.contains("removeProperty('opacity')") -> "show"
+                    script.contains("querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]')") -> "hide"
+                    script == ScrollInfo.SCRIPT -> "scroll"
                     script.contains("__rpa_pointer") && script.contains("root.style.transform") -> "pointer"
                     script.contains("querySelectorAll('[data-rpa-pointer]')") -> "pointer-remove"
                     script == Viewport.SCRIPT -> "viewport"
@@ -285,8 +286,48 @@ class ComputerUseTest {
         assertTrue(file.isFile && file.name.endsWith(".jpg") && file.name.startsWith("t-"))
         ImageIO.read(file).let { assertEquals(800 to 640, it.width to it.height) }
         val order = rig.log.entries.filter { it in setOf("hide", "bitmap", "show") }
-        assertEquals(listOf("hide", "bitmap", "show"), order)
+        assertEquals(listOf("hide", "bitmap"), order) // no pointer was ever shown: nothing to re-inject
+        assertEquals(10, s["scroll"]!!.jsonObject["x"]!!.jsonPrimitive.int)
+        assertEquals(250, s["scroll"]!!.jsonObject["y"]!!.jsonPrimitive.int)
+        assertEquals(1800, s["scroll"]!!.jsonObject["max_y"]!!.jsonPrimitive.int)
+        assertFalse(o.containsKey("scroll")) // top-level: only inside screenshot
         assertFalse(o.containsKey("focused"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `screenshot removes the overlay then re-injects the pointer at its remembered spot with its label and color`() {
+        val rig = Rig()
+        val scripts = mutableListOf<String>()
+        val browser = object : BrowserIntegration by rig.browser {
+            override suspend fun executeJavaScript(script: String): Any? { scripts += script; return rig.browser.executeJavaScript(script) }
+        }
+        val tools = TabActions(computerUse = ComputerUse({ rig.surface }, ShotStore(rig.dir))) { FakeTabs(browser) }
+        runBlocking {
+            tools.step("""{"tab_id":"t","action":{"type":"click_at","value":"120,340"},"pointer":{"label":"Jev · Research","color":"#112233"},"highlight_ms":0}""")
+            rig.log.entries.clear(); scripts.clear()
+            tools.step("""{"tab_id":"t","action":{"type":"screenshot"},"highlight_ms":0}""")
+        }
+        assertEquals(listOf("hide", "bitmap", "pointer"), rig.log.entries.filter { it in setOf("hide", "bitmap", "pointer") })
+        val reinject = scripts.last { it.contains("root.style.transform") }
+        assertTrue(reinject.contains("translate(120px,340px)") && reinject.contains("#112233") && reinject.contains("Jev · Research"))
+        assertFalse(reinject.contains("animate")) // no ripple on restore
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `an unreadable scroll is omitted and pointer_hide stops the restore`() {
+        val rig = Rig().apply { browser.scroll = true }
+        val s = json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject
+        assertFalse(s.containsKey("scroll"))
+        rig.run("""{"type":"click_at","value":"50,60"}""", ""","pointer":{"label":"Jev"}""")
+        rig.run("""{"type":"pointer_hide"}""")
+        rig.log.entries.clear()
+        rig.run("""{"type":"screenshot"}""")
+        assertFalse(rig.log.entries.contains("pointer"))
+        assertEquals(ScrollInfo(1, 2, 3), ScrollInfo.parse("1,2,3"))
+        assertEquals(ScrollInfo(0, 0, 0), ScrollInfo.parse("\"0.4,-1,0\""))
+        assertNull(ScrollInfo.parse("x,1,2")); assertNull(ScrollInfo.parse(true))
         rig.dir.deleteRecursively()
     }
 
@@ -296,7 +337,7 @@ class ComputerUseTest {
         val broken = TabActions(computerUse = ComputerUse({ FakeSurface(rig.log, bitmap = null) }, ShotStore(rig.dir))) { FakeTabs(rig.browser) }
         val out = json(runBlocking { broken.step("""{"tab_id":"t","action":{"type":"screenshot"},"highlight_ms":0}""") })
         assertFalse(out["ok"]!!.jsonPrimitive.boolean)
-        assertEquals(listOf("hide", "bitmap", "show"), rig.log.entries.filter { it in setOf("hide", "bitmap", "show") })
+        assertEquals(listOf("hide", "bitmap"), rig.log.entries.filter { it in setOf("hide", "bitmap", "pointer") })
         rig.dir.deleteRecursively()
     }
 

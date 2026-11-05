@@ -268,7 +268,10 @@ internal data class DownloadInfo(
 /** The result as JSON; the computer-use fields appear only when set, so older verbs keep their exact shape. */
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
-    return JsonObject(o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text") && v is JsonNull }).toString()
+    return JsonObject(
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text") && v is JsonNull }
+            .mapValues { (k, v) -> if (k == "screenshot" && v is JsonObject) JsonObject(v.filterNot { (sk, sv) -> sk == "scroll" && sv is JsonNull }) else v },
+    ).toString()
 }
 
 internal fun downloadNote(method: String, bytes: Long?): String =

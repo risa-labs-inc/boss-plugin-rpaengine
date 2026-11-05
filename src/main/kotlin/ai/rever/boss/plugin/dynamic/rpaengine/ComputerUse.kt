@@ -120,6 +120,20 @@ internal data class Viewport(val width: Int, val height: Int, val dpr: Double) {
     }
 }
 
+/** The page scroll position, so a caller can see progress without pixels. */
+@Serializable
+internal data class ScrollInfo(val x: Int, val y: Int, @SerialName("max_y") val maxY: Int) {
+    companion object {
+        const val SCRIPT = "[window.scrollX, window.scrollY, Math.max(0, document.documentElement.scrollHeight - window.innerHeight)].join(',')"
+
+        fun parse(answer: Any?): ScrollInfo? {
+            val p = answer?.toString()?.trim()?.trim('"')?.split(',')?.map { it.trim().toDoubleOrNull()?.roundToInt() ?: return null } ?: return null
+            if (p.size < 3) return null
+            return ScrollInfo(p[0].coerceAtLeast(0), p[1].coerceAtLeast(0), p[2].coerceAtLeast(0))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Result shapes
 // ---------------------------------------------------------------------------------------------
@@ -132,6 +146,8 @@ internal data class ScreenshotInfo(
     @SerialName("css_width") val cssWidth: Int,
     @SerialName("css_height") val cssHeight: Int,
     val dpr: Double,
+    /** Absent when the page would not answer the scroll read. */
+    val scroll: ScrollInfo? = null,
 )
 
 /** What holds keyboard focus. Never the field's value. */
@@ -620,12 +636,10 @@ else{r.remove();}}catch(e){}"""
 internal fun pointerRemoveScript(): String =
     "(function(){var n=document.querySelectorAll('[$POINTER_ATTR]');for(var i=0;i<n.length;i++){n[i].remove();}return n.length;})()"
 
-/** Hides (or restores) every overlay this plugin draws, so a screenshot shows only the page. */
-internal fun overlayVisibilityScript(visible: Boolean): String =
+/** Removes every overlay node this plugin draws (pointer, ripple, highlight): opacity did not keep them out of the bitmap. */
+internal fun overlayRemoveScript(): String =
     "(function(){var n=document.querySelectorAll('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]');" +
-        "for(var i=0;i<n.length;i++){" +
-        (if (visible) "n[i].style.removeProperty('opacity');" else "n[i].style.setProperty('opacity','0','important');") +
-        "}return n.length;})()"
+        "for(var i=0;i<n.length;i++){if(n[i].parentNode){n[i].parentNode.removeChild(n[i]);}}return n.length;})()"
 
 /** The viewport centre of the element [locate] resolves to, as "x,y", clamped into the viewport; null when it has no box. */
 internal fun elementCenterScript(locate: String): String =
@@ -682,6 +696,9 @@ internal class ComputerUse(
     /** Where each tab's pointer last was, so a re-injection after navigation starts from there. */
     private val positions = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Int>>()
 
+    /** The label and color the pointer last used per tab, so a screenshot can put it back unchanged. */
+    private val specs = java.util.concurrent.ConcurrentHashMap<String, PointerSpec>()
+
     suspend fun run(
         browser: BrowserIntegration,
         tabId: String,
@@ -693,6 +710,7 @@ internal class ComputerUse(
         return when (action.type) {
             CuTypes.POINTER_HIDE -> {
                 positions.remove(tabId)
+                specs.remove(tabId)
                 browser.executeJavaScript(pointerRemoveScript())
                 CuOutcome(true)
             }
@@ -727,6 +745,7 @@ internal class ComputerUse(
     private suspend fun glide(browser: BrowserIntegration, tabId: String, x: Int, y: Int, spec: PointerSpec, ripple: Boolean) {
         orNullUnlessCancelled { browser.executeJavaScript(pointerScript(x, y, positions[tabId], spec, ripple)) }
         positions[tabId] = x to y
+        specs[tabId] = spec
         delay(POINTER_GLIDE_MS + 40)
     }
 
@@ -740,16 +759,22 @@ internal class ComputerUse(
 
     private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int): CuOutcome {
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
-        orNullUnlessCancelled { browser.executeJavaScript(overlayVisibilityScript(false)) }
+        val scroll = ScrollInfo.parse(orNullUnlessCancelled { browser.executeJavaScript(ScrollInfo.SCRIPT) })
+        orNullUnlessCancelled { browser.executeJavaScript(overlayRemoveScript()) }
         val image = try {
             delay(OVERLAY_SETTLE_MS) // one compositor frame, so the bitmap no longer holds the overlay
             surface.bitmap()
         } finally {
-            withContext(NonCancellable) { orNullUnlessCancelled { browser.executeJavaScript(overlayVisibilityScript(true)) } }
+            // Put the pointer back where it was, same label and color, without a glide.
+            val at = positions[tabId]
+            val spec = specs[tabId]
+            if (at != null && spec != null) {
+                withContext(NonCancellable) { orNullUnlessCancelled { browser.executeJavaScript(pointerScript(at.first, at.second, at, spec, false)) } }
+            }
         } ?: return CuOutcome(false, "The browser returned no bitmap")
         val (w, h) = fitShotSize(image.width, image.height, maxSide)
         val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h)))
-        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr))
+        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll))
     }
 
     private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?): CuOutcome {
