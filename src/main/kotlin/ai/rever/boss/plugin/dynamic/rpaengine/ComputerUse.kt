@@ -248,6 +248,8 @@ function out(nx,ny,el){var m=nx!==x||ny!==y;return JSON.stringify(m?{x:nx,y:ny,m
 var under=document.elementFromPoint(x,y);
 for(var sd=0;under&&under.shadowRoot&&under.shadowRoot.elementFromPoint&&sd<8;sd++){var inner=under.shadowRoot.elementFromPoint(x,y);if(!inner||inner===under)break;under=inner;}
 if(under&&(under.tagName==='CANVAS'||under.tagName==='IFRAME'||under.tagName==='FRAME'))return out(x,y,null);
+// Snap only off empty space (html/body or a container over half the viewport): a point on any element is clicked exactly there.
+if(under&&under.tagName!=='HTML'&&under.tagName!=='BODY'){var ur=under.getBoundingClientRect();if(!((ur.right-ur.left)*(ur.bottom-ur.top)>0.5*W*H))return out(x,y,null);}
 for(var n=under;n&&n.nodeType===1;n=n.parentElement||(n.parentNode&&n.parentNode.host)){if(inter(n))return out(x,y,n);}
 var bw=B[2]-B[0],bh=B[3]-B[1],px=Math.max(12,bw*0.25),py=Math.max(12,bh*0.25);
 var wide=[B[0]-px,B[1]-py,B[2]+px,B[3]+py],best=null,bestA=-1,bestD=0;
@@ -414,6 +416,28 @@ internal fun focusedValueScript(reveal: Boolean): String =
 
 internal const val VALUE_MAX = 500
 
+/** Before the first key of the key-stream fallback, after the script selection. */
+internal const val KEY_SETTLE_MS = 40L
+
+/**
+ * In the focused editable (input, textarea, contenteditable; through open shadow roots): optionally selects its whole
+ * content ([replace]), then document.execCommand('insertText') (or 'delete' for empty text). Refuses without touching
+ * the field when an input's maxlength is shorter than the text (split code boxes need real keys). JSON [InsertAnswer].
+ */
+internal fun insertTextScript(text: String, replace: Boolean): String =
+    "(function(){/*rpa-insert*/try{var el=document.activeElement;while(el&&el.shadowRoot&&el.shadowRoot.activeElement){el=el.shadowRoot.activeElement;}" +
+        "if(!el||!el.tagName)return JSON.stringify({ok:false,why:'no focus'});var t=el.tagName.toLowerCase(),T=${text.asJsString()};" +
+        "if(t==='input'||t==='textarea'){if(el.maxLength>0&&el.maxLength<T.length)return JSON.stringify({ok:false,why:'maxlength'});" +
+        (if (replace) "try{el.select();}catch(e1){}" else "") + "}" +
+        "else if(el.isContentEditable){" +
+        (if (replace) "var rg=document.createRange();rg.selectNodeContents(el);var sl=window.getSelection();sl.removeAllRanges();sl.addRange(rg);" else "") + "}" +
+        "else return JSON.stringify({ok:false,why:'not editable'});" +
+        "var ok=T.length?document.execCommand('insertText',false,T):document.execCommand('delete',false);" +
+        "return JSON.stringify({ok:!!ok});}catch(e){return JSON.stringify({ok:false,why:String(e).slice(0,80)});}})()"
+
+@Serializable
+internal data class InsertAnswer(val ok: Boolean = false, val why: String? = null)
+
 /** The page's answer to [focusedValueScript]. */
 @Serializable
 internal data class FieldValue(val xp: String? = null, val n: Int? = null, val h: String? = null, val v: String? = null)
@@ -503,6 +527,8 @@ internal class CuOutcome(
     val retyped: Boolean? = null,
     /** hover_at by element: the element the mouse rests on. */
     val hovered: ClickedInfo? = null,
+    /** type_text: insert (the browser's insertText editing command) or keys (real key events). */
+    val method: String? = null,
 )
 
 /** The element a click_at / type_text `element` resolved to. */
@@ -1165,6 +1191,8 @@ internal class ComputerUse(
         reveal: (suspend () -> Unit)? = null,
         /** click_at / type_text: a mark id from the tab's latest look. */
         element: String? = null,
+        /** type_text: replace the field's content (default true for input/textarea, false for a contenteditable). */
+        replace: Boolean? = null,
     ): CuOutcome {
         val value = action.value
         if (action.type != CuTypes.CU_END && action.type != CuTypes.DIALOG_ANSWER) startCapture(browser, tabId)
@@ -1231,8 +1259,8 @@ internal class ComputerUse(
                             if (!c.ok) return c
                             clicked = c.clicked
                         }
-                        val t = typeText(browser, surface, tabId, value.orEmpty(), allowSensitive, focusBrowser = clicked == null)
-                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked, note = t.note, typedComplete = t.typedComplete, value = t.value, valueOk = t.valueOk, retyped = t.retyped)
+                        val t = typeText(browser, surface, tabId, value.orEmpty(), allowSensitive, focusBrowser = clicked == null, replace = replace)
+                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked, note = t.note, typedComplete = t.typedComplete, value = t.value, valueOk = t.valueOk, retyped = t.retyped, method = t.method)
                     }
                     CuTypes.KEY -> key(browser, surface, tabId, value)
                     CuTypes.HOVER_AT -> hoverAt(browser, surface, tabId, value, pointer, element)
@@ -1559,7 +1587,7 @@ internal class ComputerUse(
         }
     }
 
-    private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, tabId: String, text: String, allowSensitive: Boolean, focusBrowser: Boolean = true): CuOutcome {
+    private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, tabId: String, text: String, allowSensitive: Boolean, focusBrowser: Boolean = true, replace: Boolean? = null): CuOutcome {
         // Before reading focus: a click already gave the browser focus, and focusing it again right before the keys could drop the first one.
         if (focusBrowser) surface.focus()
         val read = readFocusedDeep(browser, surface)
@@ -1575,33 +1603,58 @@ internal class ComputerUse(
                 "The focused field is a password, payment or one-time-code field; pass allow_sensitive: true to type into it",
             )
         }
-        val events = if (isSelect) {
+        if (isSelect) {
             // Close the native popup, then type-ahead picks the option on the closed control.
-            TabGestures.stroke(TabKeys.Combo(TabKeys.ESCAPE, '\u0000', TabEvent.Mods.NONE)) + TabEvent.Pause(60) + TabGestures.type(text)
-        } else {
-            // Once, before the first key, in the document that owns the field: a script selection, not a key chord, so no
-            // modifier is ever held when the first character goes out. The keys themselves are plain real key events, so a
-            // split code box's own handler can move focus to the next box between characters.
-            focusOnce(read.target, selectAll = true)
-            TabGestures.type(text)
+            val events = TabGestures.stroke(TabKeys.Combo(TabKeys.ESCAPE, '\u0000', TabEvent.Mods.NONE)) + TabEvent.Pause(60) + TabGestures.type(text)
+            if (!surface.play(events)) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
+            quietIn(browser, tabId, read.target.takeIf { read.inFrame })
+            return CuOutcome(true, focused = readFocusedDeep(browser, surface)?.info ?: focused, method = "keys")
         }
-        if (!surface.play(events)) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
-        // The engine applies key events asynchronously: done only when the text has landed (a <select> keeps the old behaviour).
-        var complete = isSelect || awaitTyped(read.target, typedLength(text), text.length)
-        // Self-check: the same field (focus did not move) must now hold exactly the text; otherwise select-all and retype once.
-        // Compared by length and hash, so a sensitive field's content never leaves the page.
+        val field = focused.tag == "input" || focused.tag == "textarea"
+        // A rich editor keeps its content unless asked: the text goes in at the caret.
+        val doReplace = replace ?: field
+        val keystrokes = text.any { it == '\n' || it == '\r' || it == '\t' } // Enter / Tab mean keys, not content
+        val verifiable = field && doReplace && read.xp != null && !keystrokes
         val reveal = !focused.sensitive
-        val verifiable = !isSelect && (focused.tag == "input" || focused.tag == "textarea") && read.xp != null && text.none { it == '\n' || it == '\r' || it == '\t' }
         fun sameField(v: FieldValue?) = v?.takeIf { it.xp == read.xp && it.n != null }
         fun exact(v: FieldValue) = v.n == text.length && v.h == djb2Hex(text)
-        var checked: FieldValue? = if (verifiable) sameField(readValue(read.target, reveal)) else null
+        var complete = true
+        var checked: FieldValue? = null
+        var method: String
         var retyped = false
-        if (checked != null && !exact(checked)) {
-            focusOnce(read.target, selectAll = true)
-            if (surface.play(TabGestures.type(text))) {
-                retyped = true
-                complete = awaitTyped(read.target, typedLength(text), text.length)
+
+        suspend fun keys(): Boolean {
+            // A script selection (never a key chord), then a short settle so it has landed before the first key.
+            if (doReplace) focusOnce(read.target, selectAll = true)
+            delay(KEY_SETTLE_MS)
+            if (!surface.play(TabGestures.type(text))) return false
+            complete = awaitTyped(read.target, if (doReplace) typedLength(text) else Int.MIN_VALUE, text.length)
+            checked = if (verifiable) sameField(readValue(read.target, reveal)) else null
+            return true
+        }
+
+        // First choice: the browser's own editing command, atomic and synchronous (beforeinput/input fire, frameworks see it).
+        val inserted = if (keystrokes) null else
+            (orNullUnlessCancelled { withTimeoutOrNull(QUIET_CALL_TIMEOUT_MS) { read.target.executeJavaScript(insertTextScript(text, doReplace)) } } as? String)
+                ?.let { runCatching { TabJson.decodeFromString(InsertAnswer.serializer(), it) }.getOrNull() }
+        if (inserted?.ok == true) {
+            method = "insert"
+            if (verifiable) {
                 checked = sameField(readValue(read.target, reveal))
+                val c = checked
+                if (c != null && !exact(c)) {
+                    // A masked input or custom widget rewrote it: real keys once.
+                    if (!keys()) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
+                    method = "keys"; retyped = true
+                }
+            }
+        } else {
+            method = "keys"
+            if (!keys()) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
+            val c = checked
+            if (c != null && !exact(c)) {
+                if (!keys()) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
+                retyped = true
             }
         }
         quietIn(browser, tabId, read.target.takeIf { read.inFrame })
@@ -1609,8 +1662,9 @@ internal class ComputerUse(
         val note = if (after != null && read.xp != null && (after.xp != read.xp || after.info.frame != read.info.frame)) {
             "Focus moved while typing from '${focused.label ?: focused.tag}' to '${after.info.label ?: after.info.tag}' (the page advanced it, as split code boxes do)"
         } else null
+        val c = checked
         return CuOutcome(true, focused = after?.info ?: focused, note = note, typedComplete = if (complete) null else false,
-            value = if (reveal) checked?.v else null, valueOk = checked?.let(::exact), retyped = retyped.takeIf { it })
+            value = if (reveal) c?.v else null, valueOk = c?.let(::exact), retyped = retyped.takeIf { it }, method = method)
     }
 
     /**

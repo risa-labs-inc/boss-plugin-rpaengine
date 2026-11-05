@@ -71,6 +71,8 @@ internal data class StepArgs(
     val ensureVisible: Boolean = false,
     /** click_at / type_text: a mark id (`m12`) from the tab's latest look. */
     val element: String? = null,
+    /** type_text: replace the field's content; null = the default for the field (see ComputerUse.typeText). */
+    val replace: Boolean? = null,
 )
 
 internal const val OBSERVE_DEFAULT_MAX = 80
@@ -214,6 +216,8 @@ internal fun parseStepArgs(raw: String): StepArgs {
         hideOverlay = (action["hide_overlay"] as? JsonPrimitive)?.takeIf { !it.isString }?.content == "true",
         ensureVisible = (action["ensure_visible"] as? JsonPrimitive)?.takeIf { !it.isString }?.content == "true",
         element = element,
+        replace = ((action["replace"] ?: o["replace"]) as? JsonPrimitive)?.takeIf { !it.isString }?.content?.toBooleanStrictOrNull()
+            ?.also { if (type != CuTypes.TYPE_TEXT) invalid("'replace' applies only to type_text") },
     )
 }
 
@@ -319,6 +323,8 @@ internal data class StepResult(
     val retyped: Boolean? = null,
     /** hover_at by element: the element the mouse rests on. */
     val hovered: ClickedInfo? = null,
+    /** type_text: insert (editing command) or keys (real key events). */
+    val method: String? = null,
 )
 
 @Serializable
@@ -337,7 +343,7 @@ internal data class DownloadInfo(
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
     return JsonObject(
-        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups" || k == "note" || k == "typed_complete" || k == "value" || k == "value_ok" || k == "retyped" || k == "hovered") && v is JsonNull }
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups" || k == "note" || k == "typed_complete" || k == "value" || k == "value_ok" || k == "retyped" || k == "hovered" || k == "method") && v is JsonNull }
             .mapValues { (k, v) ->
                 when {
                     k == "popups" && v is kotlinx.serialization.json.JsonArray ->
@@ -1092,7 +1098,7 @@ internal class TabActions(
                     val lookWantsShown = action.type == CuTypes.LOOK && runCatching { LookOptions.parse(action.value).ensureVisible }.getOrDefault(false)
                     cu = computerUse.run(browser, args.tabId, action, args.pointer, args.allowSensitive, args.snap, args.hideOverlay,
                         reveal = if ((args.ensureVisible || lookWantsShown) && splitPopupId(args.tabId) == null) ({ revealTab(args.tabId) }) else null,
-                        element = args.element)
+                        element = args.element, replace = args.replace)
                     Triple(cu.ok, cu.error, null)
                 }
                 ActionTypes.DOWNLOAD -> download(browser, action.selector, hook)
@@ -1133,6 +1139,7 @@ internal class TabActions(
             valueOk = cu?.valueOk,
             retyped = cu?.retyped,
             hovered = cu?.hovered,
+            method = cu?.method,
         )
     }
 
@@ -1267,7 +1274,7 @@ internal class TabActions(
                 "snapped {from, to, tag, label} only when it moved; canvas or no candidate = the raw point); type_text (value: text; selects the focused field's content first, replaces it; " +
                 "on a <select> it type-aheads the option); key (value: Enter, Escape, Tab, ArrowDown, ctrl+a, ...); " +
                 "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
-                "{tag, editable, label, type, options, sensitive, frame?}, never a value; focus inside an iframe is followed into that frame; type_text adds note when the page moved focus while typing, e.g. split code boxes, returns once the typed text has landed in the field and adds typed_complete: false when it had not by the cap; then checks the field holds exactly the text (select-all + retype once if not; retyped: true) and returns value (not for sensitive fields) and value_ok; after a click on a field element, keys wait until it has focus); pointer_hide (removes the overlay); " +
+                "{tag, editable, label, type, options, sensitive, frame?}, never a value; focus inside an iframe is followed into that frame; type_text adds note when the page moved focus while typing, e.g. split code boxes, returns once the typed text has landed in the field and adds typed_complete: false when it had not by the cap; types with the browser's insertText editing command (method: insert; atomic, input events fire) and falls back to real keys (method: keys) for split code boxes, masked fields and Enter/Tab; action.replace (default true for input/textarea, false for a contenteditable editor, which gets the text at the caret) selects the content first; then checks the field holds exactly the text (retyped: true when it had to try again) and returns value (not for sensitive fields) and value_ok; after a click on a field element, keys wait until it has focus); pointer_hide (removes the overlay); " +
                 "page_text (read-only, value: max chars, default 20000, max 100000: returns text = the page's rendered innerText, never field values). " +
                 "look (read-only; value: a JSON string of options {max_side: 1100, quality: 0.7, locate: [phrases], elements: true, ensure_visible: false, page_text: false}) returns everything for one decision in one call: " +
                 "look {screenshot {...as above}, located {phrase: {found, count, in_view, direction, screens, rect?}}, elements [{id: 'm1'.., role, tag, label, value_kind?: text|empty|checked|unchecked|selected:<option>, rect {x,y,w,h}, disabled, covered, context, editable, href_host?, frame?}], page_text?, popups?, dialog?}; " +
@@ -1307,7 +1314,7 @@ internal class TabActions(
                 """"element":{"type":"string","description":"click_at, type_text and hover_at: a mark id such as m12 from the tab's latest look; clicks that element's current visible centre."},"ensure_visible":{"type":"boolean","default":false,"description":"screenshot only: when the page reports itself hidden, select its tab first (not for popup windows)."},"hide_overlay":{"type":"boolean","default":false,"description":"screenshot only: remove the pointer overlay while capturing (default: leave it)."},"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1100); look: JSON options string (optional); click_at (required unless action.element is given): 'x,y' CSS px in the viewport (the fallback when element is gone); type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right; locate_text (required): phrase; dialog_answer (required): 'ok' | 'cancel' | 'ok:<text>' (text answers a prompt)."}""" +
                 """},"required":["type"]},""" +
                 """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."},""" +
-                """"allow_sensitive":{"type":"boolean","default":false,"description":"input and type_text: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."},"snap":{"type":"object","properties":{"box":{"type":"string","description":"left,top,right,bottom in viewport CSS px: where the target is believed to be."}},"required":["box"],"description":"click_at only: snap a near-miss onto the interactive element the box overlaps most. Accepted inside action or at top level."},"pointer":{"type":"object","properties":{"label":{"type":"string","description":"Text on the cursor pill, e.g. 'Jev · Research'."},"color":{"type":"string","description":"Hex color, e.g. #6D28D9."}},"description":"Show an agent cursor that glides to the action point first. Absent = no overlay."}""" +
+                """"replace":{"type":"boolean","description":"type_text only (in action or at top level): replace the field's content (default true for input/textarea, false for a contenteditable editor: insert at the caret)."},"allow_sensitive":{"type":"boolean","default":false,"description":"input and type_text: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."},"snap":{"type":"object","properties":{"box":{"type":"string","description":"left,top,right,bottom in viewport CSS px: where the target is believed to be."}},"required":["box"],"description":"click_at only: snap a near-miss onto the interactive element the box overlaps most. Accepted inside action or at top level."},"pointer":{"type":"object","properties":{"label":{"type":"string","description":"Text on the cursor pill, e.g. 'Jev · Research'."},"color":{"type":"string","description":"Hex color, e.g. #6D28D9."}},"description":"Show an agent cursor that glides to the action point first. Absent = no overlay."}""" +
                 """},"required":["tab_id","action"]}"""
     }
 }

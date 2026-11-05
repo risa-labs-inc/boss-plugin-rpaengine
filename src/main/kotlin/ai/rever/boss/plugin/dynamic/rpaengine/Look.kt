@@ -15,6 +15,10 @@ import kotlinx.serialization.json.JsonPrimitive
 
 internal const val LOOK_MAX_ELEMENTS = 120
 internal const val LOOK_MAX_PHRASES = 20
+
+/** Role-less clickables (onclick, tabindex, cursor:pointer): at most this many, from the first this many nodes. */
+internal const val CLICKABLE_MAX = 60
+internal const val CLICKABLE_SCAN_MAX = 6000
 internal const val LOOK_DEFAULT_QUALITY = SHOT_JPEG_QUALITY
 
 /** The options string of a `look` step (its `value`). Every key is optional. */
@@ -182,6 +186,21 @@ internal fun lookElementsScript(max: Int = LOOK_MAX_ELEMENTS): String =
         "if (/^H[1-6]$/.test(s.tagName) || s.getAttribute('role') === 'heading') { var ht = norm(s.innerText || s.textContent); if (ht) { return ht.slice(0, $LABEL_MAX); } } } } " +
         "return ''; } " +
         "var all = deepAll(SEL), mod = [], rest = []; " +
+        // Clickables without a role: onclick, a tabindex, or the topmost node of a cursor:pointer subtree (so a
+        // clickable row is one mark, not one per text child); never inside a control, never a page-sized container.
+        "var EX = []; try { var cand = deepAll('*'), big = 0.5 * VW * VH; " +
+        "for (var ci = 0; ci < cand.length && ci < $CLICKABLE_SCAN_MAX && EX.length < $CLICKABLE_MAX; ci++) { var c = cand[ci]; " +
+        "if (mOvl(c) || c === document.body || c === document.documentElement || (c.matches && c.matches(SEL))) { continue; } " +
+        "var cr = c.getBoundingClientRect(); if (!hasSize(cr) || !visRect(cr) || cr.width * cr.height > big) { continue; } " +
+        "var ti = c.getAttribute('tabindex'); " +
+        "var click = c.hasAttribute('onclick') || typeof c.onclick === 'function' || (ti !== null && ti !== '-1'); " +
+        "if (!click && window.getComputedStyle(c).cursor === 'pointer') { var pe = c.parentElement || (c.parentNode && c.parentNode.host); " +
+        "click = !(pe && pe.nodeType === 1 && window.getComputedStyle(pe).cursor === 'pointer'); } " +
+        "if (!click) { continue; } " +
+        "var inCtl = false; for (var an = c.parentElement; an; an = an.parentElement) { if (an.matches && an.matches(SEL)) { inCtl = true; break; } } if (inCtl) { continue; } " +
+        "var dup = false; for (var di = 0; di < EX.length; di++) { if (ccontains(EX[di], c)) { dup = true; break; } } if (dup) { continue; } " +
+        "EX.push(c); } } catch (eEx) {} " +
+        "all = all.concat(EX); " +
         "for (var i = 0; i < all.length; i++) { var el0 = all[i]; if (mOvl(el0)) { continue; } var r0 = el0.getBoundingClientRect(); " +
         "if (!hasSize(r0) || !visRect(r0)) { continue; } ((modal && ccontains(modal.el, el0)) ? mod : rest).push(el0); } " +
         "var picked = []; function take(list) { for (var j = 0; j < list.length && picked.length < MAX; j++) { if (styledVisible(list[j])) { picked.push(list[j]); } } } " +
@@ -190,6 +209,7 @@ internal fun lookElementsScript(max: Int = LOOK_MAX_ELEMENTS): String =
         "var AE = document.activeElement; while (AE && AE.shadowRoot && AE.shadowRoot.activeElement) { AE = AE.shadowRoot.activeElement; } " +
         "for (var k = 0; k < picked.length; k++) { var el = picked[k], id = 'm' + (k + 1); " +
         "var tag = el.tagName.toLowerCase(), type = typeOf(el, tag), role = roleOf(el, tag, type), label = labelNow(el); " +
+        "if (EX.indexOf(el) >= 0 && !norm(el.getAttribute('role'))) { role = 'clickable'; } " +
         "var ce = el.isContentEditable === true && tag !== 'input' && tag !== 'textarea'; " +
         "var vk = null; " +
         "if (tag === 'input' && (type === 'checkbox' || type === 'radio')) { vk = el.checked ? 'checked' : 'unchecked'; } " +

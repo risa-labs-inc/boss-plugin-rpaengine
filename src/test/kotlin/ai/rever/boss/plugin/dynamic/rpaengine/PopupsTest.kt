@@ -100,4 +100,35 @@ class PopupsTest {
         assertEquals("a#popup-1" to 2, splitPopupId("a#popup-1#popup-2"))
         listOf("abc", "abc#popup-", "abc#popup-x", "abc#popup-0", "#popup-1").forEach { assertNull(splitPopupId(it), it) }
     }
+
+    class Bounds(private val w: Int, private val h: Int) { fun width() = w; fun height() = h }
+    class BoundedParams(private val b: FakePopupBrowser?, private val bounds: Bounds) : FakePopupParams {
+        override fun popupBrowser() = b
+        fun initialBounds() = bounds
+    }
+
+    @Test
+    fun `a sized popup registers at once, an empty-bounds one only if it is still open after the confirm delay`() {
+        val seen = java.util.concurrent.CopyOnWriteArrayList<Any>()
+        val hostCb = object : FakeOpenPopupCb { override fun on(params: FakePopupParams) = "OK" }
+        val host = Host(mapOf(FakeOpenPopupCb::class.java to hostCb))
+        PopupProxyCapture.install(host, loader, "$pkg.FakeOpenPopupCb", confirmMs = 150) { seen += it }
+        val ours = host.map[FakeOpenPopupCb::class.java] as FakeOpenPopupCb
+        val real = FakePopupBrowser()
+        ours.on(BoundedParams(real, Bounds(500, 600)))
+        assertEquals(listOf<Any>(real), seen.toList(), "a real window: immediately")
+        // target=_blank: empty bounds, the host reopens it as a tab and closes this one
+        val blank = FakePopupBrowser()
+        ours.on(BoundedParams(blank, Bounds(0, 0)))
+        assertEquals(1, seen.size, "not yet")
+        blank.closed = true
+        Thread.sleep(400)
+        assertEquals(listOf<Any>(real), seen.toList(), "closed by the host: never registered")
+        // empty bounds but it stays open: registered after the delay
+        val stays = FakePopupBrowser()
+        ours.on(BoundedParams(stays, Bounds(0, 0)))
+        Thread.sleep(400)
+        assertEquals(listOf<Any>(real, stays), seen.toList())
+    }
 }
+

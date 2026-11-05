@@ -19,6 +19,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal const val POPUP_ID_MARK = "#popup-"
 
+/**
+ * A popup with empty initial bounds is a target=_blank / window.open without size: the host closes it and reopens the
+ * URL as a tab. It is registered only if it is still open this long after the host's handler.
+ */
+internal const val POPUP_CONFIRM_MS = 1_000L
+
+private val popupTimer: java.util.concurrent.ScheduledExecutorService =
+    java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "rpaengine-popup-confirm").apply { isDaemon = true } }
+
 /** `<tabId>#popup-<n>` into (tabId, n); null for an ordinary tab id. */
 internal fun splitPopupId(id: String): Pair<String, Int>? {
     val at = id.lastIndexOf(POPUP_ID_MARK)
@@ -97,11 +106,11 @@ internal class PopupProxyCapture private constructor(
     }
 
     companion object {
-        fun install(host: CallbackHost, loader: ClassLoader, callbackClass: String, onPopup: (Any) -> Unit): PopupProxyCapture? = try {
+        fun install(host: CallbackHost, loader: ClassLoader, callbackClass: String, confirmMs: Long = POPUP_CONFIRM_MS, onPopup: (Any) -> Unit): PopupProxyCapture? = try {
             val type = Class.forName(callbackClass, true, loader)
             val previous = host.get(type)
             if (previous == null) null else {
-                val proxy = Proxy.newProxyInstance(loader, arrayOf(type), Handler(previous, onPopup))
+                val proxy = Proxy.newProxyInstance(loader, arrayOf(type), Handler(previous, confirmMs, onPopup))
                 host.set(type, proxy)
                 PopupProxyCapture(host, type, previous, proxy)
             }
@@ -110,7 +119,7 @@ internal class PopupProxyCapture private constructor(
         }
     }
 
-    private class Handler(private val host: Any, private val onPopup: (Any) -> Unit) : InvocationHandler {
+    private class Handler(private val host: Any, private val confirmMs: Long, private val onPopup: (Any) -> Unit) : InvocationHandler {
         override fun invoke(proxy: Any, method: Method, args: Array<out Any?>?): Any? {
             if (method.name != "on" || args == null || args.size != 1) {
                 return when (method.name) {
@@ -123,10 +132,23 @@ internal class PopupProxyCapture private constructor(
             val response = forward(method, args) // the host first, exactly as it would have run
             runCatching {
                 val popup = call(args[0]!!, "popupBrowser")
-                if (popup != null && call(popup, "isClosed") != true) onPopup(popup)
+                if (popup != null && call(popup, "isClosed") != true) {
+                    if (realWindow(args[0]!!) != false) {
+                        onPopup(popup)
+                    } else {
+                        // Empty bounds: usually reopened as a tab and closed by the host; only a survivor is a popup.
+                        popupTimer.schedule({ runCatching { if (call(popup, "isClosed") != true) onPopup(popup) } }, confirmMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    }
+                }
             }
             return response
         }
+
+        /** True for non-empty initialBounds (a real popup window), false for empty ones, null when the host does not say. */
+        private fun realWindow(params: Any): Boolean? = runCatching {
+            val b = call(params, "initialBounds") ?: return false
+            ((call(b, "width") as? Number)?.toInt() ?: 0) > 0 && ((call(b, "height") as? Number)?.toInt() ?: 0) > 0
+        }.getOrNull()
 
         private fun forward(method: Method, args: Array<out Any?>?): Any? = try {
             method.isAccessible = true

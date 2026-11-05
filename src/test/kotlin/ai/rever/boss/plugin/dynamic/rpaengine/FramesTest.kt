@@ -44,6 +44,7 @@ class FramesTest {
         var hit: String? = null
         var focused: () -> String = { """{"tag":"body","editable":false,"hf":false}""" }
         var len: () -> Any? = { -1 }
+        var insert: (String) -> String? = { null }
         var value: (String) -> String? = { null }
         var count: () -> Any? = { 0 }
         var markFocus: () -> String? = { null }
@@ -51,6 +52,7 @@ class FramesTest {
 
         fun answer(script: String): Any? {
             val kind = when {
+                script.contains("/*rpa-insert*/") -> "insert"
                 script.contains("/*rpa-len*/") -> "len"
                 script.contains("/*rpa-value*/") -> "value"
                 script.contains("/*rpa-count*/") -> "count"
@@ -72,6 +74,7 @@ class FramesTest {
                 "mark" -> mark
                 "hit" -> hit
                 "len" -> len()
+                "insert" -> insert(script)
                 "value" -> value(script)
                 "count" -> count()
                 "mark-focus" -> markFocus()
@@ -877,7 +880,7 @@ class FramesTest {
         val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
         e.eval("""
             var NS='http://www.w3.org/1999/xhtml';
-            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(e){return {display:'block',visibility:'visible',position:'static',zIndex:'auto'};}};
+            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(e){return {display:'block',visibility:'visible',position:'static',zIndex:'auto',cursor:e.cursor||'auto'};}};
             function T(s){this.nodeType=3;this.nodeValue=s;this.parentNode=null;}
             function walk(n,f){for(var i=0;i<n.kids.length;i++){var c=n.kids[i];f(c);if(c.nodeType===1)walk(c,f);}}
             function qsa(n,sel){var out=[];walk(n,function(c){if(c.nodeType!==1)return;
@@ -895,7 +898,7 @@ class FramesTest {
             E.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
             E.prototype.hasAttribute=function(n){return this.attrs.hasOwnProperty(n);};
             E.prototype.getBoundingClientRect=function(){var r=this.rect;return {left:r[0],top:r[1],right:r[2],bottom:r[3],width:r[2]-r[0],height:r[3]-r[1]};};
-            E.prototype.matches=function(s){if(s===':disabled')return false;if(s.indexOf('input,textarea')===0||s.indexOf('input,select,textarea')===0)return this.ctrl;
+            E.prototype.matches=function(s){if(s==='*')return true;if(s===':disabled')return false;if(s.indexOf('input,textarea')===0||s.indexOf('input,select,textarea')===0)return this.ctrl;
               if(s.indexOf('data-rpa')>=0||s.indexOf('role=dialog')>=0||s.indexOf('iframe')>=0||s.indexOf('aria-checked')>=0)return false;return this.inter;};
             E.prototype.closest=function(){return null;};
             E.prototype.contains=function(o){for(var n=o;n;n=n.parentNode)if(n===this)return true;return false;};
@@ -1014,4 +1017,163 @@ class FramesTest {
         }
         assertTrue(CuTypes.HOVER_AT in STEP_ALLOWED_TYPES && TabActions.STEP_SCHEMA.contains("\"hover_at\""))
     }
+
+    // ---- role-less clickables and snapping ---------------------------------------------------
+
+    @Test
+    fun `look marks role-less clickables once each - onclick rows, topmost cursor pointer, tabindex - and never inside a control or page-sized`() {
+        val e = shadowDom()
+        e.eval("""
+            function txt(p,s){var t=p.add(new T(s));t.parentElement=p;return t;}
+            var row=body.add(new E('tr',{rect:[0,400,600,430],innerText:'T-204 Pending'}));row.attrs={onclick:'open(204)'};
+            var cell=row.add(new E('td',{rect:[0,400,300,430],innerText:'T-204',cursor:'pointer'}));cell.attrs={onclick:'x()'};txt(cell,'T-204');
+            var menu=body.add(new E('div',{rect:[700,100,850,130],innerText:'Approve',cursor:'pointer'}));
+            var inner=menu.add(new E('span',{rect:[710,105,800,125],innerText:'Approve',cursor:'pointer'}));txt(inner,'Approve');
+            var go=body.add(new E('button',{rect:[700,200,800,230],inter:true,innerText:'Go',cursor:'pointer'}));txt(go,'Go');
+            var icon=go.add(new E('span',{rect:[705,205,720,225],cursor:'pointer'}));icon.attrs={onclick:'y()'};
+            var page=body.add(new E('div',{rect:[0,0,1000,800],cursor:'pointer'}));
+            var leaf=page.add(new E('p',{rect:[10,700,300,720],innerText:'Footer note',cursor:'pointer'}));txt(leaf,'Footer note');
+            var tile=body.add(new E('li',{rect:[0,500,200,540],innerText:'Inbox'}));tile.attrs={tabindex:'0'};txt(tile,'Inbox');
+            var skip=body.add(new E('li',{rect:[0,560,200,600],innerText:'Skipped'}));skip.attrs={tabindex:'-1'};
+        """.trimIndent())
+        val els = TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(RawLookElement.serializer()), e.eval(lookElementsScript()) as String)
+        val byLabel = els.groupBy { it.label }
+        assertEquals(listOf("clickable"), byLabel["T-204 Pending"]!!.map { it.role }, "the row, not also its cell")
+        assertEquals(listOf("clickable"), byLabel["Approve"]!!.map { it.role }, "the topmost cursor:pointer node, not its text child")
+        assertEquals(listOf("clickable"), byLabel["Inbox"]!!.map { it.role })
+        assertEquals("button", byLabel["Go"]!!.single().role)
+        assertNull(byLabel["Skipped"], "tabindex -1 is not a stop")
+        assertNull(byLabel["Footer note"], "text under a page-sized cursor:pointer wrapper is not a clickable of its own")
+        assertFalse(els.any { it.tag == "span" }, "nothing inside a control or a marked clickable")
+        assertFalse(els.any { it.w >= 1000 && it.h >= 800 }, "no page-sized container")
+        assertEquals(els.map { it.id }, (1..els.size).map { "m$it" })
+    }
+
+    @Test
+    fun `snap never moves a click that lands on an element, only one on empty space`() {
+        val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        e.eval("""
+            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(){return {display:'block',visibility:'visible'};}};
+            function El(tag,rect,o){this.nodeType=1;this.tagName=tag;this.rect=rect;this.parentElement=null;this.attrs={};this.interactive=false;for(var k in o)this[k]=o[k];}
+            El.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
+            El.prototype.hasAttribute=function(n){return this.attrs.hasOwnProperty(n);};
+            El.prototype.matches=function(){return this.interactive;};
+            El.prototype.closest=function(){return null;};
+            El.prototype.getBoundingClientRect=function(){var r=this.rect;return {left:r[0],top:r[1],right:r[2],bottom:r[3]};};
+            var signOut=new El('BUTTON',[880,10,980,40],{interactive:true,textContent:'Sign out'});
+            var approve=new El('BUTTON',[600,300,700,330],{interactive:true,textContent:'Approve'});
+            var row=new El('TD',[0,20,860,50]), under=row;
+            var document={elementFromPoint:function(){return under;},querySelectorAll:function(){return [signOut,approve];}};
+        """.trimIndent())
+        fun snap(x: Int, y: Int, b: SnapBox) = TabJson.decodeFromString(SnapAnswer.serializer(), e.eval(snapScript(x, y, b)) as String)
+        // the T-204 row: a box that also overlaps Sign out must not pull the click onto it
+        assertEquals(SnapAnswer(850, 30, false), snap(850, 30, SnapBox(820.0, 15.0, 900.0, 45.0)))
+        // an open menu's item text (not a control itself): clicked exactly there
+        e.eval("under=new El('SPAN',[600,300,690,330]);")
+        assertFalse(snap(650, 315, SnapBox(590.0, 295.0, 710.0, 335.0)).moved)
+        // empty space: body, or a container over half the viewport, may still snap
+        e.eval("under=new El('BODY',[0,0,1000,800]);")
+        assertTrue(snap(595, 315, SnapBox(590.0, 295.0, 710.0, 335.0)).moved)
+        e.eval("under=new El('DIV',[0,0,1000,500]);")
+        assertTrue(snap(595, 315, SnapBox(590.0, 295.0, 710.0, 335.0)).moved)
+    }
+
+    // ---- typing by insertText ------------------------------------------------------------------
+
+    private fun valueJson(v: String, xp: String = "/html[1]/body[1]/input[1]", reveal: Boolean = true) =
+        """{"xp":"$xp","n":${v.length},"h":"${djb2Hex(v)}"${if (reveal) ""","v":"$v"""" else ""}}"""
+
+    @Test
+    fun `type_text inserts with the editing command, sends no keys, and verifies the value`() {
+        val c = Checkout()
+        c.top.focused = { addrFocused }
+        val text = "ada@example.com"
+        c.top.insert = { """{"ok":true}""" }
+        c.top.value = { valueJson(text) }
+        c.log.clear()
+        val r = c.rig.run("""{"type":"type_text","value":"$text"}""")
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean, r.toString())
+        assertEquals("insert", r["method"]!!.jsonPrimitive.content)
+        assertEquals(text, r["value"]!!.jsonPrimitive.content); assertEquals(true, r["value_ok"]!!.jsonPrimitive.boolean)
+        assertFalse(r.containsKey("retyped"))
+        assertTrue(c.rig.surface.events.isEmpty(), "no key stream to race")
+        assertFalse(c.log.any { it.endsWith("+select") || it.endsWith(":len") })
+        assertTrue(c.top.scripts.last { it.contains("/*rpa-insert*/") }.let { it.contains("el.select()") && it.contains("execCommand('insertText'") })
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `a masked field that rewrites the insert falls back to real keys once, and code boxes and Enter go straight to keys`() {
+        val c = Checkout()
+        c.top.focused = { addrFocused }
+        c.top.len = { 9 }
+        val text = "123456789"
+        var keysSent = false
+        c.rig.surface.onKey = { keysSent = true }
+        c.top.insert = { """{"ok":true}""" }
+        c.top.value = { if (keysSent) valueJson(text) else valueJson("12-345-67") }
+        c.log.clear()
+        val r = c.rig.run("""{"type":"type_text","value":"$text"}""")
+        assertEquals("keys", r["method"]!!.jsonPrimitive.content); assertEquals(true, r["retyped"]!!.jsonPrimitive.boolean)
+        assertEquals(true, r["value_ok"]!!.jsonPrimitive.boolean)
+        val log = c.log
+        assertTrue(log.indexOf("top:insert") < log.indexOf("top:focused+select") && log.indexOf("top:focused+select") < log.indexOf("ev:KeyDown"), log.toString())
+        assertEquals(text.length, c.rig.surface.events.count { it is TabEvent.KeyChar })
+        // maxlength shorter than the text (split code boxes): the page refuses the insert untouched, keys go out once
+        c.rig.surface.events.clear(); c.log.clear()
+        c.top.insert = { """{"ok":false,"why":"maxlength"}""" }
+        c.top.value = { valueJson("4", xp = "/html[1]/body[1]/input[9]") } // focus moved on: no verdict, no retype
+        val otp = c.rig.run("""{"type":"type_text","value":"424242"}""", ""","allow_sensitive":true""")
+        assertEquals("keys", otp["method"]!!.jsonPrimitive.content); assertFalse(otp.containsKey("retyped"))
+        assertEquals(6, c.rig.surface.events.count { it is TabEvent.KeyChar })
+        // Enter in the text: keys only, the insert is never tried
+        c.log.clear(); c.rig.surface.events.clear()
+        c.rig.run("""{"type":"type_text","value":"pizza\n"}""")
+        assertFalse(c.log.contains("top:insert"))
+        assertTrue(c.rig.surface.events.any { it is TabEvent.KeyDown && it.code == TabKeys.RETURN })
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `a contenteditable editor gets the text at the caret unless replace is asked for`() {
+        val c = Checkout()
+        c.top.focused = { """{"tag":"div","editable":true,"label":"Message","hf":true,"xp":"/html[1]/body[1]/div[2]"}""" }
+        c.top.insert = { """{"ok":true}""" }
+        val r = c.rig.run("""{"type":"type_text","value":" Del"}""")
+        assertEquals("insert", r["method"]!!.jsonPrimitive.content)
+        assertFalse(c.top.scripts.last { it.contains("/*rpa-insert*/") }.contains("selectNodeContents"), "the editor's content is kept")
+        assertFalse(c.log.any { it.endsWith("+select") })
+        c.rig.run("""{"type":"type_text","value":"Hi","replace":true}""")
+        assertTrue(c.top.scripts.last { it.contains("/*rpa-insert*/") }.contains("selectNodeContents"))
+        // an input with replace false keeps its content too
+        c.top.focused = { addrFocused }
+        c.rig.run("""{"type":"type_text","value":"x"}""", ""","replace":false""")
+        assertFalse(c.top.scripts.last { it.contains("/*rpa-insert*/") }.contains("el.select()"))
+        assertTrue(runCatching { parseStepArgs("""{"tab_id":"t","action":{"type":"key","value":"Enter","replace":true}}""") }.exceptionOrNull() is TabToolException)
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `the insert script selects, inserts through execCommand, refuses short maxlength untouched, and deletes for empty text`() {
+        val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        e.eval("""
+            var calls=[];var el={tagName:'INPUT',maxLength:-1,selected:0,select:function(){this.selected++;}};
+            var document={activeElement:el,execCommand:function(c,u,v){calls.push(c+':'+(v===undefined?'':v));return true;},createRange:function(){return {selectNodeContents:function(){calls.push('range');}};}};
+            var window={getSelection:function(){return {removeAllRanges:function(){},addRange:function(){}};}};
+        """.trimIndent())
+        (NashornScriptEngineFactory().getScriptEngine("--language=es5") as Compilable).compile("(${insertTextScript("a'b\"c", true)})")
+        assertEquals("""{"ok":true}""", e.eval(insertTextScript("12 MG Road", true)))
+        assertEquals("insertText:12 MG Road", e.eval("calls[0]")); assertEquals(1, (e.eval("el.selected") as Number).toInt())
+        e.eval("calls=[];")
+        e.eval(insertTextScript("x", false)); assertEquals(1, (e.eval("el.selected") as Number).toInt(), "replace false: no select")
+        e.eval("calls=[];el.maxLength=1;")
+        assertTrue((e.eval(insertTextScript("424242", true)) as String).contains("maxlength")); assertEquals(0, (e.eval("calls.length") as Number).toInt())
+        e.eval("calls=[];el.maxLength=-1;")
+        e.eval(insertTextScript("", true)); assertEquals("delete:", e.eval("calls[0]"))
+        e.eval("calls=[];document.activeElement={tagName:'DIV',isContentEditable:true};")
+        e.eval(insertTextScript("Hi", true)); assertEquals("range", e.eval("calls[0]"))
+        e.eval("document.activeElement={tagName:'BUTTON'};")
+        assertTrue((e.eval(insertTextScript("x", true)) as String).contains("not editable"))
+    }
 }
+
