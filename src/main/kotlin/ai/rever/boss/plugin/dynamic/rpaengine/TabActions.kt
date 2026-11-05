@@ -249,6 +249,8 @@ internal data class StepResult(
     val screenshot: ScreenshotInfo? = null,
     /** Set by `focused`, and by `type_text` (the field after typing). */
     val focused: FocusedInfo? = null,
+    /** Set only by `page_text`. */
+    val text: String? = null,
 )
 
 @Serializable
@@ -266,7 +268,7 @@ internal data class DownloadInfo(
 /** The result as JSON; the computer-use fields appear only when set, so older verbs keep their exact shape. */
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
-    return JsonObject(o.filterNot { (k, v) -> (k == "screenshot" || k == "focused") && v is JsonNull }).toString()
+    return JsonObject(o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text") && v is JsonNull }).toString()
 }
 
 internal fun downloadNote(method: String, bytes: Long?): String =
@@ -965,6 +967,7 @@ internal class TabActions(
             download = download,
             screenshot = cu?.screenshot,
             focused = cu?.focused,
+            text = cu?.text,
         )
     }
 
@@ -1093,7 +1096,8 @@ internal class TabActions(
                 "click_at (value 'x,y'); type_text (value: text; selects the focused field's content first, replaces it; " +
                 "on a <select> it type-aheads the option); key (value: Enter, Escape, Tab, ArrowDown, ctrl+a, ...); " +
                 "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
-                "{tag, editable, label, type, options, sensitive}, never a value); pointer_hide (removes the overlay). " +
+                "{tag, editable, label, type, options, sensitive}, never a value); pointer_hide (removes the overlay); " +
+                "page_text (read-only, value: max chars, default 20000, max 100000: returns text = the page's rendered innerText, never field values). " +
                 "Optional top-level pointer {label, color} shows a labelled agent cursor that glides to the action point " +
                 "(the element centre for selector actions) and ripples on click; it works in any tab and stays until pointer_hide."
 
@@ -1107,7 +1111,7 @@ internal class TabActions(
             """{"type":"object","properties":{""" +
                 """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list)."},""" +
                 """"action":{"type":"object","properties":{""" +
-                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide"]},""" +
+                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text"]},""" +
                 """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit, download; optional for keypress (defaults to the focused element)."},""" +
                 """"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1568); click_at (required): 'x,y' CSS px in the viewport; type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right."}""" +
                 """},"required":["type"]},""" +

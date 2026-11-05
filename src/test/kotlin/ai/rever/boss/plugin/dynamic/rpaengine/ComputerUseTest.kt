@@ -48,6 +48,7 @@ class ComputerUseTest {
             """{"type":"type_text","value":""}""", """{"type":"key","value":"ArrowDown"}""",
             """{"type":"key","value":"ctrl+a"}""", """{"type":"scroll_by","value":"600"}""",
             """{"type":"scroll_by","value":"0,-300"}""", """{"type":"focused"}""", """{"type":"pointer_hide"}""",
+            """{"type":"page_text"}""", """{"type":"page_text","value":"500"}""",
         ).forEach { parseStepArgs(step(it)) }
         assertEquals(emptySet(), STEP_ALLOWED_TYPES intersect STEP_REFUSED_TYPES)
         assertTrue(STEP_ALLOWED_TYPES.containsAll(CuTypes.ALL))
@@ -206,6 +207,7 @@ class ComputerUseTest {
                 script == Viewport.SCRIPT -> viewport
                 script.contains("JSON.stringify({ tag: tag") -> focusedJson
                 script.contains("getBoundingClientRect") && script.contains("Math.round(r.left") -> "40,50"
+                script.contains(".innerText") -> "Best: A, B, C"
                 else -> true
             }
             log.add(
@@ -255,6 +257,18 @@ class ComputerUseTest {
     }
 
     private fun json(r: ai.rever.boss.plugin.api.McpToolResult) = Json.parseToJsonElement(r.text).jsonObject
+
+    @Test
+    fun `page_text returns the rendered text without a surface, and other verbs omit text`() {
+        val rig = Rig().apply { hasSurface = false }
+        val r = json(rig.run("""{"type":"page_text","value":"500"}"""))
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean, r.toString())
+        assertEquals("Best: A, B, C", r["text"]!!.jsonPrimitive.content)
+        assertNull(json(rig.run("""{"type":"pointer_hide"}"""))["text"])
+        assertSingleExpression(pageTextScript(20_000))
+        // Privacy: rendered text only, never form field values.
+        assertFalse(pageTextScript(10).contains(".value"))
+    }
 
     @Test
     fun `screenshot hides the overlay, captures, restores, and reports the saved size`() {

@@ -43,8 +43,9 @@ internal object CuTypes {
     const val SCROLL_BY = "scroll_by"
     const val FOCUSED = "focused"
     const val POINTER_HIDE = "pointer_hide"
+    const val PAGE_TEXT = "page_text"
 
-    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE)
+    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -57,6 +58,12 @@ internal const val SHOT_MAX_SIDE_LIMIT = 4096
 internal const val SHOT_JPEG_QUALITY = 0.8
 internal const val SHOT_KEEP = 200
 internal const val SCROLL_MAX_PX = 6000
+internal const val PAGE_TEXT_DEFAULT = 20_000
+internal const val PAGE_TEXT_LIMIT = 100_000
+
+/** The page's visible text (innerText: rendered text only, never form field values), cut to [max] chars. */
+internal fun pageTextScript(max: Int): String =
+    "(function(){try{var t=(document.body||document.documentElement).innerText||'';return t.length>$max?t.slice(0,$max):t;}catch(e){return null;}})()"
 
 /** "x,y" (CSS px, decimals rounded) or null. */
 internal fun parsePoint(value: String?): Pair<Int, Int>? {
@@ -143,6 +150,7 @@ internal class CuOutcome(
     val error: String? = null,
     val screenshot: ScreenshotInfo? = null,
     val focused: FocusedInfo? = null,
+    val text: String? = null,
 )
 
 // ---------------------------------------------------------------------------------------------
@@ -687,6 +695,12 @@ internal class ComputerUse(
                 positions.remove(tabId)
                 browser.executeJavaScript(pointerRemoveScript())
                 CuOutcome(true)
+            }
+            CuTypes.PAGE_TEXT -> {
+                val max = (value?.trim()?.toIntOrNull() ?: PAGE_TEXT_DEFAULT).coerceIn(1, PAGE_TEXT_LIMIT)
+                val text = orNullUnlessCancelled { browser.executeJavaScript(pageTextScript(max)) } as? String
+                    ?: return CuOutcome(false, "Could not read the page text (the page may be navigating)")
+                CuOutcome(true, text = text)
             }
             CuTypes.FOCUSED -> CuOutcome(true, focused = readFocused(browser, selectAll = false) ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)"))
             else -> {
