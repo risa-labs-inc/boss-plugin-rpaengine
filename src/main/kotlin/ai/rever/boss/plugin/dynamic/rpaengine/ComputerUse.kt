@@ -2,6 +2,10 @@ package ai.rever.boss.plugin.dynamic.rpaengine
 
 import ai.rever.boss.plugin.api.BrowserIntegration
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
@@ -211,7 +215,7 @@ return s.slice(0,80);}
 function norm(v){return(v||'').replace(/\s+/g,' ').trim();}
 function out(nx,ny,el){var m=nx!==x||ny!==y;return JSON.stringify(m?{x:nx,y:ny,moved:true,tag:el.tagName.toLowerCase(),label:label(el)||null}:{x:x,y:y,moved:false});}
 var under=document.elementFromPoint(x,y);
-if(under&&under.tagName==='CANVAS')return out(x,y,null);
+if(under&&(under.tagName==='CANVAS'||under.tagName==='IFRAME'||under.tagName==='FRAME'))return out(x,y,null);
 for(var n=under;n&&n.nodeType===1;n=n.parentElement){if(inter(n))return out(x,y,n);}
 var bw=B[2]-B[0],bh=B[3]-B[1],px=Math.max(12,bw*0.25),py=Math.max(12,bh*0.25);
 var wide=[B[0]-px,B[1]-py,B[2]+px,B[3]+py],best=null,bestA=-1,bestD=0;
@@ -386,7 +390,17 @@ internal data class FocusedInfo(
     val type: String? = null,
     val options: List<String>? = null,
     val sensitive: Boolean = false,
+    /** The frame path ("0", "0.1") when focus is inside an iframe; absent for the top document. */
+    val frame: String? = null,
 )
+
+/** The parts of [focusedScript]'s answer that stay inside rpaengine. */
+@Serializable
+internal data class FocusExtra(val hf: Boolean? = null, val xp: String? = null, val fr: FocusFrameRef? = null)
+
+/** The focused iframe element, when focus sits in a child frame. */
+@Serializable
+internal data class FocusFrameRef(val i: Int = -1, val fi: Int = -1, val name: String = "", val lab: String = "")
 
 internal class CuOutcome(
     val ok: Boolean,
@@ -398,6 +412,7 @@ internal class CuOutcome(
     val located: LocatedInfo? = null,
     val clicked: ClickedInfo? = null,
     val look: LookResult? = null,
+    val note: String? = null,
 )
 
 /** The element a click_at / type_text `element` resolved to. */
@@ -562,6 +577,9 @@ internal interface TabSurface {
 
     /** Wrap the host's popup handler so popups that stay open are reported to [onPopup]; null when it cannot. */
     fun capturePopups(onPopup: (PopupWindow) -> Unit): DialogCapture? = null
+
+    /** The main frame's child frames (iframes); empty when there are none or the surface cannot see them. */
+    fun childFrames(): List<SubFrame> = emptyList()
 }
 
 /** Plays [events] in order, sleeping on pauses. False as soon as one dispatch fails. */
@@ -627,6 +645,8 @@ internal class JxBrowserSurface private constructor(private val browser: Any) : 
 
     override fun capturePopups(onPopup: (PopupWindow) -> Unit): DialogCapture? =
         runCatching { PopupProxyCapture.install(JxCallbackHost(browser), loader, JX_OPEN_POPUP_CALLBACK) { popup -> onPopup(JxPopupWindow(popup)) } }.getOrNull()
+
+    override fun childFrames(): List<SubFrame> = JxFrame.childrenOf(browser)
 
     private fun cls(name: String): Class<*> = Class.forName(name, true, loader)
 
@@ -922,10 +942,18 @@ internal fun elementCenterScript(locate: String): String =
  */
 internal fun focusedScript(selectAll: Boolean): String =
     "(function () { try { " + OBSERVE_HELPERS_JS + SENSITIVE_DOM_JS +
-        "var el = document.activeElement; " +
+        "var el = document.activeElement, hf = document.hasFocus ? document.hasFocus() : null; " +
         "while (el && el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; } " +
-        "if (!el || el === document.body || el === document.documentElement) { return JSON.stringify({ tag: 'body', editable: false }); } " +
+        "if (!el || el === document.body || el === document.documentElement) { return JSON.stringify({ tag: 'body', editable: false, hf: hf }); } " +
         "var tag = el.tagName.toLowerCase(); " +
+        // Focus inside a child frame: name the iframe so the caller can read that frame's own activeElement.
+        "if (tag === 'iframe' || tag === 'frame') { var fl = document.querySelectorAll('iframe,frame'), fi = -1; " +
+        "try { for (var k = 0; k < window.frames.length; k++) { if (window.frames[k] === el.contentWindow) { fi = k; break; } } } catch (e1) {} " +
+        "return JSON.stringify({ tag: tag, editable: false, hf: hf, fr: { i: Array.prototype.indexOf.call(fl, el), fi: fi, name: el.getAttribute('name') || '', " +
+        "lab: norm(el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('name') || '') } }); } " +
+        "function fxp(e) { var parts = []; for (var n = e; n && n.nodeType === 1; n = n.parentNode) { var i = 1; " +
+        "for (var s = n.previousSibling; s; s = s.previousSibling) { if (s.nodeType === 1 && s.nodeName === n.nodeName) { i++; } } " +
+        "parts.unshift(xpathStep(n.namespaceURI, n.localName, n.nodeName, i)); } return '/' + parts.join('/'); } " +
         "var type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : null; " +
         "var role = el.getAttribute('role'); " +
         "var ce = el.isContentEditable === true && tag !== 'input' && tag !== 'textarea'; " +
@@ -941,7 +969,7 @@ internal fun focusedScript(selectAll: Boolean): String =
                 "var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(rg); } else { el.select(); } } catch (e) {} } "
         } else "") +
         "return JSON.stringify({ tag: tag, editable: editable, label: label || null, type: type, options: options, " +
-        "sensitive: sensitiveEl(el) }); " +
+        "sensitive: sensitiveEl(el), hf: hf, xp: fxp(el) }); " +
         "} catch (e) { return JSON.stringify({ tag: null, editable: false }); } })()"
 
 // ---------------------------------------------------------------------------------------------
@@ -1075,17 +1103,28 @@ internal class ComputerUse(
             }
             CuTypes.PAGE_TEXT -> {
                 val max = (value?.trim()?.toIntOrNull() ?: PAGE_TEXT_DEFAULT).coerceIn(1, PAGE_TEXT_LIMIT)
-                val text = orNullUnlessCancelled { browser.executeJavaScript(pageTextScript(max)) } as? String
-                    ?: return CuOutcome(false, "Could not read the page text (the page may be navigating)")
-                CuOutcome(true, text = text)
+                val kids = surfaceNow(browser, tabId)?.childFrames().orEmpty()
+                val fail = CuOutcome(false, "Could not read the page text (the page may be navigating)")
+                if (kids.isEmpty()) {
+                    val text = orNullUnlessCancelled { browser.executeJavaScript(pageTextScript(max)) } as? String ?: return fail
+                    return CuOutcome(true, text = text)
+                }
+                val (top, frames) = framedRead(browser, kids, pageTextScript(max)) ?: return fail
+                val text = strOf(top, "p") ?: return fail
+                CuOutcome(true, text = joinFrameText(text, frames.map { it.view.host to strOf(it.data, "p").orEmpty() }, max))
             }
             CuTypes.LOCATE_TEXT -> {
-                val located = (orNullUnlessCancelled { browser.executeJavaScript(locateTextScript(value.orEmpty())) } as? String)
-                    ?.let { runCatching { TabJson.decodeFromString(LocatedInfo.serializer(), it) }.getOrNull() }
-                    ?: return CuOutcome(false, "Could not search the page text (the page may be navigating)")
-                CuOutcome(true, located = located)
+                val kids = surfaceNow(browser, tabId)?.childFrames().orEmpty()
+                val fail = CuOutcome(false, "Could not search the page text (the page may be navigating)")
+                if (kids.isEmpty()) {
+                    val located = decodeLocated(orNullUnlessCancelled { browser.executeJavaScript(locateTextScript(value.orEmpty())) } as? String) ?: return fail
+                    return CuOutcome(true, located = located)
+                }
+                val (top, frames) = framedRead(browser, kids, locateTextScript(value.orEmpty())) ?: return fail
+                val located = decodeLocated(strOf(top, "p")) ?: return fail
+                CuOutcome(true, located = mergeLocated(located, frames.mapNotNull { f -> decodeLocated(strOf(f.data, "p"))?.let { f.view to it } }))
             }
-            CuTypes.FOCUSED -> CuOutcome(true, focused = readFocused(browser, selectAll = false) ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)"))
+            CuTypes.FOCUSED -> CuOutcome(true, focused = readFocusedDeep(browser, surfaceNow(browser, tabId))?.info ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)"))
             else -> {
                 val surface = surfaceNow(browser, tabId)
                     ?: return CuOutcome(false, "Screenshots and real input need a JxBrowser tab; none is behind this one")
@@ -1101,7 +1140,7 @@ internal class ComputerUse(
                             clicked = c.clicked
                         }
                         val t = typeText(browser, surface, tabId, value.orEmpty(), allowSensitive)
-                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked)
+                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked, note = t.note)
                     }
                     CuTypes.KEY -> key(browser, surface, tabId, value)
                     CuTypes.SCROLL_BY -> scrollBy(browser, surface, tabId, value, pointer)
@@ -1130,10 +1169,66 @@ internal class ComputerUse(
     private suspend fun readViewport(browser: BrowserIntegration): Viewport? =
         Viewport.parse(orNullUnlessCancelled { browser.executeJavaScript(Viewport.SCRIPT) })
 
-    private suspend fun readFocused(browser: BrowserIntegration, selectAll: Boolean): FocusedInfo? =
-        (orNullUnlessCancelled { browser.executeJavaScript(focusedScript(selectAll)) } as? String)
-            ?.let { runCatching { TabJson.decodeFromString(FocusedInfo.serializer(), it) }.getOrNull() }
-            ?.takeIf { it.tag != null }
+    private fun strOf(o: JsonObject?, k: String): String? = (o?.get(k) as? JsonPrimitive)?.takeIf { it.isString }?.content
+
+    private fun decodeLocated(s: String?): LocatedInfo? =
+        s?.let { runCatching { TabJson.decodeFromString(LocatedInfo.serializer(), it) }.getOrNull() }
+
+    /** [payload] in the top document and every rendered child frame ([framedScript]); null when the top did not answer. */
+    private suspend fun framedRead(browser: BrowserIntegration, kids: List<SubFrame>, payload: String): Pair<JsonObject, List<FrameAnswer>>? {
+        val script = framedScript(payload)
+        val top = (orNullUnlessCancelled { browser.executeJavaScript(script) } as? String)
+            ?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } as? JsonObject ?: return null
+        val vp = Viewport.parse(strOf(top, "v")) ?: Viewport(1, 1, 1.0)
+        return top to walkFrames(FrameView.top(vp.width, vp.height, urlOf(top)), top, kids, script)
+    }
+
+    /** One read of [focusedScript] in [target]: what it says plus the parts that stay inside rpaengine. */
+    private suspend fun focusOnce(target: BrowserIntegration, selectAll: Boolean): Pair<FocusedInfo, FocusExtra>? {
+        val s = orNullUnlessCancelled { target.executeJavaScript(focusedScript(selectAll)) } as? String ?: return null
+        val info = runCatching { TabJson.decodeFromString(FocusedInfo.serializer(), s) }.getOrNull()?.takeIf { it.tag != null } ?: return null
+        return info to (runCatching { TabJson.decodeFromString(FocusExtra.serializer(), s) }.getOrNull() ?: FocusExtra())
+    }
+
+    /** The focused element and the document (top or child frame) that holds it; [xp] tells two elements apart. */
+    private class FocusRead(val info: FocusedInfo, val target: BrowserIntegration, val xp: String?) {
+        val inFrame: Boolean get() = target is FrameIntegration
+    }
+
+    /**
+     * Walks focus down the frames: while a document's activeElement is an iframe, reads the child frame whose
+     * document has focus (document.hasFocus(); the iframe's name / window.frames index only orders the candidates),
+     * at most [FRAME_MAX_DEPTH] levels. A field inside a frame the iframe labels as card / password / code is sensitive.
+     */
+    private suspend fun readFocusedDeep(browser: BrowserIntegration, surface: TabSurface?): FocusRead? {
+        var (info, extra) = focusOnce(browser, selectAll = false) ?: return null
+        var target: BrowserIntegration = browser
+        var kids: List<SubFrame>? = null
+        var path = ""
+        var sensitive = false
+        var depth = 0
+        while ((info.tag == "iframe" || info.tag == "frame") && depth < FRAME_MAX_DEPTH) {
+            val fr = extra.fr ?: break
+            val list = kids ?: surface?.childFrames().orEmpty()
+            if (list.isEmpty()) break
+            sensitive = sensitive || looksSensitiveName(fr.lab) || looksSensitiveName(fr.name)
+            val order = list.indices.sortedBy { k -> if (fr.name.isNotEmpty() && runCatching { list[k].name() }.getOrNull() == fr.name) 0 else if (k == fr.fi) 1 else 2 }.take(FRAME_MAX)
+            val answers = coroutineScope { order.map { k -> async { k to focusOnce(FrameIntegration(list[k]), selectAll = false) } }.awaitAll() }
+            val (k, hit) = answers.firstOrNull { it.second?.second?.hf == true } ?: break
+            info = hit!!.first; extra = hit.second
+            target = FrameIntegration(list[k])
+            kids = runCatching { list[k].children() }.getOrDefault(emptyList())
+            path = if (path.isEmpty()) "$k" else "$path.$k"
+            depth++
+        }
+        return FocusRead(info.copy(frame = path.ifEmpty { null }, sensitive = info.sensitive || sensitive), target, extra.xp)
+    }
+
+    /** The quiet wait in the top document, and at the same time in the frame acted in when that is a child frame. */
+    private suspend fun quietIn(browser: BrowserIntegration, tabId: String, frame: BrowserIntegration?) {
+        if (frame == null || frame === browser) return quiet(browser, tabId)
+        coroutineScope { launch { quiet(browser, tabId) }; launch { quiet(frame, tabId) } }
+    }
 
     /** ensure_visible: selects a hidden tab, waits until it reports visible, gives it a frame. Returns the last meta and whether it selected. */
     private suspend fun ensureShown(browser: BrowserIntegration, reveal: (suspend () -> Unit)?): Pair<PageMeta?, Boolean> {
@@ -1158,7 +1253,15 @@ internal class ComputerUse(
         val (meta, revealed) = ensureShown(browser, reveal)
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         val scroll = ScrollInfo.parse(orNullUnlessCancelled { browser.executeJavaScript(ScrollInfo.SCRIPT) })
-        val contentHash = (orNullUnlessCancelled { browser.executeJavaScript(contentHashScript()) } as? String)?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
+        val kids = surface.childFrames()
+        val contentHash = if (kids.isEmpty()) {
+            (orNullUnlessCancelled { browser.executeJavaScript(contentHashScript()) } as? String)?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
+        } else {
+            framedRead(browser, kids, contentHashScript())?.let { (top, frames) ->
+                fun h(o: JsonObject) = strOf(o, "p")?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
+                h(top)?.let { combineHashes(listOf(it) + frames.map { f -> h(f.data) }) }
+            }
+        }
         // Default: the pointer stays untouched (no DOM churn, no flicker between actions). hide_overlay removes the
         // overlay nodes for the capture and puts the pointer back at its remembered spot, without a glide.
         val image = if (!hideOverlay) {
@@ -1188,48 +1291,84 @@ internal class ComputerUse(
         val raw = (orNullUnlessCancelled { browser.executeJavaScript(lookScript(opts)) } as? String)
             ?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } as? JsonObject
             ?: return CuOutcome(false, "Could not read the page (the page may be navigating)")
-        fun part(k: String): String? = (raw[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
-        val viewport = Viewport.parse(part("vp")) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
-        val meta = PageMeta.parse(part("meta"))
-        val scroll = ScrollInfo.parse(part("scroll"))
-        val hash = part("hash")?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
+        fun part(o: JsonObject, k: String): String? = strOf(o, k)
+        val viewport = Viewport.parse(part(raw, "vp")) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
+        val meta = PageMeta.parse(part(raw, "meta"))
+        val scroll = ScrollInfo.parse(part(raw, "scroll"))
+        fun hashOf(o: JsonObject) = part(o, "hash")?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
+        val kids = surface.childFrames()
+        val frames = if (kids.isEmpty()) emptyList() else
+            walkFrames(FrameView.top(viewport.width, viewport.height, meta?.url ?: urlOf(raw)), raw, kids, lookScript(opts, child = true))
+        val hash = hashOf(raw)?.let { if (frames.isEmpty()) it else combineHashes(listOf(it) + frames.map { f -> hashOf(f.data) }) }
+        fun locatedIn(o: JsonObject, phrase: String): LocatedInfo? = decodeLocated(((o["located"] as? JsonObject)?.get(phrase) as? JsonPrimitive)?.takeIf { it.isString }?.content)
         val located = LinkedHashMap<String, LocatedInfo>()
-        val locRaw = raw["located"] as? JsonObject
         for (phrase in opts.locate) {
-            located[phrase] = (locRaw?.get(phrase) as? JsonPrimitive)?.takeIf { it.isString }?.content
-                ?.let { runCatching { TabJson.decodeFromString(LocatedInfo.serializer(), it) }.getOrNull() }
-                ?: LocatedInfo(found = false, count = 0, inView = false)
+            val top = locatedIn(raw, phrase) ?: LocatedInfo(found = false, count = 0, inView = false)
+            located[phrase] = if (frames.isEmpty()) top else mergeLocated(top, frames.mapNotNull { f -> locatedIn(f.data, phrase)?.let { f.view to it } })
         }
-        val rawEls = part("els")
+        fun elsOf(o: JsonObject) = part(o, "els")
             ?.let { runCatching { TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(RawLookElement.serializer()), it) }.getOrNull() }
-            .orEmpty().filter { isMarkId(it.id) }.take(LOOK_MAX_ELEMENTS)
-        if (opts.elements) {
-            marks[tabId] = rawEls.associate { it.id to MarkRef(it.xp, normalizeLabel(it.label).orEmpty(), it.tag) }
+            .orEmpty().filter { isMarkId(it.id) }
+        val placed = placeElements(elsOf(raw), frames.map { it.view to elsOf(it.data) })
+        if (opts.elements) marks[tabId] = placed.associate { it.element.id to it.mark }
+        val pageText = if (!opts.pageText) null else part(raw, "text").let { t ->
+            if (frames.isEmpty()) t else joinFrameText(t.orEmpty(), frames.map { it.view.host to part(it.data, "text").orEmpty() }, PAGE_TEXT_DEFAULT)
         }
         val image = surface.bitmap() ?: return CuOutcome(false, "The browser returned no bitmap")
         val (w, h) = fitShotSize(image.width, image.height, opts.maxSide)
         val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h), opts.quality))
         val shot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, hash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }, meta?.modal)
-        return CuOutcome(true, look = LookResult(shot, located, rawEls.map { it.toElement() }, pageText = part("text")))
+        return CuOutcome(true, look = LookResult(shot, located, placed.map { it.element }, pageText = pageText))
     }
 
-    /** Resolves mark [id] on the page: its current clickable point, or why there is none (disabled/covered/gone). */
-    private suspend fun resolveMark(browser: BrowserIntegration, tabId: String, id: String): MarkAnswer {
-        val ref = marks[tabId]?.get(id) ?: return MarkAnswer("gone")
-        return (orNullUnlessCancelled { browser.executeJavaScript(markScript(id, ref)) } as? String)
-            ?.let { runCatching { TabJson.decodeFromString(MarkAnswer.serializer(), it) }.getOrNull() }
-            ?: MarkAnswer("gone")
+    /**
+     * Resolves mark [id]: its current clickable point in TOP-viewport px, or why there is none (disabled/covered/gone),
+     * plus the child frame it lives in (null for the top document). A frame element is re-found and hit-tested in its
+     * own frame, then each ancestor maps the point through its iframe element (scrolling it into view) and checks
+     * nothing sits on top of that iframe there.
+     */
+    private suspend fun resolveMark(browser: BrowserIntegration, surface: TabSurface, tabId: String, id: String): Pair<MarkAnswer, BrowserIntegration?> {
+        val gone = MarkAnswer("gone") to null
+        val ref = marks[tabId]?.get(id) ?: return gone
+        fun decode(a: Any?) = (a as? String)?.let { runCatching { TabJson.decodeFromString(MarkAnswer.serializer(), it) }.getOrNull() }
+        val view = ref.frame
+        if (view == null || view.hops.isEmpty()) {
+            return (decode(orNullUnlessCancelled { browser.executeJavaScript(markScript(ref.localId ?: id, ref)) }) ?: MarkAnswer("gone")) to null
+        }
+        val handles = ArrayList<SubFrame>()
+        var kids = surface.childFrames()
+        for (hop in view.hops) {
+            val h = kids.getOrNull(hop.child) ?: return gone
+            handles += h
+            kids = runCatching { h.children() }.getOrDefault(emptyList())
+        }
+        val own = FrameIntegration(handles.last())
+        val a = decode(orNullUnlessCancelled { own.executeJavaScript(markScript(ref.localId ?: id, ref)) }) ?: return gone
+        if (a.state != "ok") return a to own
+        var x = a.x
+        var y = a.y
+        for (level in view.hops.indices.reversed()) {
+            val parent: BrowserIntegration = if (level == 0) browser else FrameIntegration(handles[level - 1])
+            val hit = decode(orNullUnlessCancelled { parent.executeJavaScript(frameHitScript(view.hops[level].iframe, x, y)) }) ?: return gone
+            when (hit.state) {
+                "ok" -> { x = hit.x; y = hit.y }
+                "covered" -> return MarkAnswer("covered", label = a.label, tag = a.tag, cover = hit.cover) to own
+                else -> return gone
+            }
+        }
+        return MarkAnswer("ok", x, y, a.label, a.tag) to own
     }
 
     private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, snap: SnapBox? = null, element: String? = null): CuOutcome {
         val fallback = parsePoint(value)
         var clicked: ClickedInfo? = null
         var resolved: Pair<Int, Int>? = null
+        var frame: BrowserIntegration? = null
         if (element != null) {
-            val a = resolveMark(browser, tabId, element)
+            val (a, f) = resolveMark(browser, surface, tabId, element)
             val name = a.label ?: marks[tabId]?.get(element)?.label ?: element
             when (a.state) {
-                "ok" -> { resolved = a.x to a.y; clicked = ClickedInfo(element, a.label, a.tag) }
+                "ok" -> { resolved = a.x to a.y; clicked = ClickedInfo(element, a.label, a.tag); frame = f }
                 "disabled" -> return CuOutcome(false, "'$name' is disabled")
                 "covered" -> return CuOutcome(false, "'$name' is covered by ${a.cover ?: "another element"}")
                 else -> if (fallback == null) return CuOutcome(false, "Element '$element' is gone and no x,y fallback was given; take a new look")
@@ -1253,14 +1392,16 @@ internal class ComputerUse(
         }
         if (pointer != null) glide(browser, tabId, x, y, pointer, ripple = true)
         surface.focus()
+        // Always the top-viewport point: Chromium's input router hit-tests it and delivers it to the (out-of-process) frame under it.
         if (!surface.play(TabGestures.click(x, y))) return CuOutcome(false, "The browser did not accept the click", snapped = snapped)
-        quiet(browser, tabId)
+        quietIn(browser, tabId, frame)
         return CuOutcome(true, snapped = snapped, clicked = clicked)
     }
 
     private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, tabId: String, text: String, allowSensitive: Boolean): CuOutcome {
-        val focused = readFocused(browser, selectAll = false)
+        val read = readFocusedDeep(browser, surface)
             ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)")
+        val focused = read.info
         val isSelect = focused.tag == "select"
         if (!isSelect && !focused.editable) {
             return CuOutcome(false, "The focused element is not a text field or select; click one first", focused = focused)
@@ -1276,12 +1417,18 @@ internal class ComputerUse(
             // Close the native popup, then type-ahead picks the option on the closed control.
             TabGestures.stroke(TabKeys.Combo(TabKeys.ESCAPE, '\u0000', TabEvent.Mods.NONE)) + TabEvent.Pause(60) + TabGestures.type(text)
         } else {
-            readFocused(browser, selectAll = true)
+            // Once, before the first key, in the document that owns the field; the keys themselves are plain real
+            // key events, so a split code box's own handler can move focus to the next box between characters.
+            focusOnce(read.target, selectAll = true)
             TabGestures.type(text)
         }
         if (!surface.play(events)) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
-        quiet(browser, tabId)
-        return CuOutcome(true, focused = readFocused(browser, selectAll = false) ?: focused)
+        quietIn(browser, tabId, read.target.takeIf { read.inFrame })
+        val after = readFocusedDeep(browser, surface)
+        val note = if (after != null && read.xp != null && (after.xp != read.xp || after.info.frame != read.info.frame)) {
+            "Focus moved while typing from '${focused.label ?: focused.tag}' to '${after.info.label ?: after.info.tag}' (the page advanced it, as split code boxes do)"
+        } else null
+        return CuOutcome(true, focused = after?.info ?: focused, note = note)
     }
 
     private suspend fun key(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?): CuOutcome {

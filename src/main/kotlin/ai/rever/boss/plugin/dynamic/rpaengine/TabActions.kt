@@ -308,6 +308,8 @@ internal data class StepResult(
     val look: LookResult? = null,
     /** Popup windows opened from the tab (or its popups): open ones, and each one that closed, once. */
     val popups: List<PopupInfo>? = null,
+    /** Something the caller should know about how the action went, e.g. focus moving between split code boxes. */
+    val note: String? = null,
 )
 
 @Serializable
@@ -326,13 +328,14 @@ internal data class DownloadInfo(
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
     return JsonObject(
-        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups") && v is JsonNull }
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups" || k == "note") && v is JsonNull }
             .mapValues { (k, v) ->
                 when {
                     k == "popups" && v is kotlinx.serialization.json.JsonArray ->
                         kotlinx.serialization.json.JsonArray(v.map { e -> if (e is JsonObject) JsonObject(e.filterNot { it.value is JsonNull }) else e })
                     k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash" || sk == "url" || sk == "title" || sk == "visible" || sk == "revealed" || sk == "modal") && sv is JsonNull })
                     k == "look" && v is JsonObject -> pruneNulls(v)
+                    k == "focused" && v is JsonObject -> JsonObject(v.filterNot { (fk, fv) -> fk == "frame" && fv is JsonNull })
                     (k == "dialog" || k == "snapped" || k == "located" || k == "clicked") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
                     else -> v
                 }
@@ -1115,6 +1118,7 @@ internal class TabActions(
             clicked = cu?.clicked,
             look = cu?.look?.copy(popups = popupsNow, dialog = dialogNow),
             popups = popupsNow,
+            note = cu?.note,
         )
     }
 
@@ -1249,10 +1253,11 @@ internal class TabActions(
                 "snapped {from, to, tag, label} only when it moved; canvas or no candidate = the raw point); type_text (value: text; selects the focused field's content first, replaces it; " +
                 "on a <select> it type-aheads the option); key (value: Enter, Escape, Tab, ArrowDown, ctrl+a, ...); " +
                 "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
-                "{tag, editable, label, type, options, sensitive}, never a value); pointer_hide (removes the overlay); " +
+                "{tag, editable, label, type, options, sensitive, frame?}, never a value; focus inside an iframe is followed into that frame; type_text adds note when the page moved focus while typing, e.g. split code boxes); pointer_hide (removes the overlay); " +
                 "page_text (read-only, value: max chars, default 20000, max 100000: returns text = the page's rendered innerText, never field values). " +
                 "look (read-only; value: a JSON string of options {max_side: 1100, quality: 0.7, locate: [phrases], elements: true, ensure_visible: false, page_text: false}) returns everything for one decision in one call: " +
-                "look {screenshot {...as above}, located {phrase: {found, count, in_view, direction, screens, rect?}}, elements [{id: 'm1'.., role, tag, label, value_kind?: text|empty|checked|unchecked|selected:<option>, rect {x,y,w,h}, disabled, covered, context, editable, href_host?}], page_text?, popups?, dialog?}; " +
+                "look {screenshot {...as above}, located {phrase: {found, count, in_view, direction, screens, rect?}}, elements [{id: 'm1'.., role, tag, label, value_kind?: text|empty|checked|unchecked|selected:<option>, rect {x,y,w,h}, disabled, covered, context, editable, href_host?, frame?}], page_text?, popups?, dialog?}; " +
+                "look, page_text, locate_text and content_hash also cover iframes (cross-origin and nested, up to 10 frames, 3 deep): a frame element carries frame (a path like '0' or '0.1') and its rect in top-viewport px, elements of a frame scrolled out of view or hidden are left out, page_text adds each frame's text as '[frame <host>]' blocks; " +
                 "elements are the interactive ones in the viewport (modal ones first, at most 120; disabled and covered ones are kept and flagged); click_at and type_text accept element: '<id>' from the tab's latest look " +
                 "(clicks its current visible centre after a hit-test; ok false with '<label> is disabled' or '<label> is covered by <x>'; a vanished element falls back to value 'x,y' when given; the result adds clicked {id, label, tag}; type_text clicks it first). " +
                 "Read-only verbs return without settling; action verbs wait until the page is quiet (no DOM change for 100 ms, at most 800 ms). " +

@@ -75,6 +75,8 @@ internal data class LookElement(
     val context: String,
     val editable: Boolean,
     @SerialName("href_host") val hrefHost: String? = null,
+    /** The frame path ("0", "0.1") of an element inside an iframe; absent for the top document. */
+    val frame: String? = null,
 )
 
 @Serializable
@@ -102,6 +104,8 @@ internal data class RawLookElement(
     val editable: Boolean = false,
     @SerialName("href_host") val hrefHost: String? = null,
     val xp: String? = null,
+    /** Inside its document's open modal. */
+    val mod: Boolean = false,
 )
 
 private val MARK_ID = Regex("m[0-9]{1,4}")
@@ -113,8 +117,11 @@ internal fun RawLookElement.toElement(): LookElement = LookElement(
     context = normalizeLabel(context).orEmpty(), editable = editable, hrefHost = hrefHost?.take(100),
 )
 
-/** What rpaengine remembers about one element of the latest look, to find it again. */
-internal class MarkRef(val xpath: String?, val label: String, val tag: String)
+/**
+ * What rpaengine remembers about one element of the latest look, to find it again: [localId] is its key in its own
+ * document's window.__rpaMarks, [frame] the frame it lives in (null for the top document).
+ */
+internal class MarkRef(val xpath: String?, val label: String, val tag: String, val localId: String? = null, val frame: FrameView? = null)
 
 // ---------------------------------------------------------------------------------------------
 // Page scripts
@@ -180,20 +187,77 @@ internal fun lookElementsScript(max: Int = LOOK_MAX_ELEMENTS): String =
         "if (M) { M.set(id, el); } else { O[id] = el; } " +
         "out.push({ id: id, role: role, tag: tag, label: label, value_kind: vk, x: Math.round(vr.l), y: Math.round(vr.t), " +
         "w: Math.round(vr.r - vr.l), h: Math.round(vr.b - vr.t), disabled: disabled(el), covered: blocks(el, topAt(cx, cy)), " +
-        "context: ctxOf(el, label), editable: editable, href_host: host, xp: xpathOf(el) }); } " +
+        "context: ctxOf(el, label), editable: editable, href_host: host, xp: xpathOf(el), mod: !!(modal && modal.el.contains(el)) }); } " +
         "window.__rpaMarks = M || O; " +
         "return JSON.stringify(out); } catch (e) { return null; } })()"
 
-/** The whole look read in one call: JSON {meta, vp, scroll, hash, located:{phrase:json}, els, text}; each part is the existing script's own answer. */
-internal fun lookScript(opts: LookOptions): String {
+/**
+ * The whole look read in one call: JSON {meta, vp, scroll, hash, located:{phrase:json}, els, text, u, f}; each part is
+ * the existing script's own answer, u is location.href and f the document's iframes ([framesListScript]). In a child
+ * frame ([child]) meta and scroll are skipped.
+ */
+internal fun lookScript(opts: LookOptions, child: Boolean = false): String {
     val located = opts.locate.joinToString("") { "out.located[${it.asJsString()}] = ${locateTextScript(it)}; " }
     return "(function(){/*rpa-look*/try{var out={located:{}}; " +
-        "out.meta = ${PageMeta.SCRIPT}; out.vp = ${Viewport.SCRIPT}; out.scroll = ${ScrollInfo.SCRIPT}; out.hash = ${contentHashScript()}; " +
+        (if (child) "" else "out.meta = ${PageMeta.SCRIPT}; out.scroll = ${ScrollInfo.SCRIPT}; ") +
+        "out.vp = ${Viewport.SCRIPT}; out.hash = ${contentHashScript()}; out.u = String(location.href); out.f = ${framesListScript()}; " +
         located +
         "out.els = ${if (opts.elements) lookElementsScript() else "null"}; " +
         "out.text = ${if (opts.pageText) pageTextScript(PAGE_TEXT_DEFAULT) else "null"}; " +
         "return JSON.stringify(out);}catch(e){return null;}})()"
 }
+
+/**
+ * The document's iframe/frame elements (at most [FRAME_LIST_MAX]) as a JSON array of [IframeInfo]: content-box
+ * offset and size in this viewport, on-screen part, a 4x4 sample of where something else covers it, its
+ * window.frames index, name, src (about:srcdoc for srcdoc frames) and title/aria-label. Never reads into the frame.
+ */
+internal fun framesListScript(): String =
+    "(function () { /*rpa-frames*/ try { var fl = document.querySelectorAll('iframe,frame'); if (!fl.length) { return '[]'; } " +
+        OBSERVE_HELPERS_JS + OBSERVE_DOM_JS + MODAL_JS + MARK_COMMON_JS +
+        "var modal = findModal(), out = [], grids = 0; " +
+        "for (var i = 0; i < fl.length && i < $FRAME_LIST_MAX; i++) { var el = fl[i], r = el.getBoundingClientRect(), cs = window.getComputedStyle(el); " +
+        "var pl = parseFloat(cs.paddingLeft) || 0, pt = parseFloat(cs.paddingTop) || 0, pr = parseFloat(cs.paddingRight) || 0, pb = parseFloat(cs.paddingBottom) || 0; " +
+        "var x = r.left + (el.clientLeft || 0) + pl, y = r.top + (el.clientTop || 0) + pt; " +
+        "var w = Math.max(0, (el.clientWidth || 0) - pl - pr), h = Math.max(0, (el.clientHeight || 0) - pt - pb); " +
+        "var shown = w > 1 && h > 1 && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse' && !(el.closest && el.closest('[hidden]')); " +
+        "var vr = shown ? visRect({ left: x, top: y, right: x + w, bottom: y + h }) : null, cov = null; " +
+        "if (vr && grids++ < 12) { cov = ''; for (var gy = 0; gy < 4; gy++) { for (var gx = 0; gx < 4; gx++) { " +
+        "var t = topAt(vr.l + (gx + 0.5) * (vr.r - vr.l) / 4, vr.t + (gy + 0.5) * (vr.b - vr.t) / 4); cov += (t && t !== el && !el.contains(t)) ? '1' : '0'; } } } " +
+        "var fi = -1; try { for (var k = 0; k < window.frames.length; k++) { if (window.frames[k] === el.contentWindow) { fi = k; break; } } } catch (e1) {} " +
+        "var src = el.hasAttribute('srcdoc') ? 'about:srcdoc' : String(el.src || 'about:blank'); " +
+        "out.push({ i: i, fi: fi, name: el.getAttribute('name') || '', src: src, x: x, y: y, w: w, h: h, shown: shown, " +
+        "vis: vr ? [vr.l, vr.t, vr.r, vr.b] : null, cov: cov, mod: !!(modal && modal.el.contains(el)), " +
+        "lab: norm(el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 80) }); } " +
+        "return JSON.stringify(out); } catch (e) { return null; } })()"
+
+/**
+ * Wraps [payload] (an expression) for a frame walk: JSON {u: location.href, f: [framesListScript], p: payload, v: "w,h"}.
+ */
+internal fun framedScript(payload: String): String =
+    "(function(){/*rpa-framed*/try{return JSON.stringify({u:String(location.href),f:${framesListScript()},p:$payload,v:${Viewport.SCRIPT}});}catch(e){return null;}})()"
+
+/**
+ * In a parent frame: where the point ([px],[py]) of the child frame shown by its [idx]-th iframe/frame element lies in
+ * this frame's viewport, scrolling the iframe into view when the point is off screen, and whether something else sits
+ * on top of the iframe there. Answers JSON [MarkAnswer] (ok | covered | gone).
+ */
+internal fun frameHitScript(idx: Int, px: Int, py: Int): String =
+    "(function () { /*rpa-frame-hit*/ try { " + OBSERVE_HELPERS_JS + OBSERVE_DOM_JS + MODAL_JS + MARK_COMMON_JS +
+        "var el = document.querySelectorAll('iframe,frame')[$idx]; if (!el) { return JSON.stringify({ state: 'gone' }); } " +
+        "function at() { var r = el.getBoundingClientRect(), cs = window.getComputedStyle(el); " +
+        "return [r.left + (el.clientLeft || 0) + (parseFloat(cs.paddingLeft) || 0) + $px, r.top + (el.clientTop || 0) + (parseFloat(cs.paddingTop) || 0) + $py]; } " +
+        "function inside(p) { return p[0] >= 0 && p[0] < VW && p[1] >= 0 && p[1] < VH; } " +
+        "var p = at(); " +
+        "if (!inside(p)) { try { el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' }); } catch (e1) {} p = at(); } " +
+        "if (!inside(p)) { try { window.scrollBy((p[0] < 0 || p[0] >= VW) ? p[0] - VW / 2 : 0, (p[1] < 0 || p[1] >= VH) ? p[1] - VH / 2 : 0); } catch (e2) {} p = at(); } " +
+        "if (!inside(p)) { return JSON.stringify({ state: 'gone' }); } " +
+        "var x = Math.round(p[0]), y = Math.round(p[1]), t = topAt(x, y); " +
+        "if (t && t !== el && !el.contains(t)) { var modal = findModal(), cover; " +
+        "if (modal && modal.el.contains(t) && !modal.el.contains(el)) { cover = modal.label || modal.role || 'dialog'; } " +
+        "else { cover = labelNow(t) || norm(t.getAttribute('aria-label')) || t.tagName.toLowerCase(); } " +
+        "return JSON.stringify({ state: 'covered', cover: cover }); } " +
+        "return JSON.stringify({ state: 'ok', x: x, y: y }); } catch (e) { return null; } })()"
 
 /** The page's answer to [markScript]. */
 @Serializable
