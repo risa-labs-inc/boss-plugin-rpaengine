@@ -898,6 +898,18 @@ internal fun isNavigation(before: String?, after: String?): Boolean =
 /** Settle after the action before reading the URL again. */
 internal const val STEP_URL_SETTLE_MS = 300L
 
+/** The shorter settle of the computer-use action verbs: their quiet wait already stops on a location change. */
+internal const val STEP_URL_SETTLE_QUIET_MS = 100L
+
+internal val STEP_QUIET_ACTION_TYPES = setOf(CuTypes.CLICK_AT, CuTypes.TYPE_TEXT, CuTypes.KEY, CuTypes.SCROLL_BY, CuTypes.DIALOG_ANSWER)
+
+/** Post-step wait before the URL is read again: none for read-only verbs, 100 ms after a quiet-waited verb, else 300 ms. */
+internal fun stepUrlSettleMs(type: String): Long = when (type) {
+    in STEP_NO_SETTLE_TYPES -> 0L
+    in STEP_QUIET_ACTION_TYPES -> STEP_URL_SETTLE_QUIET_MS
+    else -> STEP_URL_SETTLE_MS
+}
+
 /**
  * rpa_step's `input` guard: a JS expression over `el`, run by [ActionRunner] in the same script as the
  * typing and before it, so the element checked is the element typed into.
@@ -1081,7 +1093,7 @@ internal class TabActions(
                     "pass allow_sensitive: true to type into it",
             )
         }
-        if (action.type !in STEP_NO_SETTLE_TYPES) delay(STEP_URL_SETTLE_MS)
+        stepUrlSettleMs(action.type).let { if (it > 0) delay(it) }
         val after = currentUrl(browser)
         val popupsNow = computerUse.popupsFor(args.tabId).ifEmpty { null }
         val dialogNow = computerUse.pendingDialog(args.tabId)

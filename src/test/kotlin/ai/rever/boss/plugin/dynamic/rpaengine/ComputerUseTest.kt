@@ -1057,6 +1057,19 @@ class ComputerUseTest {
         rig.dir.deleteRecursively()
     }
 
+    @Test
+    fun `url settle is 0 for reads, 100 ms for quiet-waited action verbs and 300 ms for the legacy verbs`() {
+        for (t in listOf("screenshot", "page_text", "locate_text", "focused", "look")) assertEquals(0L, stepUrlSettleMs(t), t)
+        for (t in listOf("click_at", "type_text", "key", "scroll_by", "dialog_answer")) assertEquals(100L, stepUrlSettleMs(t), t)
+        for (t in listOf("click", "input", "select", "keypress", "submit", "navigate", "wait", "download")) assertEquals(300L, stepUrlSettleMs(t), t)
+        val rig = Rig()
+        val quick = durationMs(json(rig.run("""{"type":"key","value":"Tab"}""")))
+        val legacy = durationMs(json(rig.run("""{"type":"click","selector":{"type":"id","value":"go"}}""")))
+        assertTrue(quick < STEP_URL_SETTLE_MS, "key took $quick ms")
+        assertTrue(legacy >= STEP_URL_SETTLE_MS, "legacy click took $legacy ms")
+        rig.dir.deleteRecursively()
+    }
+
     private fun quietEngine(): javax.script.ScriptEngine {
         val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
         e.eval("""
