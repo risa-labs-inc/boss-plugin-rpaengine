@@ -302,7 +302,7 @@ internal fun stepResultJson(result: StepResult): String {
                 when {
                     k == "popups" && v is kotlinx.serialization.json.JsonArray ->
                         kotlinx.serialization.json.JsonArray(v.map { e -> if (e is JsonObject) JsonObject(e.filterNot { it.value is JsonNull }) else e })
-                    k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash") && sv is JsonNull })
+                    k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash" || sk == "url" || sk == "title") && sv is JsonNull })
                     (k == "dialog" || k == "snapped" || k == "located") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
                     else -> v
                 }
@@ -911,7 +911,12 @@ internal class TabActions(
 
     suspend fun observe(raw: String): McpToolResult = try {
         val args = parseObserveArgs(raw)
-        val browser = resolveTab(args.tabId)
+        val browser = if (splitPopupId(args.tabId) != null) {
+            computerUse.popupTarget(args.tabId)?.integration
+                ?: throw TabToolException(TabErrorCodes.TAB_NOT_FOUND, "No open popup window '${args.tabId}'")
+        } else {
+            resolveTab(args.tabId)
+        }
         val result = try {
             browser.executeJavaScript(observeScript(args.maxElements))
         } catch (e: CancellationException) {
@@ -1163,7 +1168,7 @@ internal class TabActions(
                 "run_script, switch_frame and assert are refused. " +
                 "Computer-use verbs act on what is on screen, in viewport CSS px, with real browser input: " +
                 "screenshot (value: max side px, default 1568) saves a JPEG and returns screenshot " +
-                "{path, width, height, css_width, css_height, dpr, scroll, content_hash} (the pointer overlay is left as is; action.hide_overlay true removes it for the capture; content_hash changes when the page's text or form state changes, not for video or animation); " +
+                "{path, width, height, css_width, css_height, dpr, scroll, content_hash, url, title} (the pointer overlay is left as is; action.hide_overlay true removes it for the capture; content_hash changes when the page's text or form state changes, not for video or animation); " +
                 "click_at (value 'x,y'; optional snap {box: 'left,top,right,bottom'} in viewport CSS px: when no interactive element " +
                 "is under the point, the click moves to the centre of the visible interactive element overlapping the box most, and the result adds " +
                 "snapped {from, to, tag, label} only when it moved; canvas or no candidate = the raw point); type_text (value: text; selects the focused field's content first, replaces it; " +
@@ -1188,7 +1193,7 @@ internal class TabActions(
 
         const val OBSERVE_SCHEMA =
             """{"type":"object","properties":{""" +
-                """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list)."},""" +
+                """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list), or a popup id '<tabId>#popup-<n>' from an rpa_step result."},""" +
                 """"max_elements":{"type":"integer","minimum":1,"maximum":200,"default":80,"description":"Cap on elements returned; truncated is true when more exist."}""" +
                 """},"required":["tab_id"]}"""
 

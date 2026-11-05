@@ -276,6 +276,18 @@ internal data class Viewport(val width: Int, val height: Int, val dpr: Double) {
     }
 }
 
+/** The page's address and title, so a screenshot carries them without a separate observe. */
+@Serializable
+internal data class PageMeta(val url: String? = null, val title: String? = null) {
+    companion object {
+        const val SCRIPT = "(function(){try{return JSON.stringify({url:String(location.href||''),title:String(document.title||'')});}catch(e){return null;}})()"
+
+        fun parse(answer: Any?): PageMeta? =
+            (answer as? String)?.let { runCatching { TabJson.decodeFromString(serializer(), it) }.getOrNull() }
+                ?.let { PageMeta(it.url?.takeIf(String::isNotEmpty)?.take(2000), it.title?.takeIf(String::isNotEmpty)?.take(300)) }
+    }
+}
+
 /** The page scroll position, so a caller can see progress without pixels. */
 @Serializable
 internal data class ScrollInfo(val x: Int, val y: Int, @SerialName("max_y") val maxY: Int) {
@@ -306,6 +318,9 @@ internal data class ScreenshotInfo(
     val scroll: ScrollInfo? = null,
     /** Hash of the page's content and form state (see [contentHashScript]); absent when the read failed. */
     @SerialName("content_hash") val contentHash: String? = null,
+    /** location.href and document.title; each omitted when the page would not say. */
+    val url: String? = null,
+    val title: String? = null,
 )
 
 /** What holds keyboard focus. Never the field's value. */
@@ -1026,6 +1041,7 @@ internal class ComputerUse(
     private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int, hideOverlay: Boolean): CuOutcome {
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         val scroll = ScrollInfo.parse(orNullUnlessCancelled { browser.executeJavaScript(ScrollInfo.SCRIPT) })
+        val meta = PageMeta.parse(orNullUnlessCancelled { browser.executeJavaScript(PageMeta.SCRIPT) })
         val contentHash = (orNullUnlessCancelled { browser.executeJavaScript(contentHashScript()) } as? String)?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
         // Default: the pointer stays untouched (no DOM churn, no flicker between actions). hide_overlay removes the
         // overlay nodes for the capture and puts the pointer back at its remembered spot, without a glide.
@@ -1046,7 +1062,7 @@ internal class ComputerUse(
         } ?: return CuOutcome(false, "The browser returned no bitmap")
         val (w, h) = fitShotSize(image.width, image.height, maxSide)
         val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h)))
-        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash))
+        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash, meta?.url, meta?.title))
     }
 
     private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, snap: SnapBox? = null): CuOutcome {

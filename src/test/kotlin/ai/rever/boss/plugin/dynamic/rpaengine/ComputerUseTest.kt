@@ -204,12 +204,14 @@ class ComputerUseTest {
         var scroll: Any? = "10,250,1800"
         var hash: Any? = "1a2b3c4d"
         var snap: Any? = null
+        var meta: Any? = """{"url":"https://a.test/page#x","title":"A page"}"""
         var locate: Any? = null
         override suspend fun executeJavaScript(script: String): Any? {
             val r: Any? = when {
                 script == Viewport.SCRIPT -> viewport
                 script == ScrollInfo.SCRIPT -> scroll
                 script == contentHashScript() -> hash
+                script == PageMeta.SCRIPT -> meta
                 script.contains("elementFromPoint") -> snap
                 script.contains("createTreeWalker") -> locate
                 script.contains("JSON.stringify({ tag: tag") -> focusedJson
@@ -510,6 +512,46 @@ class ComputerUseTest {
         val o = json(rig.run("""{"type":"locate_text","value":"zzz"}""")).getValue("located").jsonObject
         assertEquals(setOf("found", "count", "in_view"), o.keys)
         assertFalse(json(rig.run("""{"type":"focused"}""")).containsKey("located"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `screenshot carries url and title, omitting what the page would not say, also on a popup`() {
+        val rig = Rig()
+        val s = json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject
+        assertEquals("https://a.test/page#x", s["url"]!!.jsonPrimitive.content); assertEquals("A page", s["title"]!!.jsonPrimitive.content)
+        rig.browser.meta = null
+        assertFalse(json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject.let { it.containsKey("url") || it.containsKey("title") })
+        rig.browser.meta = """{"url":"https://a.test/","title":""}"""
+        json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject.let { assertFalse(it.containsKey("title")); assertTrue(it.containsKey("url")) }
+        assertEquals(PageMeta("u", "t"), PageMeta.parse("""{"url":"u","title":"t"}"""))
+        assertNull(PageMeta.parse(true)); assertNull(PageMeta.parse("nope"))
+        // a popup id: the popup's own browser answers
+        rig.run("""{"type":"focused"}""")
+        val pop = PopupRig(rig); pop.browser.meta = """{"url":"https://accounts.test/signin","title":"Sign in"}"""
+        pop.surface.let { rig.surface.popupSink!!.invoke(pop.window) }
+        val ps = json(runBlocking { rig.tools.step("""{"tab_id":"t#popup-1","action":{"type":"screenshot"},"highlight_ms":0}""") })["screenshot"]!!.jsonObject
+        assertEquals("Sign in", ps["title"]!!.jsonPrimitive.content)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `rpa_observe accepts a popup id and runs on the popup's browser`() {
+        val rig = Rig()
+        rig.run("""{"type":"focused"}""")
+        val pop = PopupRig(rig)
+        val scripts = mutableListOf<String>()
+        val window = object : PopupWindow by pop.window {
+            override val integration: BrowserIntegration = object : BrowserIntegration by pop.browser {
+                override suspend fun executeJavaScript(script: String): Any? { scripts += script; return """{"url":"https://accounts.test/","title":"Sign in","total":1,"items":[{"tag":"button","label":"Continue","inViewport":true,"selector":{"type":"css","value":"#go"}}]}""" }
+            }
+        }
+        rig.surface.popupSink!!.invoke(window)
+        val r = runBlocking { rig.tools.observe("""{"tab_id":"t#popup-1"}""") }
+        assertTrue(scripts.single() == observeScript(80), r.text)
+        assertFalse(r.isError, r.text)
+        assertTrue(r.text.contains("t#popup-1") && r.text.contains("Continue"))
+        assertTrue(runBlocking { rig.tools.observe("""{"tab_id":"t#popup-7"}""") }.text.contains("TAB_NOT_FOUND"))
         rig.dir.deleteRecursively()
     }
 
