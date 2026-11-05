@@ -243,6 +243,12 @@ class ComputerUseTest {
         var sink: DialogSink? = null
         var captures = 0
         var restores = 0
+        var popupSink: ((PopupWindow) -> Unit)? = null
+        var popupRestores = 0
+        override fun capturePopups(onPopup: (PopupWindow) -> Unit): DialogCapture? {
+            popupSink = onPopup
+            return object : DialogCapture { override fun restore() { popupRestores++ } }
+        }
         override fun captureDialogs(sink: DialogSink): DialogCapture? {
             captures++; this.sink = sink
             return object : DialogCapture { override fun restore() { restores++ } }
@@ -504,6 +510,69 @@ class ComputerUseTest {
         val o = json(rig.run("""{"type":"locate_text","value":"zzz"}""")).getValue("located").jsonObject
         assertEquals(setOf("found", "count", "in_view"), o.keys)
         assertFalse(json(rig.run("""{"type":"focused"}""")).containsKey("located"))
+        rig.dir.deleteRecursively()
+    }
+
+    private class PopupRig(val rig: Rig) {
+        val log = Log()
+        val browser = FakeBrowser(log)
+        val surface = FakeSurface(log)
+        var closed = false
+        val window = object : PopupWindow {
+            override val surface: TabSurface = this@PopupRig.surface
+            override val integration: BrowserIntegration = browser
+            override fun url() = "https://accounts.test/signin"
+            override fun title() = "Sign in"
+            override fun isClosed() = closed
+        }
+    }
+
+    @Test
+    fun `popups ride on results, popup ids route to the popup browser, and closing reports once`() {
+        val rig = Rig()
+        rig.run("""{"type":"focused"}""") // first CU verb installs the popup wrapper
+        val pop = PopupRig(rig)
+        rig.surface.popupSink!!.invoke(pop.window)
+        assertEquals(1, pop.surface.captures) // dialogs captured on adoption
+        val r = json(rig.run("""{"type":"focused"}"""))
+        val info = r["popups"]!!.jsonArray.single().jsonObject
+        assertEquals(setOf("id", "open", "url", "title"), info.keys)
+        assertEquals("t#popup-1", info["id"]!!.jsonPrimitive.content); assertTrue(info["open"]!!.jsonPrimitive.boolean)
+        // the pseudo id targets the popup's own browser and surface, not the parent's
+        rig.log.entries.clear()
+        val shot = rig.tools.let { runBlocking { it.step("""{"tab_id":"t#popup-1","action":{"type":"click_at","value":"30,40"},"highlight_ms":0}""") }}
+        assertTrue(json(shot)["ok"]!!.jsonPrimitive.boolean, shot.text)
+        assertTrue(pop.surface.events.any { it is TabEvent.Press }); assertTrue(rig.surface.events.none { it is TabEvent.Press })
+        assertTrue(json(shot).containsKey("popups")) // the popup's own results list its siblings too
+        // selector verbs and unknown ids are refused clearly
+        val sel = runBlocking { rig.tools.step("""{"tab_id":"t#popup-1","action":{"type":"click","selector":{"type":"css","value":"a"}}}""") }
+        assertTrue(sel.isError && sel.text.contains("computer-use verbs"), sel.text)
+        assertTrue(runBlocking { rig.tools.step("""{"tab_id":"t#popup-9","action":{"type":"focused"}}""") }.text.contains("TAB_NOT_FOUND"))
+        // a dialog in the popup is answered through the popup id
+        val calls = mutableListOf<String>()
+        pop.surface.sink!!.onDialog(DialogInfo("confirm", "Allow?")) { a, t -> calls += "$a:$t" }
+        val ans = json(runBlocking { rig.tools.step("""{"tab_id":"t#popup-1","action":{"type":"dialog_answer","value":"ok"}}""") })
+        assertTrue(ans["ok"]!!.jsonPrimitive.boolean); assertEquals(listOf("true:null"), calls)
+        // closed: reported once as {id, open:false}
+        pop.closed = true
+        val gone = json(rig.run("""{"type":"focused"}""", ""))["popups"]!!.jsonArray.single().jsonObject
+        assertEquals(setOf("id", "open"), gone.keys); assertFalse(gone["open"]!!.jsonPrimitive.boolean)
+        assertFalse(json(rig.run("""{"type":"focused"}""")).containsKey("popups"))
+        assertTrue(runBlocking { rig.tools.step("""{"tab_id":"t#popup-1","action":{"type":"focused"}}""") }.text.contains("TAB_NOT_FOUND"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `cu_end and dispose restore the popup wrapper and the popups' dialog captures`() {
+        val rig = Rig()
+        rig.run("""{"type":"focused"}""")
+        val pop = PopupRig(rig); rig.surface.popupSink!!.invoke(pop.window)
+        rig.run("""{"type":"cu_end"}""")
+        assertEquals(1, rig.surface.popupRestores); assertEquals(1, rig.surface.restores); assertEquals(1, pop.surface.restores)
+        assertFalse(json(rig.run("""{"type":"cu_end"}""")).containsKey("popups"))
+        rig.run("""{"type":"focused"}""")
+        rig.tools.dispose()
+        assertEquals(2, rig.surface.popupRestores)
         rig.dir.deleteRecursively()
     }
 

@@ -277,6 +277,8 @@ internal data class StepResult(
     val snapped: SnapInfo? = null,
     /** Set only by `locate_text`. */
     val located: LocatedInfo? = null,
+    /** Popup windows opened from the tab (or its popups): open ones, and each one that closed, once. */
+    val popups: List<PopupInfo>? = null,
 )
 
 @Serializable
@@ -295,9 +297,11 @@ internal data class DownloadInfo(
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
     return JsonObject(
-        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located") && v is JsonNull }
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "popups") && v is JsonNull }
             .mapValues { (k, v) ->
                 when {
+                    k == "popups" && v is kotlinx.serialization.json.JsonArray ->
+                        kotlinx.serialization.json.JsonArray(v.map { e -> if (e is JsonObject) JsonObject(e.filterNot { it.value is JsonNull }) else e })
                     k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash") && sv is JsonNull })
                     (k == "dialog" || k == "snapped" || k == "located") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
                     else -> v
@@ -935,13 +939,23 @@ internal class TabActions(
 
     suspend fun step(raw: String): McpToolResult = try {
         val args = parseStepArgs(raw)
-        val browser = resolveTab(args.tabId)
-        refuseIfEngineRunning(args.tabId)
+        val popupOf = splitPopupId(args.tabId)
+        val browser = if (popupOf != null) {
+            if (args.action.type !in CuTypes.ALL) {
+                throw TabToolException(TabErrorCodes.UNSUPPORTED_ACTION, "'${args.action.type}' needs a tab's DOM; use computer-use verbs (screenshot, click_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on popup windows")
+            }
+            computerUse.popupTarget(args.tabId)?.integration
+                ?: throw TabToolException(TabErrorCodes.TAB_NOT_FOUND, "No open popup window '${args.tabId}'")
+        } else {
+            resolveTab(args.tabId)
+        }
+        val busyId = popupOf?.first ?: args.tabId
+        refuseIfEngineRunning(busyId)
         val result = lockFor(args.tabId).withLock {
             // Re-checked under the lock: a run may have started while this step waited. Best-effort,
             // since a panel run takes no tab lock - but a run creates its own tab, so an agent cannot
             // know that id before the run starts.
-            refuseIfEngineRunning(args.tabId)
+            refuseIfEngineRunning(busyId)
             runStep(browser, args)
         }
         McpToolResult(stepResultJson(result))
@@ -984,6 +998,7 @@ internal class TabActions(
                 urlBefore = before, urlAfter = before, navigated = false,
                 durationMs = Clock.System.now().toEpochMilliseconds() - started,
                 dialog = waiting,
+                popups = computerUse.popupsFor(args.tabId).ifEmpty { null },
                 dialogAuto = computerUse.drainAutoDialogs(args.tabId).ifEmpty { null },
             )
         }
@@ -1020,6 +1035,7 @@ internal class TabActions(
             dialogAuto = computerUse.drainAutoDialogs(args.tabId).ifEmpty { null },
             snapped = cu?.snapped,
             located = cu?.located,
+            popups = computerUse.popupsFor(args.tabId).ifEmpty { null },
         )
     }
 
@@ -1164,7 +1180,11 @@ internal class TabActions(
                 "default_value?, ok_text?, cancel_text?, url?} and every other verb is refused until dialog_answer (value 'ok', " +
                 "'cancel' or 'ok:<text>' for a prompt) answers it. A dialog unanswered for 120 s is cancelled (alert: ok); " +
                 "dialog_auto lists dialogs answered automatically. cu_end (value ignored) ends computer use on the tab: " +
-                "the host's dialog handlers are restored and the pointer is removed."
+                "the host's dialog handlers are restored and the pointer is removed. " +
+                "Popup windows (window.open with a size, e.g. sign-in) opened while a tab is in computer use get the tab id '<tabId>#popup-<n>': " +
+                "every result for the tab or its popups carries popups [{id, open: true, url, title}] (a closed one appears once as {id, open: false}); " +
+                "pass that id as tab_id to use computer-use verbs (screenshot, click_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on the popup. " +
+                "Selector verbs (click, input, ...) are not available on popups."
 
         const val OBSERVE_SCHEMA =
             """{"type":"object","properties":{""" +

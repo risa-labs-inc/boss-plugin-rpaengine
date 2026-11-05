@@ -484,6 +484,9 @@ internal interface TabSurface {
 
     /** Start routing this tab's alert/confirm/prompt/beforeunload to [sink]; null when the tab cannot. */
     fun captureDialogs(sink: DialogSink): DialogCapture? = null
+
+    /** Wrap the host's popup handler so popups that stay open are reported to [onPopup]; null when it cannot. */
+    fun capturePopups(onPopup: (PopupWindow) -> Unit): DialogCapture? = null
 }
 
 /** Plays [events] in order, sleeping on pauses. False as soon as one dispatch fails. */
@@ -547,6 +550,9 @@ internal class JxBrowserSurface private constructor(private val browser: Any) : 
     override fun captureDialogs(sink: DialogSink): DialogCapture? =
         runCatching { ProxyDialogCapture.install(JxCallbackHost(browser), loader, JX_DIALOG_SPECS, sink) }.getOrNull()
 
+    override fun capturePopups(onPopup: (PopupWindow) -> Unit): DialogCapture? =
+        runCatching { PopupProxyCapture.install(JxCallbackHost(browser), loader, JX_OPEN_POPUP_CALLBACK) { popup -> onPopup(JxPopupWindow(popup)) } }.getOrNull()
+
     private fun cls(name: String): Class<*> = Class.forName(name, true, loader)
 
     // Several `dispatch` overloads; the first by name is the wrong one for most events.
@@ -558,6 +564,9 @@ internal class JxBrowserSurface private constructor(private val browser: Any) : 
         const val BROWSER = "com.teamdev.jxbrowser.browser.Browser"
         private const val SEARCH_DEPTH = 5
         private val found: MutableMap<BrowserIntegration, Any> = Collections.synchronizedMap(WeakHashMap())
+
+        /** A surface over a Browser object itself (a popup window). */
+        fun wrap(browser: Any): TabSurface = JxBrowserSurface(browser)
 
         /** The tab's surface, or null when no live JxBrowser sits behind [integration]. */
         fun of(integration: BrowserIntegration): TabSurface? {
@@ -865,9 +874,12 @@ internal class ComputerUse(
     /** The label and color the pointer last used per tab, so a screenshot can put it back unchanged. */
     private val specs = java.util.concurrent.ConcurrentHashMap<String, PointerSpec>()
 
-    private class TabDialogs(val pending: PendingDialogs, val capture: DialogCapture)
+    private class TabDialogs(val pending: PendingDialogs, val capture: DialogCapture?, val popupCapture: DialogCapture? = null)
 
     private val dialogs = java.util.concurrent.ConcurrentHashMap<String, TabDialogs>()
+
+    /** Popups opened from each captured tab, under `<tabId>#popup-<n>`. */
+    private val registries = java.util.concurrent.ConcurrentHashMap<String, PopupRegistry>()
 
     private val newPending: () -> PendingDialogs = { PendingDialogs() }
 
@@ -877,25 +889,54 @@ internal class ComputerUse(
     /** Dialogs this plugin auto-answered since the last result (second dialog, timeout, capture end). */
     fun drainAutoDialogs(tabId: String): List<AutoDialog> = dialogs[tabId]?.pending?.drainAuto().orEmpty()
 
+    /** The open popup behind a pseudo tab id, or null. */
+    fun popupTarget(id: String): PopupWindow? = splitPopupId(id)?.let { (parent, n) -> registries[parent]?.get(n) }
+
+    /** Open popups of the tab (or of the parent when [tabId] is itself a popup), plus ones that just closed. */
+    fun popupsFor(tabId: String): List<PopupInfo> {
+        val parent = splitPopupId(tabId)?.first ?: tabId
+        val list = registries[parent]?.status().orEmpty()
+        list.filter { !it.open }.forEach { endCapture(it.id) }
+        return list
+    }
+
     /** Restores every tab's host callbacks (plugin dispose). */
     fun dispose() {
         dialogs.keys.toList().forEach { endCapture(it) }
+        registries.keys.toList().forEach { endCapture(it) }
     }
 
     private fun endCapture(tabId: String) {
+        registries.remove(tabId)?.ids()?.forEach { endCapture(it) }
         val d = dialogs.remove(tabId) ?: return
         d.pending.close()
-        runCatching { d.capture.restore() }
+        runCatching { d.popupCapture?.restore() }
+        runCatching { d.capture?.restore() }
     }
+
+    /** A popup that stayed open: register it and give it the same dialog capture. */
+    private fun adopt(parentId: String, window: PopupWindow) {
+        val id = registries.computeIfAbsent(parentId) { PopupRegistry(parentId) }.add(window)
+        val pending = newPending()
+        val capture = window.surface.captureDialogs { info, responder -> pending.offer(info, responder) } ?: return
+        dialogs[id] = TabDialogs(pending, capture)
+    }
+
+    /** The surface behind this tab id: a popup's own, else the tab's JxBrowser. */
+    private fun surfaceNow(browser: BrowserIntegration, tabId: String): TabSurface? =
+        popupTarget(tabId)?.surface ?: surfaceFor(browser)
 
     /** First computer-use action on a tab: remember the host's callbacks and install ours. */
     private fun startCapture(browser: BrowserIntegration, tabId: String) {
         if (dialogs.containsKey(tabId)) return
-        val surface = surfaceFor(browser) ?: return
+        val surface = surfaceNow(browser, tabId) ?: return
         val pending = newPending()
-        val capture = surface.captureDialogs { info, responder -> pending.offer(info, responder) } ?: return
-        if (dialogs.putIfAbsent(tabId, TabDialogs(pending, capture)) != null) {
-            capture.restore() // lost a race: ours was installed twice, keep the first
+        val capture = surface.captureDialogs { info, responder -> pending.offer(info, responder) }
+        val popupCapture = if (splitPopupId(tabId) == null) surface.capturePopups { w -> adopt(tabId, w) } else null
+        if (capture == null && popupCapture == null) return
+        if (dialogs.putIfAbsent(tabId, TabDialogs(pending, capture, popupCapture)) != null) {
+            popupCapture?.restore() // lost a race: ours was installed twice, keep the first
+            capture?.restore()
         }
     }
 
@@ -947,7 +988,7 @@ internal class ComputerUse(
             }
             CuTypes.FOCUSED -> CuOutcome(true, focused = readFocused(browser, selectAll = false) ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)"))
             else -> {
-                val surface = surfaceFor(browser)
+                val surface = surfaceNow(browser, tabId)
                     ?: return CuOutcome(false, "Screenshots and real input need a JxBrowser tab; none is behind this one")
                 when (action.type) {
                     CuTypes.SCREENSHOT -> screenshot(browser, surface, tabId, value?.trim()?.toIntOrNull() ?: SHOT_DEFAULT_MAX_SIDE, hideOverlay)
