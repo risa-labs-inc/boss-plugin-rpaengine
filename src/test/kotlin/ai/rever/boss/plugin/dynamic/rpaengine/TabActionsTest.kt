@@ -280,7 +280,7 @@ class TabActionsTest {
         val b = FakeBrowser()
         TabActions { FakeTabs(mapOf("t" to b)) }
             .step("""{"tab_id":"t","action":{"type":"click","selector":{"type":"css","value":"#go"}},"highlight_ms":0}""")
-        assertTrue(b.scripts.none { it.contains(HIGHLIGHT_ATTR) })
+        assertTrue(b.scripts.none { it.contains(HIGHLIGHT_ATTR) && !it.contains("/*rpa-quiet*/") })
     }
 
     @Test

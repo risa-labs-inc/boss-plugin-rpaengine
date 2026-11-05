@@ -69,6 +69,8 @@ internal data class StepArgs(
     val hideOverlay: Boolean = false,
     /** screenshot only: select the tab first when the page reports itself hidden. */
     val ensureVisible: Boolean = false,
+    /** click_at / type_text: a mark id (`m12`) from the tab's latest look. */
+    val element: String? = null,
 )
 
 internal const val OBSERVE_DEFAULT_MAX = 80
@@ -76,6 +78,11 @@ internal const val OBSERVE_MAX_LIMIT = 200
 internal const val STEP_DEFAULT_HIGHLIGHT_MS = 600
 internal const val STEP_MAX_HIGHLIGHT_MS = 2000
 internal const val STEP_MAX_WAIT_MS = 10_000L
+
+/** Verbs that only read (or touch nothing on the page): no post-step URL settle. */
+internal val STEP_NO_SETTLE_TYPES = setOf(
+    CuTypes.SCREENSHOT, CuTypes.PAGE_TEXT, CuTypes.LOCATE_TEXT, CuTypes.FOCUSED, CuTypes.LOOK, CuTypes.POINTER_HIDE, CuTypes.CU_END,
+)
 
 internal val STEP_ALLOWED_TYPES = setOf(
     ActionTypes.CLICK, ActionTypes.INPUT, ActionTypes.SELECT, ActionTypes.KEYPRESS,
@@ -166,6 +173,15 @@ internal fun parseStepArgs(raw: String): StepArgs {
         }
         else -> invalid("'action.selector' must be an object")
     }
+    val element = (action["element"] ?: o["element"]).let { el ->
+        when (el) {
+            null, is JsonNull -> null
+            is JsonPrimitive -> el.takeIf { it.isString }?.content?.trim()?.takeIf(::isMarkId)
+                ?: invalid("'element' must be a mark id like m12 from the latest look")
+            else -> invalid("'element' must be a mark id like m12 from the latest look")
+        }
+    }
+    if (element != null && type != CuTypes.CLICK_AT && type != CuTypes.TYPE_TEXT) invalid("'element' applies only to click_at and type_text")
     if (type in SELECTOR_REQUIRED && selector.type == SelectorTypes.NONE) {
         invalid("'$type' requires action.selector")
     }
@@ -179,7 +195,8 @@ internal fun parseStepArgs(raw: String): StepArgs {
         CuTypes.SCREENSHOT -> if (value != null && value.trim().toIntOrNull()?.takeIf { it in SHOT_MIN_SIDE..SHOT_MAX_SIDE_LIMIT } == null) {
             invalid("'screenshot' value must be a max side in px between $SHOT_MIN_SIDE and $SHOT_MAX_SIDE_LIMIT")
         }
-        CuTypes.CLICK_AT -> if (parsePoint(value) == null) invalid("'click_at' requires action.value 'x,y' (CSS px in the viewport)")
+        CuTypes.CLICK_AT -> if (parsePoint(value) == null && !(element != null && value == null)) invalid("'click_at' requires action.value 'x,y' (CSS px in the viewport), or an element id with an optional x,y fallback")
+        CuTypes.LOOK -> try { LookOptions.parse(value) } catch (e: IllegalArgumentException) { invalid(e.message ?: "invalid look options") }
         CuTypes.TYPE_TEXT -> if (value == null) invalid("'type_text' requires action.value (the text to type)")
         CuTypes.KEY -> if (TabKeys.parse(value) == null) invalid("'key' requires action.value, a key name like Enter, Escape, Tab, ArrowDown or ctrl+a")
         CuTypes.SCROLL_BY -> if (parseScrollDelta(value) == null) invalid("'scroll_by' requires action.value 'dy' or 'dx,dy' (integer px)")
@@ -195,6 +212,7 @@ internal fun parseStepArgs(raw: String): StepArgs {
         snap?.also { if (type != CuTypes.CLICK_AT) invalid("'snap' applies only to click_at") },
         hideOverlay = (action["hide_overlay"] as? JsonPrimitive)?.takeIf { !it.isString }?.content == "true",
         ensureVisible = (action["ensure_visible"] as? JsonPrimitive)?.takeIf { !it.isString }?.content == "true",
+        element = element,
     )
 }
 
@@ -284,6 +302,10 @@ internal data class StepResult(
     val snapped: SnapInfo? = null,
     /** Set only by `locate_text`. */
     val located: LocatedInfo? = null,
+    /** Set by a click_at / type_text that used `element`: the element that was clicked. */
+    val clicked: ClickedInfo? = null,
+    /** Set only by `look`. */
+    val look: LookResult? = null,
     /** Popup windows opened from the tab (or its popups): open ones, and each one that closed, once. */
     val popups: List<PopupInfo>? = null,
 )
@@ -304,13 +326,14 @@ internal data class DownloadInfo(
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
     return JsonObject(
-        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "popups") && v is JsonNull }
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups") && v is JsonNull }
             .mapValues { (k, v) ->
                 when {
                     k == "popups" && v is kotlinx.serialization.json.JsonArray ->
                         kotlinx.serialization.json.JsonArray(v.map { e -> if (e is JsonObject) JsonObject(e.filterNot { it.value is JsonNull }) else e })
                     k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash" || sk == "url" || sk == "title" || sk == "visible" || sk == "revealed" || sk == "modal") && sv is JsonNull })
-                    (k == "dialog" || k == "snapped" || k == "located") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
+                    k == "look" && v is JsonObject -> pruneNulls(v)
+                    (k == "dialog" || k == "snapped" || k == "located" || k == "clicked") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
                     else -> v
                 }
             }
@@ -566,8 +589,8 @@ private const val IMAGE_DOM_JS: String =
         "function absUrl(u) { if (!u) { return null; } try { return new URL(u, document.baseURI).href; } catch (e) { return null; } } " +
         "function bestSrc(img) { return absUrl(pickSrc(img.getAttribute('srcset'), img.currentSrc, img.getAttribute('src'))); } "
 
-/** The DOM-walking part of the observe script. Expects [OBSERVE_HELPERS_JS] in scope and `MAX`. */
-private val OBSERVE_BODY_JS: String =
+/** DOM predicates and label resolution shared by the observe and look scripts. Expects [OBSERVE_HELPERS_JS] in scope. */
+internal val OBSERVE_DOM_JS: String =
     "function hasSize(r) { return r.width > 0 && r.height > 0; } " +
         "function styledVisible(el) { var cs = window.getComputedStyle(el); " +
         "if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') { return false; } " +
@@ -596,8 +619,11 @@ private val OBSERVE_BODY_JS: String =
         "if (!entry(el, tag, role)) { " +
         "s = el.querySelector(CONTROLS) ? textOf(el) : norm(el.innerText); if (s) { return s; } " +
         "var img = el.querySelector('img[alt]'); if (img) { s = norm(img.getAttribute('alt')); if (s) { return s; } } } " +
-        "s = norm(el.getAttribute('name')); return s || null; } " +
-        IMAGE_DOM_JS + SENSITIVE_DOM_JS +
+        "s = norm(el.getAttribute('name')); return s || null; } "
+
+/** The DOM-walking part of the observe script. Expects [OBSERVE_HELPERS_JS] in scope and `MAX`. */
+private val OBSERVE_BODY_JS: String =
+    OBSERVE_DOM_JS + IMAGE_DOM_JS + SENSITIVE_DOM_JS +
         "function imageOf(img, min) { if (!img) { return null; } var r = img.getBoundingClientRect(); " +
         "if (r.width < min || r.height < min) { return null; } " +
         "return { src: safeSrc(bestSrc(img)), alt: norm(img.getAttribute('alt')) || null, " +
@@ -969,7 +995,7 @@ internal class TabActions(
         val popupOf = splitPopupId(args.tabId)
         val browser = if (popupOf != null) {
             if (args.action.type !in CuTypes.ALL) {
-                throw TabToolException(TabErrorCodes.UNSUPPORTED_ACTION, "'${args.action.type}' needs a tab's DOM; use computer-use verbs (screenshot, click_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on popup windows")
+                throw TabToolException(TabErrorCodes.UNSUPPORTED_ACTION, "'${args.action.type}' needs a tab's DOM; use computer-use verbs (screenshot, look, click_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on popup windows")
             }
             computerUse.popupTarget(args.tabId)?.integration
                 ?: throw TabToolException(TabErrorCodes.TAB_NOT_FOUND, "No open popup window '${args.tabId}'")
@@ -1039,12 +1065,14 @@ internal class TabActions(
         val (ok, error, download) =
             when (action.type) {
                 in CuTypes.ALL -> {
+                    val lookWantsShown = action.type == CuTypes.LOOK && runCatching { LookOptions.parse(action.value).ensureVisible }.getOrDefault(false)
                     cu = computerUse.run(browser, args.tabId, action, args.pointer, args.allowSensitive, args.snap, args.hideOverlay,
-                        reveal = if (args.ensureVisible && splitPopupId(args.tabId) == null) ({ revealTab(args.tabId) }) else null)
+                        reveal = if ((args.ensureVisible || lookWantsShown) && splitPopupId(args.tabId) == null) ({ revealTab(args.tabId) }) else null,
+                        element = args.element)
                     Triple(cu.ok, cu.error, null)
                 }
                 ActionTypes.DOWNLOAD -> download(browser, action.selector, hook)
-                else -> runner.execute(browser, action, hook, guard).let { Triple(it.first, it.second, null) }
+                else -> runner.execute(browser, action, hook, guard, quiet = { b -> computerUse.quiet(b, args.tabId) }).let { Triple(it.first, it.second, null) }
             }
         if (guard != null && error == GUARD_REFUSED) {
             throw TabToolException(
@@ -1053,8 +1081,10 @@ internal class TabActions(
                     "pass allow_sensitive: true to type into it",
             )
         }
-        delay(STEP_URL_SETTLE_MS)
+        if (action.type !in STEP_NO_SETTLE_TYPES) delay(STEP_URL_SETTLE_MS)
         val after = currentUrl(browser)
+        val popupsNow = computerUse.popupsFor(args.tabId).ifEmpty { null }
+        val dialogNow = computerUse.pendingDialog(args.tabId)
         return StepResult(
             ok = ok,
             error = error,
@@ -1066,11 +1096,13 @@ internal class TabActions(
             screenshot = cu?.screenshot,
             focused = cu?.focused,
             text = cu?.text,
-            dialog = computerUse.pendingDialog(args.tabId),
+            dialog = dialogNow,
             dialogAuto = computerUse.drainAutoDialogs(args.tabId).ifEmpty { null },
             snapped = cu?.snapped,
             located = cu?.located,
-            popups = computerUse.popupsFor(args.tabId).ifEmpty { null },
+            clicked = cu?.clicked,
+            look = cu?.look?.copy(popups = popupsNow, dialog = dialogNow),
+            popups = popupsNow,
         )
     }
 
@@ -1198,7 +1230,7 @@ internal class TabActions(
                 "refused unless allow_sensitive is true. A tab an RPA Engine run is driving is refused (TAB_BUSY). " +
                 "run_script, switch_frame and assert are refused. " +
                 "Computer-use verbs act on what is on screen, in viewport CSS px, with real browser input: " +
-                "screenshot (value: max side px, default 1568) saves a JPEG and returns screenshot " +
+                "screenshot (value: max side px, default 1100, JPEG quality 0.7) saves a JPEG and returns screenshot " +
                 "{path, width, height, css_width, css_height, dpr, scroll, content_hash, url, title, visible, revealed, modal} (the pointer overlay is left as is; action.hide_overlay true removes it for the capture; visible is document.visibilityState: a tab that is not the front one in its panel gives a STALE image, so action.ensure_visible true selects it first (revealed: true) and waits until it is visible; content_hash changes when the page's text or form state changes, not for video or animation); " +
                 "click_at (value 'x,y'; optional snap {box: 'left,top,right,bottom'} in viewport CSS px: when no interactive element " +
                 "is under the point, the click moves to the centre of the visible interactive element overlapping the box most, and the result adds " +
@@ -1207,6 +1239,11 @@ internal class TabActions(
                 "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
                 "{tag, editable, label, type, options, sensitive}, never a value); pointer_hide (removes the overlay); " +
                 "page_text (read-only, value: max chars, default 20000, max 100000: returns text = the page's rendered innerText, never field values). " +
+                "look (read-only; value: a JSON string of options {max_side: 1100, quality: 0.7, locate: [phrases], elements: true, ensure_visible: false, page_text: false}) returns everything for one decision in one call: " +
+                "look {screenshot {...as above}, located {phrase: {found, count, in_view, direction, screens, rect?}}, elements [{id: 'm1'.., role, tag, label, value_kind?: text|empty|checked|unchecked|selected:<option>, rect {x,y,w,h}, disabled, covered, context, editable, href_host?}], page_text?, popups?, dialog?}; " +
+                "elements are the interactive ones in the viewport (modal ones first, at most 120; disabled and covered ones are kept and flagged); click_at and type_text accept element: '<id>' from the tab's latest look " +
+                "(clicks its current visible centre after a hit-test; ok false with '<label> is disabled' or '<label> is covered by <x>'; a vanished element falls back to value 'x,y' when given; the result adds clicked {id, label, tag}; type_text clicks it first). " +
+                "Read-only verbs return without settling; action verbs wait until the page is quiet (no DOM change for 100 ms, at most 800 ms). " +
                 "locate_text (read-only, value: a phrase up to 100 chars) finds where the phrase is on the page, case-insensitive, whole words preferred ('item 87' never matches 'Item 870'): " +
                 "located {found, count, in_view, direction: above|below|in_view|null, screens (nearest match's distance from the viewport in viewport heights), rect? {x,y,w,h} when in view}; never field values. " +
                 "Optional top-level pointer {label, color} shows a labelled agent cursor that glides to the action point " +
@@ -1219,7 +1256,7 @@ internal class TabActions(
                 "the host's dialog handlers are restored and the pointer is removed. " +
                 "Popup windows (window.open with a size, e.g. sign-in) opened while a tab is in computer use get the tab id '<tabId>#popup-<n>': " +
                 "every result for the tab or its popups carries popups [{id, open: true, url, title}] (a closed one appears once as {id, open: false}); " +
-                "pass that id as tab_id to use computer-use verbs (screenshot, click_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on the popup. " +
+                "pass that id as tab_id to use computer-use verbs (screenshot, look, click_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on the popup. " +
                 "Selector verbs (click, input, ...) are not available on popups."
 
         const val OBSERVE_SCHEMA =
@@ -1232,9 +1269,9 @@ internal class TabActions(
             """{"type":"object","properties":{""" +
                 """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list)."},""" +
                 """"action":{"type":"object","properties":{""" +
-                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text","locate_text","cu_end","dialog_answer"]},""" +
+                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text","locate_text","look","cu_end","dialog_answer"]},""" +
                 """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit, download; optional for keypress (defaults to the focused element)."},""" +
-                """"ensure_visible":{"type":"boolean","default":false,"description":"screenshot only: when the page reports itself hidden, select its tab first (not for popup windows)."},"hide_overlay":{"type":"boolean","default":false,"description":"screenshot only: remove the pointer overlay while capturing (default: leave it)."},"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1568); click_at (required): 'x,y' CSS px in the viewport; type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right; locate_text (required): phrase; dialog_answer (required): 'ok' | 'cancel' | 'ok:<text>' (text answers a prompt)."}""" +
+                """"element":{"type":"string","description":"click_at and type_text: a mark id such as m12 from the tab's latest look; clicks that element's current visible centre."},"ensure_visible":{"type":"boolean","default":false,"description":"screenshot only: when the page reports itself hidden, select its tab first (not for popup windows)."},"hide_overlay":{"type":"boolean","default":false,"description":"screenshot only: remove the pointer overlay while capturing (default: leave it)."},"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1100); look: JSON options string (optional); click_at (required unless action.element is given): 'x,y' CSS px in the viewport (the fallback when element is gone); type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right; locate_text (required): phrase; dialog_answer (required): 'ok' | 'cancel' | 'ok:<text>' (text answers a prompt)."}""" +
                 """},"required":["type"]},""" +
                 """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."},""" +
                 """"allow_sensitive":{"type":"boolean","default":false,"description":"input and type_text: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."},"snap":{"type":"object","properties":{"box":{"type":"string","description":"left,top,right,bottom in viewport CSS px: where the target is believed to be."}},"required":["box"],"description":"click_at only: snap a near-miss onto the interactive element the box overlaps most. Accepted inside action or at top level."},"pointer":{"type":"object","properties":{"label":{"type":"string","description":"Text on the cursor pill, e.g. 'Jev · Research'."},"color":{"type":"string","description":"Hex color, e.g. #6D28D9."}},"description":"Show an agent cursor that glides to the action point first. Absent = no overlay."}""" +

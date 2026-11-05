@@ -21,6 +21,9 @@ import javax.imageio.IIOImage
 import javax.imageio.ImageIO
 import javax.imageio.ImageWriteParam
 import javax.imageio.stream.MemoryCacheImageOutputStream
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.min
@@ -47,18 +50,19 @@ internal object CuTypes {
     const val LOCATE_TEXT = "locate_text"
     const val CU_END = "cu_end"
     const val DIALOG_ANSWER = "dialog_answer"
+    const val LOOK = "look"
 
-    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT, LOCATE_TEXT, CU_END, DIALOG_ANSWER)
+    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT, LOCATE_TEXT, LOOK, CU_END, DIALOG_ANSWER)
 }
 
 // ---------------------------------------------------------------------------------------------
 // Values: parsing and geometry (pure)
 // ---------------------------------------------------------------------------------------------
 
-internal const val SHOT_DEFAULT_MAX_SIDE = 1568
+internal const val SHOT_DEFAULT_MAX_SIDE = 1100
 internal const val SHOT_MIN_SIDE = 280
 internal const val SHOT_MAX_SIDE_LIMIT = 4096
-internal const val SHOT_JPEG_QUALITY = 0.8
+internal const val SHOT_JPEG_QUALITY = 0.7
 internal const val SHOT_KEEP = 200
 internal const val SCROLL_MAX_PX = 6000
 internal const val PAGE_TEXT_DEFAULT = 20_000
@@ -392,7 +396,13 @@ internal class CuOutcome(
     val text: String? = null,
     val snapped: SnapInfo? = null,
     val located: LocatedInfo? = null,
+    val clicked: ClickedInfo? = null,
+    val look: LookResult? = null,
 )
+
+/** The element a click_at / type_text `element` resolved to. */
+@Serializable
+internal data class ClickedInfo(val id: String, val label: String? = null, val tag: String? = null)
 
 // ---------------------------------------------------------------------------------------------
 // Input events (plain data) and key parsing
@@ -822,6 +832,9 @@ internal const val POINTER_DEFAULT_LABEL = "Agent"
 internal const val POINTER_DEFAULT_COLOR = "#6D28D9"
 internal const val POINTER_LABEL_MAX = 40
 internal const val POINTER_GLIDE_MS = 260L
+
+/** The glide starts, and the input follows this long after: the click never waits for the pointer to arrive. */
+internal const val POINTER_LEAD_MS = 60L
 internal const val POINTER_ID = "__rpa_pointer"
 internal const val POINTER_ATTR = "data-rpa-pointer"
 
@@ -948,6 +961,12 @@ internal class ComputerUse(
 
     private val newPending: () -> PendingDialogs = { PendingDialogs() }
 
+    /** The element marks of each tab's latest look, by id. */
+    private val marks = java.util.concurrent.ConcurrentHashMap<String, Map<String, MarkRef>>()
+
+    /** The quiet wait of rpa_step action verbs; skipped while a dialog is pending (a script would block behind it). */
+    suspend fun quiet(browser: BrowserIntegration, tabId: String) = awaitQuiet(browser, hasDialog = { pendingDialog(tabId) != null })
+
     /** The tab's pending dialog, for every rpa_step result. */
     fun pendingDialog(tabId: String): DialogInfo? = dialogs[tabId]?.pending?.current()
 
@@ -1015,6 +1034,8 @@ internal class ComputerUse(
         hideOverlay: Boolean = false,
         /** screenshot with ensure_visible: selects the tab; null for popups and when not asked. */
         reveal: (suspend () -> Unit)? = null,
+        /** click_at / type_text: a mark id from the tab's latest look. */
+        element: String? = null,
     ): CuOutcome {
         val value = action.value
         if (action.type != CuTypes.CU_END && action.type != CuTypes.DIALOG_ANSWER) startCapture(browser, tabId)
@@ -1023,6 +1044,7 @@ internal class ComputerUse(
                 endCapture(tabId) // first: a held dialog is answered before any script could block on it
                 positions.remove(tabId)
                 specs.remove(tabId)
+                marks.remove(tabId)
                 orNullUnlessCancelled { browser.executeJavaScript(pointerRemoveScript()) }
                 CuOutcome(true)
             }
@@ -1032,7 +1054,7 @@ internal class ComputerUse(
                 // Off the caller's thread, never the EDT: the Action's send is a plain RPC reply.
                 val answered = pending != null && withContext(kotlinx.coroutines.Dispatchers.IO) { pending.answer(answer) }
                 if (!answered) return CuOutcome(false, "No browser dialog is pending on this tab")
-                delay(ActionTiming.ACTION_SETTLE_MS)
+                quiet(browser, tabId)
                 CuOutcome(true)
             }
             CuTypes.POINTER_HIDE -> {
@@ -1059,9 +1081,19 @@ internal class ComputerUse(
                     ?: return CuOutcome(false, "Screenshots and real input need a JxBrowser tab; none is behind this one")
                 when (action.type) {
                     CuTypes.SCREENSHOT -> screenshot(browser, surface, tabId, value?.trim()?.toIntOrNull() ?: SHOT_DEFAULT_MAX_SIDE, hideOverlay, reveal)
-                    CuTypes.CLICK_AT -> clickAt(browser, surface, tabId, value, pointer, snap)
-                    CuTypes.TYPE_TEXT -> typeText(browser, surface, value.orEmpty(), allowSensitive)
-                    CuTypes.KEY -> key(surface, value)
+                    CuTypes.LOOK -> look(browser, surface, tabId, value, reveal)
+                    CuTypes.CLICK_AT -> clickAt(browser, surface, tabId, value, pointer, snap, element)
+                    CuTypes.TYPE_TEXT -> {
+                        var clicked: ClickedInfo? = null
+                        if (element != null) {
+                            val c = clickAt(browser, surface, tabId, null, pointer, null, element)
+                            if (!c.ok) return c
+                            clicked = c.clicked
+                        }
+                        val t = typeText(browser, surface, tabId, value.orEmpty(), allowSensitive)
+                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked)
+                    }
+                    CuTypes.KEY -> key(browser, surface, tabId, value)
                     CuTypes.SCROLL_BY -> scrollBy(browser, surface, tabId, value, pointer)
                     else -> CuOutcome(false, "Unknown action type '${action.type}'")
                 }
@@ -1079,7 +1111,7 @@ internal class ComputerUse(
         orNullUnlessCancelled { browser.executeJavaScript(pointerScript(x, y, positions[tabId], spec, ripple)) }
         positions[tabId] = x to y
         specs[tabId] = spec
-        delay(POINTER_GLIDE_MS + 40)
+        delay(POINTER_LEAD_MS)
     }
 
     private suspend fun readMeta(browser: BrowserIntegration): PageMeta? =
@@ -1093,7 +1125,8 @@ internal class ComputerUse(
             ?.let { runCatching { TabJson.decodeFromString(FocusedInfo.serializer(), it) }.getOrNull() }
             ?.takeIf { it.tag != null }
 
-    private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int, hideOverlay: Boolean, reveal: (suspend () -> Unit)?): CuOutcome {
+    /** ensure_visible: selects a hidden tab, waits until it reports visible, gives it a frame. Returns the last meta and whether it selected. */
+    private suspend fun ensureShown(browser: BrowserIntegration, reveal: (suspend () -> Unit)?): Pair<PageMeta?, Boolean> {
         var meta = readMeta(browser)
         var revealed = false
         if (reveal != null && meta?.visible == false) {
@@ -1108,6 +1141,11 @@ internal class ComputerUse(
                 if (meta?.visible == true) delay(REVEAL_FRAME_MS)
             }
         }
+        return meta to revealed
+    }
+
+    private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int, hideOverlay: Boolean, reveal: (suspend () -> Unit)?): CuOutcome {
+        val (meta, revealed) = ensureShown(browser, reveal)
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         val scroll = ScrollInfo.parse(orNullUnlessCancelled { browser.executeJavaScript(ScrollInfo.SCRIPT) })
         val contentHash = (orNullUnlessCancelled { browser.executeJavaScript(contentHashScript()) } as? String)?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
@@ -1133,13 +1171,66 @@ internal class ComputerUse(
         return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }, meta?.modal))
     }
 
-    private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, snap: SnapBox? = null): CuOutcome {
-        var (x, y) = parsePoint(value) ?: return CuOutcome(false, "click_at value must be 'x,y' in CSS px")
+    private suspend fun look(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, reveal: (suspend () -> Unit)?): CuOutcome {
+        val opts = try { LookOptions.parse(value) } catch (e: IllegalArgumentException) { return CuOutcome(false, e.message) }
+        var revealed = false
+        if (reveal != null) revealed = ensureShown(browser, reveal).second
+        val raw = (orNullUnlessCancelled { browser.executeJavaScript(lookScript(opts)) } as? String)
+            ?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } as? JsonObject
+            ?: return CuOutcome(false, "Could not read the page (the page may be navigating)")
+        fun part(k: String): String? = (raw[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
+        val viewport = Viewport.parse(part("vp")) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
+        val meta = PageMeta.parse(part("meta"))
+        val scroll = ScrollInfo.parse(part("scroll"))
+        val hash = part("hash")?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
+        val located = LinkedHashMap<String, LocatedInfo>()
+        val locRaw = raw["located"] as? JsonObject
+        for (phrase in opts.locate) {
+            located[phrase] = (locRaw?.get(phrase) as? JsonPrimitive)?.takeIf { it.isString }?.content
+                ?.let { runCatching { TabJson.decodeFromString(LocatedInfo.serializer(), it) }.getOrNull() }
+                ?: LocatedInfo(found = false, count = 0, inView = false)
+        }
+        val rawEls = part("els")
+            ?.let { runCatching { TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(RawLookElement.serializer()), it) }.getOrNull() }
+            .orEmpty().filter { isMarkId(it.id) }.take(LOOK_MAX_ELEMENTS)
+        if (opts.elements) {
+            marks[tabId] = rawEls.associate { it.id to MarkRef(it.xp, normalizeLabel(it.label).orEmpty(), it.tag) }
+        }
+        val image = surface.bitmap() ?: return CuOutcome(false, "The browser returned no bitmap")
+        val (w, h) = fitShotSize(image.width, image.height, opts.maxSide)
+        val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h), opts.quality))
+        val shot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, hash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }, meta?.modal)
+        return CuOutcome(true, look = LookResult(shot, located, rawEls.map { it.toElement() }, pageText = part("text")))
+    }
+
+    /** Resolves mark [id] on the page: its current clickable point, or why there is none (disabled/covered/gone). */
+    private suspend fun resolveMark(browser: BrowserIntegration, tabId: String, id: String): MarkAnswer {
+        val ref = marks[tabId]?.get(id) ?: return MarkAnswer("gone")
+        return (orNullUnlessCancelled { browser.executeJavaScript(markScript(id, ref)) } as? String)
+            ?.let { runCatching { TabJson.decodeFromString(MarkAnswer.serializer(), it) }.getOrNull() }
+            ?: MarkAnswer("gone")
+    }
+
+    private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, snap: SnapBox? = null, element: String? = null): CuOutcome {
+        val fallback = parsePoint(value)
+        var clicked: ClickedInfo? = null
+        var resolved: Pair<Int, Int>? = null
+        if (element != null) {
+            val a = resolveMark(browser, tabId, element)
+            val name = a.label ?: marks[tabId]?.get(element)?.label ?: element
+            when (a.state) {
+                "ok" -> { resolved = a.x to a.y; clicked = ClickedInfo(element, a.label, a.tag) }
+                "disabled" -> return CuOutcome(false, "'$name' is disabled")
+                "covered" -> return CuOutcome(false, "'$name' is covered by ${a.cover ?: "another element"}")
+                else -> if (fallback == null) return CuOutcome(false, "Element '$element' is gone and no x,y fallback was given; take a new look")
+            }
+        }
+        var (x, y) = resolved ?: fallback ?: return CuOutcome(false, "click_at value must be 'x,y' in CSS px")
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         pointInViewport(x, y, viewport.width, viewport.height)
             ?: return CuOutcome(false, "($x,$y) is outside the ${viewport.width}x${viewport.height} viewport")
         var snapped: SnapInfo? = null
-        if (snap != null) {
+        if (snap != null && resolved == null) {
             val answer = (orNullUnlessCancelled { browser.executeJavaScript(snapScript(x, y, snap)) } as? String)
                 ?.let { runCatching { TabJson.decodeFromString(SnapAnswer.serializer(), it) }.getOrNull() }
             if (answer != null && answer.moved) {
@@ -1153,11 +1244,11 @@ internal class ComputerUse(
         if (pointer != null) glide(browser, tabId, x, y, pointer, ripple = true)
         surface.focus()
         if (!surface.play(TabGestures.click(x, y))) return CuOutcome(false, "The browser did not accept the click", snapped = snapped)
-        delay(ActionTiming.ACTION_SETTLE_MS)
-        return CuOutcome(true, snapped = snapped)
+        quiet(browser, tabId)
+        return CuOutcome(true, snapped = snapped, clicked = clicked)
     }
 
-    private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, text: String, allowSensitive: Boolean): CuOutcome {
+    private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, tabId: String, text: String, allowSensitive: Boolean): CuOutcome {
         val focused = readFocused(browser, selectAll = false)
             ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)")
         val isSelect = focused.tag == "select"
@@ -1179,15 +1270,15 @@ internal class ComputerUse(
             TabGestures.type(text)
         }
         if (!surface.play(events)) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
-        delay(ActionTiming.INPUT_SETTLE_MS)
+        quiet(browser, tabId)
         return CuOutcome(true, focused = readFocused(browser, selectAll = false) ?: focused)
     }
 
-    private suspend fun key(surface: TabSurface, value: String?): CuOutcome {
+    private suspend fun key(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?): CuOutcome {
         val combo = TabKeys.parse(value) ?: return CuOutcome(false, "Unknown key '$value'")
         surface.focus()
         if (!surface.play(TabGestures.stroke(combo))) return CuOutcome(false, "The browser did not accept the key event")
-        delay(ActionTiming.ACTION_SETTLE_MS)
+        quiet(browser, tabId)
         return CuOutcome(true)
     }
 
@@ -1198,7 +1289,7 @@ internal class ComputerUse(
         val cy = viewport.height / 2
         if (pointer != null) glide(browser, tabId, cx, cy, pointer, ripple = false)
         if (!surface.play(TabGestures.scroll(cx, cy, dx, dy))) return CuOutcome(false, "The browser did not accept the wheel event")
-        delay(ActionTiming.ACTION_SETTLE_MS)
+        quiet(browser, tabId)
         return CuOutcome(true)
     }
 

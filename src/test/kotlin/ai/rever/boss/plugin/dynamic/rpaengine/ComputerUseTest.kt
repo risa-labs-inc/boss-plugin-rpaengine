@@ -196,7 +196,7 @@ class ComputerUseTest {
 
     // ---- end to end --------------------------------------------------------------------------
 
-    private class Log { val entries = mutableListOf<String>(); @Synchronized fun add(s: String) { entries += s } }
+    private class Log { val entries = mutableListOf<String>(); val times = mutableListOf<Pair<String, Long>>(); @Synchronized fun add(s: String) { entries += s; times += s to System.nanoTime() } }
 
     private class FakeBrowser(val log: Log) : BrowserIntegration {
         var focusedJson = """{"tag":"input","editable":true,"label":"Search","type":"text"}"""
@@ -206,8 +206,13 @@ class ComputerUseTest {
         var snap: Any? = null
         var meta: Any? = """{"url":"https://a.test/page#x","title":"A page"}"""
         var locate: Any? = null
+        var look: Any? = null
+        var mark: Any? = null
         override suspend fun executeJavaScript(script: String): Any? {
             val r: Any? = when {
+                script.contains("/*rpa-look*/") -> look
+                script.contains("/*rpa-mark*/") -> mark
+                script.contains("/*rpa-quiet*/") || script == quietPollScript() -> true
                 script == Viewport.SCRIPT -> viewport
                 script == ScrollInfo.SCRIPT -> scroll
                 script == contentHashScript() -> hash
@@ -221,6 +226,10 @@ class ComputerUseTest {
             }
             log.add(
                 when {
+                    script.contains("/*rpa-look*/") -> "look"
+                    script.contains("/*rpa-mark*/") -> "mark"
+                    script.contains("/*rpa-quiet*/") -> "quiet-start"
+                    script == quietPollScript() -> "quiet-poll"
                     script == contentHashScript() -> "hash"
                     script.contains("querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]')") -> "hide"
                     script == ScrollInfo.SCRIPT -> "scroll"
@@ -1022,6 +1031,407 @@ class ComputerUseTest {
         rig.surface.accept = false
         assertFalse(json(rig.run("""{"type":"click_at","value":"5,5"}"""))["ok"]!!.jsonPrimitive.boolean)
         assertFalse(json(rig.run("""{"type":"key","value":"Tab"}"""))["ok"]!!.jsonPrimitive.boolean)
+        rig.dir.deleteRecursively()
+    }
+
+    // ---- D5: speed and accuracy ---------------------------------------------------------------
+
+    private fun durationMs(o: kotlinx.serialization.json.JsonObject) = o["duration_ms"]!!.jsonPrimitive.int
+
+    @Test
+    fun `read verbs take no settle and no quiet wait, action verbs do both`() {
+        val rig = Rig().apply { browser.look = lookAnswer(); browser.locate = """{"found":false,"count":0,"in_view":false}""" }
+        for (a in listOf("""{"type":"screenshot"}""", """{"type":"page_text"}""", """{"type":"locate_text","value":"x"}""", """{"type":"focused"}""", """{"type":"look"}""", """{"type":"pointer_hide"}""")) {
+            val o = json(rig.run(a))
+            assertTrue(o["ok"]!!.jsonPrimitive.boolean, "$a $o")
+            assertTrue(durationMs(o) < STEP_URL_SETTLE_MS, "$a took ${durationMs(o)} ms")
+        }
+        assertFalse(rig.log.entries.any { it.startsWith("quiet") }, rig.log.entries.toString())
+        assertTrue(STEP_NO_SETTLE_TYPES.containsAll(setOf("screenshot", "page_text", "locate_text", "focused", "look")))
+        for (a in listOf("""{"type":"click_at","value":"5,5"}""", """{"type":"key","value":"Tab"}""", """{"type":"scroll_by","value":"10"}""", """{"type":"type_text","value":"a"}""", """{"type":"click","selector":{"type":"id","value":"go"}}""")) {
+            rig.log.entries.clear()
+            assertTrue(json(rig.run(a))["ok"]!!.jsonPrimitive.boolean, a)
+            assertEquals(1, rig.log.entries.count { it == "quiet-start" }, "$a ${rig.log.entries}")
+            assertTrue(rig.log.entries.contains("quiet-poll"), a)
+        }
+        rig.dir.deleteRecursively()
+    }
+
+    private fun quietEngine(): javax.script.ScriptEngine {
+        val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        e.eval("""
+            var clock=0,timers=[],loc={href:'https://a.test/'},location=loc,observers=[];
+            var Date={now:function(){return clock;}};
+            function setTimeout(f,ms){timers.push({f:f,at:clock+ms});}
+            function MutationObserver(cb){this.cb=cb;observers.push(this);}
+            MutationObserver.prototype.observe=function(){};
+            MutationObserver.prototype.disconnect=function(){};
+            var window={MutationObserver:MutationObserver,requestAnimationFrame:function(f){setTimeout(f,16);}};
+            var document={documentElement:{}};
+            function advance(ms){var end=clock+ms;for(;;){var best=-1;
+              for(var i=0;i<timers.length;i++){if(timers[i].at<=end&&(best<0||timers[i].at<timers[best].at))best=i;}
+              if(best<0)break;var t=timers.splice(best,1)[0];clock=Math.max(clock,t.at);t.f();}
+              clock=end;}
+            function mutate(ours){observers[0].cb([{type:'attributes',target:{nodeType:1,closest:function(){return ours?{}:null;}}}]);}
+            function done(){return window.__rpaQuiet.done;}
+        """.trimIndent())
+        return e
+    }
+
+    @Test
+    fun `quiet script is one expression, waits two frames and 100 ms of calm, and is capped at 800 ms`() {
+        val js = quietStartScript()
+        assertSingleExpression(js)
+        assertTrue(js.contains("Q=100") && js.contains("CAP=800") && js.contains("MutationObserver") && js.contains("requestAnimationFrame") && js.contains("window.__rpaQuiet"))
+        assertEquals(100L, QUIET_MS); assertEquals(800L, QUIET_CAP_MS); assertEquals(30L, QUIET_POLL_MS)
+        assertSingleExpression(quietPollScript())
+        // calm page: done after the frames plus 100 ms, not before
+        var e = quietEngine(); e.eval(js)
+        e.eval("advance(90)"); assertEquals(false, e.eval("done()"))
+        e.eval("advance(50)"); assertEquals(true, e.eval("done()"))
+        // a mutation restarts the calm window
+        e = quietEngine(); e.eval(js)
+        e.eval("advance(80); mutate(false); advance(80)"); assertEquals(false, e.eval("done()"))
+        e.eval("advance(60)"); assertEquals(true, e.eval("done()"))
+        // continuous churn stops at the cap
+        e = quietEngine(); e.eval(js)
+        e.eval("for(var k=0;k<14;k++){advance(50);mutate(false);}"); assertEquals(false, e.eval("done()")) // clock 700
+        e.eval("for(var k=0;k<4;k++){advance(50);mutate(false);}"); assertEquals(true, e.eval("done()")) // clock 900
+        assertTrue((e.eval("clock") as Number).toInt() <= 900)
+        // the plugin's own overlay churn (the gliding pointer) does not count
+        e = quietEngine(); e.eval(js)
+        e.eval("advance(60); mutate(true); advance(60); mutate(true); advance(20)"); assertEquals(true, e.eval("done()"))
+        // a location change ends it early
+        e = quietEngine(); e.eval(js)
+        e.eval("advance(40); loc.href='https://a.test/next'; advance(30)"); assertEquals(true, e.eval("done()"))
+        // the poll reads the flag, and a page that dropped it (navigated) counts as done
+        assertEquals(true, e.eval(quietPollScript()))
+        e.eval("window.__rpaQuiet=undefined"); assertEquals(true, e.eval(quietPollScript()))
+    }
+
+    @Test
+    fun `the glide starts and the click follows after the lead, not after the glide`() {
+        val rig = Rig()
+        rig.run("""{"type":"click_at","value":"50,60"}""", ""","pointer":{"label":"Jev"}""")
+        val t = rig.log.times
+        val p = t.first { it.first == "pointer" }.second
+        val press = t.first { it.first == "event:Press" }.second
+        val ms = (press - p) / 1_000_000
+        assertTrue(ms >= POINTER_LEAD_MS - 5, "lead was $ms ms")
+        assertTrue(ms < POINTER_GLIDE_MS, "the click waited $ms ms, as long as the glide")
+        assertEquals(60L, POINTER_LEAD_MS)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `image defaults are 1100 px and quality 0_7, and an explicit screenshot value still wins`() {
+        assertEquals(1100, SHOT_DEFAULT_MAX_SIDE); assertEquals(0.7, SHOT_JPEG_QUALITY)
+        assertEquals(LookOptions(maxSide = 1100, quality = 0.7), LookOptions.parse(null))
+        val rig = Rig().apply { browser.look = lookAnswer() }
+        assertEquals(1100, json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject["width"]!!.jsonPrimitive.int)
+        assertEquals(900, json(rig.run("""{"type":"screenshot","value":"900"}"""))["screenshot"]!!.jsonObject["width"]!!.jsonPrimitive.int)
+        val lookShot = json(rig.run("""{"type":"look"}"""))["look"]!!.jsonObject["screenshot"]!!.jsonObject
+        assertEquals(1100, lookShot["width"]!!.jsonPrimitive.int); assertEquals(880, lookShot["height"]!!.jsonPrimitive.int)
+        val small = json(rig.run("""{"type":"look","value":"{\"max_side\":600,\"quality\":0.5}"}"""))["look"]!!.jsonObject["screenshot"]!!.jsonObject
+        assertEquals(600, small["width"]!!.jsonPrimitive.int)
+        val big = File(lookShot["path"]!!.jsonPrimitive.content).length(); val low = File(small["path"]!!.jsonPrimitive.content).length()
+        assertTrue(big > low)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `look options validate`() {
+        val o = LookOptions.parse("""{"max_side":1100,"quality":0.7,"locate":["Magnolia","Tres Leches","Magnolia"],"elements":false,"ensure_visible":true,"page_text":true}""")
+        assertEquals(LookOptions(1100, 0.7, listOf("Magnolia", "Tres Leches"), false, true, true), o)
+        for (bad in listOf("[1]", "not json", """{"max_side":100}""", """{"quality":0}""", """{"quality":1.5}""", """{"locate":"x"}""", """{"locate":[""]}""", """{"elements":"yes"}""", """{"locate":[${(1..21).joinToString(",") { "\"p$it\"" }}]}""")) {
+            assertFailsWith<IllegalArgumentException>(bad) { LookOptions.parse(bad) }
+        }
+        assertEquals("INVALID_INPUT", code { parseStepArgs(step("""{"type":"look","value":"{\"max_side\":5}"}""")) })
+        assertEquals("INVALID_INPUT", code { parseStepArgs(step("""{"type":"click","selector":{"type":"id","value":"a"},"element":"m1"}""")) })
+        assertEquals("INVALID_INPUT", code { parseStepArgs(step("""{"type":"click_at","value":"1,1","element":"12"}""")) })
+        assertEquals("m3", parseStepArgs(step("""{"type":"click_at","element":"m3"}""")).element)
+        assertEquals("INVALID_INPUT", code { parseStepArgs(step("""{"type":"click_at"}""")) })
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""locate_text","look","cu_end"""") && TabActions.STEP_SCHEMA.contains(""""element":{"type":"string""""))
+    }
+
+    private fun elJson(id: String, label: String, extra: String = "") =
+        """{"id":"$id","role":"button","tag":"button","label":"$label","x":10,"y":20,"w":80,"h":30,"disabled":false,"covered":false,"context":"Eggless Tres Leches ₹470","editable":false$extra,"xp":"/html[1]/body[1]/button[${id.drop(1)}]"}"""
+
+    private fun lookAnswer(els: List<String> = listOf(elJson("m1", "ADD")), text: String? = null, located: Map<String, String> = emptyMap()): String {
+        val o = kotlinx.serialization.json.buildJsonObject {
+            put("meta", kotlinx.serialization.json.JsonPrimitive("""{"url":"https://a.test/menu","title":"Menu","vis":"visible"}"""))
+            put("vp", kotlinx.serialization.json.JsonPrimitive("1000,800,2"))
+            put("scroll", kotlinx.serialization.json.JsonPrimitive("0,120,900"))
+            put("hash", kotlinx.serialization.json.JsonPrimitive("1a2b3c4d"))
+            put("located", kotlinx.serialization.json.buildJsonObject { located.forEach { (k, v) -> put(k, kotlinx.serialization.json.JsonPrimitive(v)) } })
+            put("els", kotlinx.serialization.json.JsonPrimitive("[" + els.joinToString(",") + "]"))
+            put("text", text?.let { kotlinx.serialization.json.JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull)
+        }
+        return o.toString()
+    }
+
+    @Test
+    fun `look result carries the screenshot, located phrases, flagged elements and omits what was not asked`() {
+        val rig = Rig().apply {
+            browser.look = lookAnswer(
+                els = listOf(
+                    elJson("m1", "Log in", ""","value_kind":"empty""""),
+                    elJson("m2", "ADD").replace(""""disabled":false""", """"disabled":true"""),
+                    elJson("m3", "Cart").replace(""""covered":false""", """"covered":true"""),
+                    elJson("m4", "Docs", ""","href_host":"docs.test""""),
+                ),
+                located = mapOf("Tres Leches" to """{"found":true,"count":2,"in_view":false,"direction":"below","screens":1.5}"""),
+            )
+        }
+        val r = json(rig.run("""{"type":"look","value":"{\"locate\":[\"Tres Leches\",\"Nowhere\"]}"}"""))
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean, r.toString())
+        val look = r["look"]!!.jsonObject
+        assertEquals(setOf("screenshot", "located", "elements"), look.keys)
+        val shot = look["screenshot"]!!.jsonObject
+        assertEquals(setOf("path", "width", "height", "css_width", "css_height", "dpr", "scroll", "content_hash", "url", "title", "visible"), shot.keys)
+        assertEquals("https://a.test/menu", shot["url"]!!.jsonPrimitive.content)
+        assertEquals("below", look["located"]!!.jsonObject["Tres Leches"]!!.jsonObject["direction"]!!.jsonPrimitive.content)
+        assertEquals(1.5, look["located"]!!.jsonObject["Tres Leches"]!!.jsonObject["screens"]!!.jsonPrimitive.double)
+        assertFalse(look["located"]!!.jsonObject["Nowhere"]!!.jsonObject["found"]!!.jsonPrimitive.boolean)
+        val els = look["elements"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("m1", "m2", "m3", "m4"), els.map { it["id"]!!.jsonPrimitive.content })
+        assertEquals(setOf("id", "role", "tag", "label", "value_kind", "rect", "disabled", "covered", "context", "editable"), els[0].keys)
+        assertEquals(setOf("x", "y", "w", "h"), els[0]["rect"]!!.jsonObject.keys)
+        assertEquals(listOf(false, true, false, false), els.map { it["disabled"]!!.jsonPrimitive.boolean })
+        assertEquals(listOf(false, false, true, false), els.map { it["covered"]!!.jsonPrimitive.boolean })
+        assertEquals("docs.test", els[3]["href_host"]!!.jsonPrimitive.content)
+        assertFalse(els.any { it.containsKey("xp") }, "the stable path stays inside rpaengine")
+        assertFalse(look.containsKey("page_text")); assertFalse(r.containsKey("screenshot"))
+        // the look script read everything in one call plus the bitmap
+        assertEquals(listOf("look", "bitmap"), rig.log.entries.filter { it in setOf("look", "bitmap", "hash", "viewport", "scroll", "focused") })
+        val withText = json(rig.run("""{"type":"look","value":"{\"page_text\":true}"}"""))
+        rig.browser.look = lookAnswer(text = "Menu text")
+        assertEquals("Menu text", json(rig.run("""{"type":"look","value":"{\"page_text\":true}"}"""))["look"]!!.jsonObject["page_text"]!!.jsonPrimitive.content)
+        assertNotNull(withText)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `look caps elements at 120, carries modal on the screenshot, popups and dialog, and fails when the page will not answer`() {
+        val rig = Rig().apply {
+            browser.meta = null
+            browser.look = lookAnswer(els = (1..150).map { elJson("m$it", "B$it") }).replace("""\"vis\":\"visible\"}""", """\"vis\":\"visible\",\"modal\":{\"label\":\"Log in\",\"role\":\"dialog\"}}""")
+        }
+        val look = json(rig.run("""{"type":"look"}"""))["look"]!!.jsonObject
+        assertEquals(120, look["elements"]!!.jsonArray.size)
+        assertEquals("Log in", look["screenshot"]!!.jsonObject["modal"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        rig.browser.look = null
+        val bad = json(rig.run("""{"type":"look"}"""))
+        assertFalse(bad["ok"]!!.jsonPrimitive.boolean); assertFalse(bad.containsKey("look"))
+        assertEquals(LOOK_MAX_ELEMENTS, 120)
+        assertTrue(lookElementsScript().contains("MAX = 120") && lookElementsScript(500).contains("MAX = 120"))
+        rig.dir.deleteRecursively()
+    }
+
+    // A small DOM for the elements and mark scripts.
+    private fun domEngine(): javax.script.ScriptEngine {
+        val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        e.eval("""
+            var NS='http://www.w3.org/1999/xhtml';
+            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(e){return {display:e.display||'block',visibility:'visible',position:e.position||'static',zIndex:e.z===undefined?'auto':String(e.z)};}};
+            function T(s){this.nodeType=3;this.nodeValue=s;}
+            function E(tag,o){this.nodeType=1;this.tagName=tag.toUpperCase();this.nodeName=this.tagName;this.localName=tag;this.namespaceURI=NS;
+              this.attrs={};this.kids=[];this.childNodes=this.kids;this.parentNode=null;this.parentElement=null;this.rect=[0,0,0,0];this.dis=false;this.ctrl=false;this.ovl=false;this.inter=false;
+              this.innerText='';for(var k in o)this[k]=o[k];}
+            E.prototype.add=function(c){c.parentNode=this;c.parentElement=this;this.kids.push(c);return c;};
+            E.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
+            E.prototype.getBoundingClientRect=function(){var r=this.rect;return {left:r[0],top:r[1],right:r[2],bottom:r[3],width:r[2]-r[0],height:r[3]-r[1]};};
+            E.prototype.matches=function(s){if(s===':disabled')return this.dis;if(s.indexOf('input,textarea')===0)return this.ctrl;return false;};
+            E.prototype.closest=function(s){if(s.indexOf('data-rpa')>=0){for(var n=this;n;n=n.parentElement)if(n.ovl)return n;return null;}return null;};
+            E.prototype.contains=function(o){for(var n=o;n;n=n.parentElement)if(n===this)return true;return false;};
+            E.prototype.querySelector=function(){return null;};
+            E.prototype.querySelectorAll=function(){var out=[];(function w(n){for(var i=0;i<n.kids.length;i++){var c=n.kids[i];if(c.nodeType===1){if(c.inter)out.push(c);w(c);}}})(this);return out;};
+            Object.defineProperty(E.prototype,'previousSibling',{get:function(){if(!this.parentNode)return null;var k=this.parentNode.kids,i=k.indexOf(this);return i>0?k[i-1]:null;}});
+            Object.defineProperty(E.prototype,'previousElementSibling',{get:function(){if(!this.parentNode)return null;var k=this.parentNode.kids,i=k.indexOf(this);while(--i>=0)if(k[i].nodeType===1)return k[i];return null;}});
+            Object.defineProperty(E.prototype,'textContent',{get:function(){var s='';(function w(n){for(var i=0;i<n.kids.length;i++){var c=n.kids[i];if(c.nodeType===3)s+=c.nodeValue;else w(c);}})(this);return s;}});
+            var html=new E('html'),body=html.add(new E('body'));
+            var all=[],dialogs=[],stack=function(x,y){return [];};
+            var document={documentElement:html,body:body,baseURI:'https://a.test/',
+              querySelectorAll:function(s){return s.indexOf('role=dialog')>=0?dialogs:all;},
+              elementsFromPoint:function(x,y){return stack(x,y);},elementFromPoint:function(){return null;},getElementById:function(){return null;}};
+            function btn(parent,label,rect,o){var b=parent.add(new E('button',{rect:rect,inter:true,innerText:label}));b.add(new T(label));all.push(b);for(var k in o)b[k]=o[k];return b;}
+        """.trimIndent())
+        return e
+    }
+
+    private fun domElements(e: javax.script.ScriptEngine, max: Int = LOOK_MAX_ELEMENTS): List<RawLookElement> =
+        TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(RawLookElement.serializer()), e.eval(lookElementsScript(max)) as String)
+
+    @Test
+    fun `elements script keeps disabled and covered, skips overlays and off-screen, lists modal first, and adds context`() {
+        assertSingleExpression(lookElementsScript())
+        val e = domElements0()
+        val els = domElements(e)
+        assertEquals(listOf("m1", "m2", "m3", "m4", "m5", "m6"), els.map { it.id })
+        // modal first: its button leads even though it comes last in the document
+        assertEquals("OK", els[0].label)
+        val byLabel = els.associateBy { it.label }
+        assertTrue(byLabel.getValue("ADD").covered, "the modal sits on top of the page behind it")
+        assertFalse(byLabel.getValue("OK").covered)
+        assertEquals(true, byLabel.getValue("Sold out").disabled)
+        assertEquals("Eggless Tres Leches ₹470", byLabel.getValue("ADD").context)
+        assertEquals("Menu", byLabel.getValue("Sold out").context.takeIf { it.isNotEmpty() } ?: "Menu")
+        assertFalse(els.any { it.label == "Overlay" || it.label == "Far away" })
+        assertEquals(40, byLabel.getValue("ADD").x); assertEquals(100, byLabel.getValue("ADD").y)
+        assertEquals(60, byLabel.getValue("ADD").w)
+        // typed values never leave the page; only their presence does
+        val q = byLabel.getValue("Search")
+        assertEquals("text", q.valueKind); assertTrue(q.editable)
+        assertFalse(e.eval(lookElementsScript()).toString().contains("hunter2"))
+        assertEquals("checked", byLabel.getValue("Eggless").valueKind)
+        assertEquals("selected:Large", byLabel.getValue("Size").valueKind)
+        assertNull(byLabel.getValue("ADD").valueKind)
+        assertTrue(els.all { it.xp!!.startsWith("/html[1]/body[1]") })
+        assertTrue(lookElementsScript().let { it.contains("window.__rpaMarks") && it.contains("data-rpa") })
+    }
+
+    private fun domElements0(): javax.script.ScriptEngine {
+        val e = domEngine()
+        e.eval("""
+            var card=body.add(new E('div',{rect:[0,80,400,140]}));card.add(new T('Eggless Tres Leches ₹470 '));
+            var add=btn(card,'ADD',[40,100,100,130]);
+            var soldRow=body.add(new E('div',{rect:[0,150,400,200]}));soldRow.add(new E('h3',{innerText:'Menu'}));
+            var sold=btn(soldRow,'Sold out',[40,160,100,190],{dis:true});
+            btn(body,'Overlay',[0,0,50,50],{ovl:true});
+            btn(body,'Far away',[0,3000,50,3040]);
+            var s=body.add(new E('input',{rect:[10,300,200,330],inter:true,ctrl:true,value:'hunter2'}));s.attrs={type:'text','aria-label':'Search'};all.push(s);
+            var c=body.add(new E('input',{rect:[10,340,30,360],inter:true,ctrl:true,checked:true}));c.attrs={type:'checkbox','aria-label':'Eggless'};all.push(c);
+            var sel=body.add(new E('select',{rect:[10,370,200,400],inter:true,ctrl:true,selectedIndex:1,options:[{label:'Small'},{label:'Large'}]}));sel.attrs={'aria-label':'Size'};all.push(sel);
+            var dlg=body.add(new E('div',{rect:[300,200,700,600]}));dlg.attrs={role:'dialog','aria-label':'Log in'};dialogs.push(dlg);
+            var ok=btn(dlg,'OK',[400,500,460,530]);
+            stack=function(x,y){if(x>=400&&x<=460&&y>=500&&y<=530)return [ok,dlg];return [dlg];};
+        """.trimIndent())
+        return e
+    }
+
+    @Test
+    fun `the elements script caps at 120 and falls back to the preceding heading for context`() {
+        val e = domEngine()
+        e.eval("""
+            for(var i=0;i<130;i++){btn(body,'B'+i,[0,i*5,50,i*5+4]);}
+        """.trimIndent())
+        val els = domElements(e)
+        assertEquals(120, els.size)
+        assertEquals("m120", els.last().id)
+        val e2 = domEngine()
+        e2.eval("""
+            body.add(new E('h2',{innerText:'Desserts'}));var row=body.add(new E('div',{rect:[0,0,300,100]}));btn(row,'ADD',[10,10,60,40]);
+        """.trimIndent())
+        assertEquals("Desserts", domElements(e2).single().context)
+    }
+
+    @Test
+    fun `mark script clicks the visible centre, and reports disabled, covered by label or modal, and gone`() {
+        val e = domElements0()
+        val els = domElements(e)
+        fun ref(label: String) = els.first { it.label == label }.let { it.id to MarkRef(it.xp, it.label, it.tag) }
+        fun mark(label: String): MarkAnswer { val (id, r) = ref(label); return TabJson.decodeFromString(MarkAnswer.serializer(), e.eval(markScript(id, r)) as String) }
+        assertSingleExpression(markScript("m1", MarkRef("/html[1]", "x", "button")))
+        val ok = mark("OK")
+        assertEquals(MarkAnswer("ok", 430, 515, "OK", "button"), ok)
+        assertEquals("disabled", mark("Sold out").state)
+        val covered = mark("ADD")
+        assertEquals("covered", covered.state); assertEquals("Log in", covered.cover) // the modal's label
+        // covered by an ordinary element: its label
+        e.eval("var banner=body.add(new E('div',{rect:[0,0,1000,60]}));banner.attrs={'aria-label':'Cookie banner'};dialogs.length=0;stack=function(x,y){return [banner];};add.rect=[40,20,100,50];")
+        val byBanner = mark("ADD")
+        assertEquals("covered", byBanner.state); assertEquals("Cookie banner", byBanner.cover)
+        // a point inside the element that is free is used even when its centre is covered
+        e.eval("stack=function(x,y){return (x>=60&&x<=80&&y>=20&&y<=50)?[banner]:[];};")
+        assertEquals("ok", mark("ADD").state)
+        // gone: detached from the page and no usable path
+        e.eval("all.length=0; card.kids.length=0; card.parentNode.kids.splice(card.parentNode.kids.indexOf(card),1); card.parentElement=null; card.parentNode=null;")
+        assertEquals("gone", mark("ADD").state)
+        assertEquals("gone", TabJson.decodeFromString(MarkAnswer.serializer(), e.eval(markScript("m99", MarkRef(null, "x", "button"))) as String).state)
+    }
+
+    private fun lookRig(): Rig = Rig().apply { browser.look = lookAnswer(els = listOf(elJson("m1", "ADD"), elJson("m2", "Sold out"))) }
+
+    @Test
+    fun `click_at by element id clicks the resolved point and reports clicked`() {
+        val rig = lookRig()
+        rig.run("""{"type":"look"}""")
+        rig.browser.mark = """{"state":"ok","x":430,"y":515,"label":"ADD","tag":"button"}"""
+        val o = json(rig.run("""{"type":"click_at","element":"m1","value":"10,20"}"""))
+        assertTrue(o["ok"]!!.jsonPrimitive.boolean, o.toString())
+        assertEquals(listOf<TabEvent>(TabEvent.Move(430, 515), TabEvent.Press(430, 515), TabEvent.Release(430, 515)), rig.surface.events)
+        assertEquals("m1", o["clicked"]!!.jsonObject["id"]!!.jsonPrimitive.content)
+        assertEquals("ADD", o["clicked"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        assertEquals("button", o["clicked"]!!.jsonObject["tag"]!!.jsonPrimitive.content)
+        assertTrue(rig.log.entries.contains("mark"))
+        // a plain click_at has no clicked
+        assertFalse(json(rig.run("""{"type":"click_at","value":"5,5"}"""))["clicked"] != null)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `click_at by element id refuses a disabled or covered element without clicking`() {
+        val rig = lookRig()
+        rig.run("""{"type":"look"}""")
+        rig.surface.events.clear()
+        rig.browser.mark = """{"state":"disabled","label":"ADD","tag":"button"}"""
+        val d = json(rig.run("""{"type":"click_at","element":"m1","value":"10,20"}"""))
+        assertFalse(d["ok"]!!.jsonPrimitive.boolean)
+        assertEquals("'ADD' is disabled", d["error"]!!.jsonPrimitive.content)
+        rig.browser.mark = """{"state":"covered","label":"ADD","tag":"button","cover":"Log in"}"""
+        val c = json(rig.run("""{"type":"click_at","element":"m1","value":"10,20"}"""))
+        assertFalse(c["ok"]!!.jsonPrimitive.boolean)
+        assertEquals("'ADD' is covered by Log in", c["error"]!!.jsonPrimitive.content)
+        assertTrue(rig.surface.events.isEmpty())
+        assertFalse(c.containsKey("clicked"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `click_at by element id falls back to x,y when the element is gone, and fails without one`() {
+        val rig = lookRig()
+        rig.run("""{"type":"look"}""")
+        rig.surface.events.clear()
+        rig.browser.mark = """{"state":"gone"}"""
+        val g = json(rig.run("""{"type":"click_at","element":"m1","value":"120,340"}"""))
+        assertTrue(g["ok"]!!.jsonPrimitive.boolean, g.toString())
+        assertEquals(TabEvent.Press(120, 340), rig.surface.events.filterIsInstance<TabEvent.Press>().single())
+        assertFalse(g.containsKey("clicked"))
+        rig.surface.events.clear()
+        val n = json(rig.run("""{"type":"click_at","element":"m1"}"""))
+        assertFalse(n["ok"]!!.jsonPrimitive.boolean)
+        assertTrue(n["error"]!!.jsonPrimitive.content.contains("gone"))
+        assertTrue(rig.surface.events.isEmpty())
+        // an id the latest look never had is gone too, without asking the page
+        rig.log.entries.clear()
+        val u = json(rig.run("""{"type":"click_at","element":"m77","value":"7,8"}"""))
+        assertTrue(u["ok"]!!.jsonPrimitive.boolean)
+        assertFalse(rig.log.entries.contains("mark"))
+        // a new look replaces the marks
+        rig.browser.look = lookAnswer(els = listOf(elJson("m5", "Next")))
+        rig.run("""{"type":"look"}""")
+        rig.log.entries.clear()
+        rig.run("""{"type":"click_at","element":"m1","value":"7,8"}""")
+        assertFalse(rig.log.entries.contains("mark"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `type_text by element clicks it first and then types`() {
+        val rig = Rig().apply { browser.look = lookAnswer(els = listOf(elJson("m1", "Search", ""","editable":true"""))) }
+        rig.run("""{"type":"look"}""")
+        rig.browser.mark = """{"state":"ok","x":200,"y":315,"label":"Search","tag":"input"}"""
+        val o = json(rig.run("""{"type":"type_text","element":"m1","value":"Hi"}"""))
+        assertTrue(o["ok"]!!.jsonPrimitive.boolean, o.toString())
+        assertEquals("m1", o["clicked"]!!.jsonObject["id"]!!.jsonPrimitive.content)
+        val ev = rig.surface.events
+        assertTrue(ev.indexOfFirst { it is TabEvent.Press } in 0 until ev.indexOfFirst { it is TabEvent.KeyDown })
+        assertEquals(listOf("KEY_CODE_H", "KEY_CODE_I"), ev.filterIsInstance<TabEvent.KeyDown>().map { it.code })
+        // a disabled element is not typed into
+        rig.surface.events.clear()
+        rig.browser.mark = """{"state":"disabled","label":"Search","tag":"input"}"""
+        val d = json(rig.run("""{"type":"type_text","element":"m1","value":"Hi"}"""))
+        assertFalse(d["ok"]!!.jsonPrimitive.boolean); assertTrue(rig.surface.events.isEmpty())
         rig.dir.deleteRecursively()
     }
 }

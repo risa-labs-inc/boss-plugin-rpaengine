@@ -8,6 +8,9 @@ import kotlin.time.Clock
 /** Called with the JS expression resolving an element that is about to be acted on. */
 internal typealias ElementHook = suspend (browser: BrowserIntegration, locate: String) -> Unit
 
+/** Waits for the page to go quiet after an action, instead of sleeping a fixed time (see [awaitQuiet]). */
+internal typealias QuietFn = suspend (browser: BrowserIntegration) -> Unit
+
 /**
  * Executes one plan action against a real browser. Shared by the panel's run loop and the
  * `rpa_step` MCP tool so both have the same verbs and the same failure semantics.
@@ -31,7 +34,10 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
         action: RpaActionConfig,
         beforeAct: ElementHook? = null,
         inputGuard: String? = null,
+        /** Replaces the fixed post-action sleeps of click/input/select/keypress/scroll (rpa_step's quiet wait). */
+        quiet: QuietFn? = null,
     ): Pair<Boolean, String?> {
+        suspend fun settle(fixedMs: Long) { if (quiet != null) quiet(browser) else delay(fixedMs) }
         return try {
             when (action.type) {
                 ActionTypes.NAVIGATE -> {
@@ -74,7 +80,7 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                             "el.click();",
                             "No element matched ${action.selector.value}",
                         ) ?: return Pair(false, unsupportedSelector(action.selector))
-                    delay(ActionTiming.ACTION_SETTLE_MS)
+                    settle(ActionTiming.ACTION_SETTLE_MS)
                     outcome
                 }
                 ActionTypes.INPUT -> {
@@ -90,7 +96,7 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                             "Could not type into '${action.selector.value}' (no match, or it has no value)",
                             inputGuard,
                         ) ?: return Pair(false, unsupportedSelector(action.selector))
-                    delay(ActionTiming.INPUT_SETTLE_MS)
+                    settle(ActionTiming.INPUT_SETTLE_MS)
                     outcome
                 }
                 ActionTypes.SELECT -> {
@@ -106,7 +112,7 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                             selectOptionScript(value),
                             "No option '$value' in '${action.selector.value}'",
                         ) ?: return Pair(false, unsupportedSelector(action.selector))
-                    delay(ActionTiming.INPUT_SETTLE_MS)
+                    settle(ActionTiming.INPUT_SETTLE_MS)
                     outcome
                 }
                 // Enter in a search field is how most of the web is driven, so this is not an
@@ -145,7 +151,7 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                                 "No element matched ${action.selector.value}",
                             ) ?: return Pair(false, unsupportedSelector(action.selector))
                         }
-                    delay(ActionTiming.ACTION_SETTLE_MS)
+                    settle(ActionTiming.ACTION_SETTLE_MS)
                     outcome
                 }
                 ActionTypes.SUBMIT -> {
@@ -215,7 +221,7 @@ internal class ActionRunner(private val log: (LogLevel, String) -> Unit) {
                             "(function () { try { window.scrollTo($x, $y); return true; } " +
                                 "catch (e) { return 'threw: ' + e.message; } })();",
                         )
-                    delay(ActionTiming.ACTION_SETTLE_MS)
+                    settle(ActionTiming.ACTION_SETTLE_MS)
                     if (scrolled.isJsTrue()) Pair(true, null) else Pair(false, "Could not scroll: $scrolled")
                 }
                 ActionTypes.ASSERT -> {
