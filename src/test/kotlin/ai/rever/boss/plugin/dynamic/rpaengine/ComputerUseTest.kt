@@ -1447,4 +1447,50 @@ class ComputerUseTest {
         assertFalse(d["ok"]!!.jsonPrimitive.boolean); assertTrue(rig.surface.events.isEmpty())
         rig.dir.deleteRecursively()
     }
+
+    private fun pointerDomEngine(popover: Boolean): javax.script.ScriptEngine {
+        val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        e.eval("""
+            var calls=[],popoverOk=$popover,byId={};
+            function El(tag){this.tagName=tag;this.attrs={};this.kids=[];this.parentNode=null;this.offsetWidth=1;this.open=false;
+              var self=this;this.style={cssText:'',setProperty:function(){}};
+              if(popoverOk){this.showPopover=function(){if(!self.attrs.popover)throw new Error('NotSupportedError');self.open=true;calls.push('show:'+(self.id||self.tagName));};
+                this.hidePopover=function(){self.open=false;calls.push('hide:'+(self.id||self.tagName));};}}
+            El.prototype.setAttribute=function(n,v){this.attrs[n]=v;};
+            El.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
+            El.prototype.hasAttribute=function(n){return this.attrs.hasOwnProperty(n);};
+            El.prototype.matches=function(s){return s===':popover-open'&&this.open;};
+            El.prototype.appendChild=function(c){c.parentNode=this;this.kids.push(c);if(c.id)byId[c.id]=c;return c;};
+            El.prototype.remove=function(){};
+            El.prototype.querySelector=function(){return this.kids[1]||null;};
+            var document={body:new El('body'),documentElement:new El('html'),
+              getElementById:function(i){return byId[i]||null;},createElement:function(t){return new El(t);},createElementNS:function(n,t){return new El(t);}};
+            Object.defineProperty(El.prototype,'textContent',{set:function(v){},get:function(){return '';}});
+        """.trimIndent())
+        return e
+    }
+
+    @Test
+    fun `pointer is a manual popover raised to the top layer on every glide, with the z-index fallback`() {
+        val js = pointerScript(300, 200, 10 to 20, PointerSpec(), ripple = true)
+        assertSingleExpression(js)
+        assertTrue(js.contains("showPopover") && js.contains("hidePopover") && js.contains(":popover-open") && js.contains("typeof root.showPopover==='function'"))
+        assertTrue(js.contains("setAttribute('popover','manual')"))
+        assertTrue(js.contains("z-index:2147483647") && js.contains("pointer-events:none") && js.contains("margin:0;padding:0;border:0;background:transparent;overflow:visible;inset:auto;"))
+        assertTrue(js.contains("r.showPopover()"), "the ripple joins the top layer after the pointer")
+        // supported: shown on creation, hidden then shown on each later glide
+        val e = pointerDomEngine(true)
+        e.eval(pointerScript(5, 6, null, PointerSpec(), false))
+        assertEquals("show:__rpa_pointer", e.eval("calls.join(',')") as String)
+        e.eval("calls.length=0")
+        e.eval(pointerScript(50, 60, 5 to 6, PointerSpec(), false))
+        assertEquals("hide:__rpa_pointer,show:__rpa_pointer", (e.eval("calls.join(',')") as String))
+        assertEquals("manual", e.eval("document.getElementById('__rpa_pointer').attrs.popover"))
+        // unsupported: no popover calls, still injected, no throw
+        val f = pointerDomEngine(false)
+        assertEquals("ok", f.eval(pointerScript(5, 6, null, PointerSpec(), false)))
+        assertEquals("ok", f.eval(pointerScript(7, 8, 5 to 6, PointerSpec(), true)))
+        assertEquals(0, (f.eval("calls.length") as Number).toInt())
+        assertEquals(true, f.eval("document.getElementById('__rpa_pointer')!==null"))
+    }
 }

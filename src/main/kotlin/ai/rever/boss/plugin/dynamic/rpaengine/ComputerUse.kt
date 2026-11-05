@@ -835,6 +835,14 @@ internal const val POINTER_GLIDE_MS = 260L
 
 /** The glide starts, and the input follows this long after: the click never waits for the pointer to arrive. */
 internal const val POINTER_LEAD_MS = 60L
+/**
+ * The pointer is a manual popover: the browser's top layer sits above any z-index, so it stays over <dialog>.showModal(),
+ * other popovers and fullscreen. Hiding then showing re-raises it above whatever opened since. Falls back to the
+ * z-index approach where popovers are unsupported.
+ */
+private const val POPOVER_RAISE_JS =
+    "try{if(typeof root.showPopover==='function'){if(!root.hasAttribute('popover')){root.setAttribute('popover','manual');}if(root.matches(':popover-open')){root.hidePopover();}root.showPopover();}}catch(e){}"
+
 internal const val POINTER_ID = "__rpa_pointer"
 internal const val POINTER_ATTR = "data-rpa-pointer"
 
@@ -857,8 +865,8 @@ var d=document,id=${POINTER_ID.asJsString()},root=d.getElementById(id);
 function st(e,css){e.style.cssText='all:initial;'+css;return e;}
 if(root&&root.getAttribute('data-rpa-color')!=='$color'){root.remove();root=null;}
 if(!root){
-root=st(d.createElement('div'),'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;display:block;transform:translate(${fx}px,${fy}px);transition:transform ${POINTER_GLIDE_MS}ms cubic-bezier(.2,.7,.2,1);');
-root.id=id;root.setAttribute('$POINTER_ATTR','1');root.setAttribute('data-rpa-color','$color');root.setAttribute('aria-hidden','true');
+root=st(d.createElement('div'),'position:fixed;margin:0;padding:0;border:0;background:transparent;overflow:visible;inset:auto;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;display:block;transform:translate(${fx}px,${fy}px);transition:transform ${POINTER_GLIDE_MS}ms cubic-bezier(.2,.7,.2,1);');
+root.id=id;root.setAttribute('$POINTER_ATTR','1');try{root.setAttribute('popover','manual');}catch(e){}root.setAttribute('data-rpa-color','$color');root.setAttribute('aria-hidden','true');
 var ns='http://www.w3.org/2000/svg',svg=d.createElementNS(ns,'svg');
 svg.setAttribute('width','22');svg.setAttribute('height','26');svg.setAttribute('viewBox','0 0 22 26');
 svg.style.cssText='position:absolute;left:-2px;top:-1px;overflow:visible;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35));';
@@ -873,6 +881,7 @@ void root.offsetWidth;
 }
 var lab=root.querySelector('[data-rpa-label]');if(lab)lab.textContent=${label.asJsString()};
 if(root.parentNode!==(d.body||d.documentElement))(d.body||d.documentElement).appendChild(root);
+$POPOVER_RAISE_JS
 root.style.transform='translate(${x}px,${y}px)';
 ${if (ripple) rippleJs(x, y, color) else ""}
 return 'ok';
@@ -883,6 +892,7 @@ return 'ok';
 private fun rippleJs(x: Int, y: Int, color: String): String =
     """try{var r=st(d.createElement('div'),'position:fixed;left:${x - 14}px;top:${y - 14}px;width:28px;height:28px;border-radius:50%;border:2px solid $color;box-sizing:border-box;z-index:2147483646;pointer-events:none;display:block;opacity:0;');
 r.setAttribute('$POINTER_ATTR','1');(d.body||d.documentElement).appendChild(r);
+try{if(typeof r.showPopover==='function'){r.setAttribute('popover','manual');r.showPopover();}}catch(e){}
 if(r.animate){var a=r.animate([{transform:'scale(.3)',opacity:.9},{transform:'scale(1.6)',opacity:0}],{duration:450,delay:$POINTER_GLIDE_MS,easing:'ease-out',fill:'both'});a.onfinish=function(){r.remove();};}
 else{r.remove();}}catch(e){}"""
 
