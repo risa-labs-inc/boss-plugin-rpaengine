@@ -62,9 +62,9 @@ class TabActionsTest {
         )
         val json = TabJson.encodeToString(ObserveResult.serializer(), buildObserveResult("t1", snapshot))
         assertEquals(
-            """{"tab_id":"t1","url":"https://x.test/","title":"X Test","truncated":true,"elements":[""" +
-                """{"id":"e1","role":"button","tag":"button","label":"Sign in","type":"submit","placeholder":null,"href":null,"image":null,"options":null,"checked":null,"sensitive":false,"in_viewport":true,"selector":{"type":"id","value":"go"}},""" +
-                """{"id":"e2","role":"combobox","tag":"select","label":null,"type":null,"placeholder":null,"href":null,"image":null,"options":["One"],"checked":null,"sensitive":false,"in_viewport":false,"selector":{"type":"css","value":"select[name=\"s\"]"}}]}""",
+            """{"tab_id":"t1","url":"https://x.test/","title":"X Test","truncated":true,"modal":null,"elements":[""" +
+                """{"id":"e1","role":"button","tag":"button","label":"Sign in","type":"submit","placeholder":null,"href":null,"image":null,"options":null,"checked":null,"sensitive":false,"in_viewport":true,"selector":{"type":"id","value":"go"},"covered":false},""" +
+                """{"id":"e2","role":"combobox","tag":"select","label":null,"type":null,"placeholder":null,"href":null,"image":null,"options":["One"],"checked":null,"sensitive":false,"in_viewport":false,"selector":{"type":"css","value":"select[name=\"s\"]"},"covered":false}]}""",
             json,
         )
     }
@@ -138,14 +138,13 @@ class TabActionsTest {
     fun `step result has the contract shape`() {
         assertEquals(
             """{"ok":false,"error":"No element matched #x","url_before":"a","url_after":"a","navigated":false,"duration_ms":12,"download":null}""",
-            TabJson.encodeToString(StepResult.serializer(), StepResult(false, "No element matched #x", "a", "a", false, 12)),
+            stepResultJson(StepResult(false, "No element matched #x", "a", "a", false, 12)),
         )
         assertEquals(
             """{"ok":true,"error":null,"url_before":"a","url_after":"a","navigated":false,"duration_ms":5,""" +
                 """"download":{"url":"https://x.test/a.jpg","file":"a.jpg","bytes":null,"method":"direct",""" +
                 """"save_verified":false,"note":"${downloadNote(DOWNLOAD_METHOD_DIRECT, null)}"}}""",
-            TabJson.encodeToString(
-                StepResult.serializer(),
+            stepResultJson(
                 StepResult(
                     true, null, "a", "a", false, 5,
                     DownloadInfo("https://x.test/a.jpg", "a.jpg", null, DOWNLOAD_METHOD_DIRECT, note = downloadNote(DOWNLOAD_METHOD_DIRECT, null)),
@@ -281,7 +280,7 @@ class TabActionsTest {
         val b = FakeBrowser()
         TabActions { FakeTabs(mapOf("t" to b)) }
             .step("""{"tab_id":"t","action":{"type":"click","selector":{"type":"css","value":"#go"}},"highlight_ms":0}""")
-        assertTrue(b.scripts.none { it.contains(HIGHLIGHT_ATTR) })
+        assertTrue(b.scripts.none { it.contains(HIGHLIGHT_ATTR) && !it.contains("/*rpa-quiet*/") })
     }
 
     @Test

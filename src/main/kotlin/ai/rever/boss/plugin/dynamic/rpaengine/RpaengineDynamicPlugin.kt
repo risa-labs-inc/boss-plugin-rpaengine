@@ -25,6 +25,7 @@ class RpaengineDynamicPlugin : DynamicPlugin {
     // Most recently created panel component, so MCP tools can drive the engine.
     @Volatile
     private var lastComponent: RpaengineComponent? = null
+    private var tabActions: TabActions? = null
 
     // Every open panel, so rpa_step can refuse a tab any of their runs is driving.
     private val liveComponents = CopyOnWriteArraySet<RpaengineComponent>()
@@ -61,12 +62,14 @@ class RpaengineDynamicPlugin : DynamicPlugin {
                 { lastComponent },
                 TabActions(busyTabIds = { liveComponents.mapNotNullTo(HashSet()) { it.liveRunTabId() } }) {
                     activeTabsProvider
-                },
+                }.also { tabActions = it },
             ),
         )
     }
 
     override fun dispose() {
+        runCatching { tabActions?.dispose() }
+        tabActions = null
         lastComponent = null
         liveComponents.clear()
     }

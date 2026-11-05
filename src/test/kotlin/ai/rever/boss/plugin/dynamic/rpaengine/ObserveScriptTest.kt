@@ -262,7 +262,7 @@ class ObserveScriptTest {
     @Test
     fun `innerText is gated on non-entry elements`() {
         val js = observeScript(80)
-        assertEquals(1, Regex("""innerText""").findAll(js).count())
+        assertEquals(1, Regex("""innerText""").findAll(js.replace(MODAL_JS, "")).count()) // the modal label reads only heading/aria text
         assertTrue(js.contains("if (!entry(el, tag, role)) { s = el.querySelector(CONTROLS) ? textOf(el) : norm(el.innerText)"))
     }
 
@@ -355,10 +355,11 @@ class ObserveScriptTest {
     fun `computed style only runs on candidates taken, stopping past MAX`() {
         val js = observeScript(80)
         // Rects bucket every candidate; styledVisible runs inside take(), which stops at MAX + 1.
-        assertTrue(js.contains("if (hasSize(r)) { (rectInView(r) ? inv : outv).push(all[i]); }"))
+        assertTrue(js.contains("(rectInView(r) ? (inM ? minv : inv) : (inM ? moutv : outv)).push(all[i]); }"))
         assertTrue(js.contains("i < list.length && seen.length <= MAX; i++) { var el = list[i]; if (!disabled(el) && styledVisible(el))"))
-        assertTrue(js.contains("take(inv, true); take(outv, false);"), "in-viewport first")
-        assertEquals(1, Regex("""getComputedStyle""").findAll(js).count(), "one getComputedStyle, in styledVisible")
+        assertTrue(js.contains("take(minv, true); take(moutv, false); take(inv, true); take(outv, false);"), "modal first, then in-viewport first")
+        // Modal detection (a handful of nodes) has its own two; everything else styles through styledVisible only.
+        assertEquals(1, Regex("""getComputedStyle""").findAll(js.replace(MODAL_JS, "")).count(), "one getComputedStyle, in styledVisible")
     }
 
     @Test
