@@ -276,17 +276,24 @@ internal data class Viewport(val width: Int, val height: Int, val dpr: Double) {
     }
 }
 
-/** The page's address and title, so a screenshot carries them without a separate observe. */
+/** The page's address, title and visibility, so a screenshot carries them without a separate observe. */
 @Serializable
-internal data class PageMeta(val url: String? = null, val title: String? = null) {
+internal data class PageMeta(val url: String? = null, val title: String? = null, val vis: String? = null) {
+    /** document.visibilityState == 'visible'; null when the page did not say. */
+    val visible: Boolean? get() = vis?.let { it == "visible" }
+
     companion object {
-        const val SCRIPT = "(function(){try{return JSON.stringify({url:String(location.href||''),title:String(document.title||'')});}catch(e){return null;}})()"
+        const val SCRIPT = "(function(){try{return JSON.stringify({url:String(location.href||''),title:String(document.title||''),vis:String(document.visibilityState||'')});}catch(e){return null;}})()"
 
         fun parse(answer: Any?): PageMeta? =
             (answer as? String)?.let { runCatching { TabJson.decodeFromString(serializer(), it) }.getOrNull() }
-                ?.let { PageMeta(it.url?.takeIf(String::isNotEmpty)?.take(2000), it.title?.takeIf(String::isNotEmpty)?.take(300)) }
+                ?.let { PageMeta(it.url?.takeIf(String::isNotEmpty)?.take(2000), it.title?.takeIf(String::isNotEmpty)?.take(300), it.vis?.takeIf(String::isNotEmpty)) }
     }
 }
+
+internal const val REVEAL_POLL_MS = 50L
+internal const val REVEAL_TIMEOUT_MS = 1_500L
+internal const val REVEAL_FRAME_MS = 120L
 
 /** The page scroll position, so a caller can see progress without pixels. */
 @Serializable
@@ -321,6 +328,10 @@ internal data class ScreenshotInfo(
     /** location.href and document.title; each omitted when the page would not say. */
     val url: String? = null,
     val title: String? = null,
+    /** document.visibilityState == 'visible' when captured; a hidden tab's bitmap can be stale. */
+    val visible: Boolean? = null,
+    /** True when ensure_visible had to select the tab first. */
+    val revealed: Boolean? = null,
 )
 
 /** What holds keyboard focus. Never the field's value. */
@@ -963,6 +974,8 @@ internal class ComputerUse(
         allowSensitive: Boolean,
         snap: SnapBox? = null,
         hideOverlay: Boolean = false,
+        /** screenshot with ensure_visible: selects the tab; null for popups and when not asked. */
+        reveal: (suspend () -> Unit)? = null,
     ): CuOutcome {
         val value = action.value
         if (action.type != CuTypes.CU_END && action.type != CuTypes.DIALOG_ANSWER) startCapture(browser, tabId)
@@ -1006,7 +1019,7 @@ internal class ComputerUse(
                 val surface = surfaceNow(browser, tabId)
                     ?: return CuOutcome(false, "Screenshots and real input need a JxBrowser tab; none is behind this one")
                 when (action.type) {
-                    CuTypes.SCREENSHOT -> screenshot(browser, surface, tabId, value?.trim()?.toIntOrNull() ?: SHOT_DEFAULT_MAX_SIDE, hideOverlay)
+                    CuTypes.SCREENSHOT -> screenshot(browser, surface, tabId, value?.trim()?.toIntOrNull() ?: SHOT_DEFAULT_MAX_SIDE, hideOverlay, reveal)
                     CuTypes.CLICK_AT -> clickAt(browser, surface, tabId, value, pointer, snap)
                     CuTypes.TYPE_TEXT -> typeText(browser, surface, value.orEmpty(), allowSensitive)
                     CuTypes.KEY -> key(surface, value)
@@ -1030,6 +1043,9 @@ internal class ComputerUse(
         delay(POINTER_GLIDE_MS + 40)
     }
 
+    private suspend fun readMeta(browser: BrowserIntegration): PageMeta? =
+        PageMeta.parse(orNullUnlessCancelled { browser.executeJavaScript(PageMeta.SCRIPT) })
+
     private suspend fun readViewport(browser: BrowserIntegration): Viewport? =
         Viewport.parse(orNullUnlessCancelled { browser.executeJavaScript(Viewport.SCRIPT) })
 
@@ -1038,10 +1054,23 @@ internal class ComputerUse(
             ?.let { runCatching { TabJson.decodeFromString(FocusedInfo.serializer(), it) }.getOrNull() }
             ?.takeIf { it.tag != null }
 
-    private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int, hideOverlay: Boolean): CuOutcome {
+    private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int, hideOverlay: Boolean, reveal: (suspend () -> Unit)?): CuOutcome {
+        var meta = readMeta(browser)
+        var revealed = false
+        if (reveal != null && meta?.visible == false) {
+            // A hidden tab's bitmap is stale (paint-only changes never show): select it, wait for 'visible', give it a frame.
+            revealed = runCatching { reveal(); true }.getOrDefault(false)
+            if (revealed) {
+                var waited = 0L
+                while (waited < REVEAL_TIMEOUT_MS && meta?.visible != true) {
+                    delay(REVEAL_POLL_MS); waited += REVEAL_POLL_MS
+                    meta = readMeta(browser)
+                }
+                if (meta?.visible == true) delay(REVEAL_FRAME_MS)
+            }
+        }
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         val scroll = ScrollInfo.parse(orNullUnlessCancelled { browser.executeJavaScript(ScrollInfo.SCRIPT) })
-        val meta = PageMeta.parse(orNullUnlessCancelled { browser.executeJavaScript(PageMeta.SCRIPT) })
         val contentHash = (orNullUnlessCancelled { browser.executeJavaScript(contentHashScript()) } as? String)?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
         // Default: the pointer stays untouched (no DOM churn, no flicker between actions). hide_overlay removes the
         // overlay nodes for the capture and puts the pointer back at its remembered spot, without a glide.
@@ -1062,7 +1091,7 @@ internal class ComputerUse(
         } ?: return CuOutcome(false, "The browser returned no bitmap")
         val (w, h) = fitShotSize(image.width, image.height, maxSide)
         val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h)))
-        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash, meta?.url, meta?.title))
+        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }))
     }
 
     private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, snap: SnapBox? = null): CuOutcome {

@@ -257,10 +257,10 @@ class ComputerUseTest {
         }
     }
 
-    private class FakeTabs(private val b: BrowserIntegration) : ActiveTabsProvider {
+    private class FakeTabs(private val b: BrowserIntegration, private val onSelect: (String, String) -> Unit = { _, _ -> }) : ActiveTabsProvider {
         override val activeTabs: StateFlow<List<ActiveTabData>> = MutableStateFlow(listOf(ActiveTabData("t", "t", "t", "w", "w", "p", "win")))
         override suspend fun refreshTabs() {}
-        override fun selectTab(tabId: String, panelId: String) {}
+        override fun selectTab(tabId: String, panelId: String) { onSelect(tabId, panelId) }
         override fun getTabUrl(tabId: String): String? = null
         override fun getFaviconCacheKey(tabId: String): String? = null
         @Composable override fun loadFavicon(cacheKey: String?): Painter? = null
@@ -275,7 +275,11 @@ class ComputerUseTest {
         val browser = FakeBrowser(log)
         val surface = FakeSurface(log)
         var hasSurface = true
-        val tools = TabActions(computerUse = ComputerUse({ if (hasSurface) surface else null }, ShotStore(dir))) { FakeTabs(browser) }
+        val selects = mutableListOf<Pair<String, String>>()
+        val tools = TabActions(computerUse = ComputerUse({ if (hasSurface) surface else null }, ShotStore(dir)), uiDispatcher = kotlinx.coroutines.Dispatchers.Unconfined) {
+            FakeTabs(browser) { t, p -> selects += t to p; onSelect(t, p) }
+        }
+        var onSelect: (String, String) -> Unit = { _, _ -> }
         fun run(action: String, extra: String = "") = runBlocking { tools.step("""{"tab_id":"t","action":$action,"highlight_ms":0$extra}""") }
     }
 
@@ -552,6 +556,52 @@ class ComputerUseTest {
         assertFalse(r.isError, r.text)
         assertTrue(r.text.contains("t#popup-1") && r.text.contains("Continue"))
         assertTrue(runBlocking { rig.tools.observe("""{"tab_id":"t#popup-7"}""") }.text.contains("TAB_NOT_FOUND"))
+        rig.dir.deleteRecursively()
+    }
+
+    private fun meta(vis: String) = """{"url":"https://a.test/","title":"A","vis":"$vis"}"""
+
+    @Test
+    fun `a visible page is captured without selecting its tab`() {
+        val rig = Rig().apply { browser.meta = meta("visible") }
+        val s = json(rig.run("""{"type":"screenshot","ensure_visible":true}"""))["screenshot"]!!.jsonObject
+        assertTrue(rig.selects.isEmpty())
+        assertTrue(s["visible"]!!.jsonPrimitive.boolean); assertFalse(s.containsKey("revealed"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `a hidden page is selected through the provider, awaited, then captured with revealed true`() {
+        val rig = Rig().apply { browser.meta = meta("hidden") }
+        rig.onSelect = { _, _ -> rig.log.add("select"); rig.browser.meta = meta("visible") }
+        val s = json(rig.run("""{"type":"screenshot","ensure_visible":true}"""))["screenshot"]!!.jsonObject
+        assertEquals(listOf("t" to "p"), rig.selects)
+        assertTrue(s["visible"]!!.jsonPrimitive.boolean); assertTrue(s["revealed"]!!.jsonPrimitive.boolean)
+        val order = rig.log.entries.filter { it == "select" || it == "bitmap" }
+        assertEquals(listOf("select", "bitmap"), order)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `a page that never becomes visible is captured anyway with visible false`() {
+        val rig = Rig().apply { browser.meta = meta("hidden") }
+        val s = json(rig.run("""{"type":"screenshot","ensure_visible":true}"""))["screenshot"]!!.jsonObject
+        assertEquals(1, rig.selects.size)
+        assertFalse(s["visible"]!!.jsonPrimitive.boolean); assertTrue(s["revealed"]!!.jsonPrimitive.boolean)
+        assertTrue(rig.log.entries.contains("bitmap"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `without ensure_visible a hidden page is only reported, and a popup is never revealed`() {
+        val rig = Rig().apply { browser.meta = meta("hidden") }
+        val s = json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject
+        assertTrue(rig.selects.isEmpty()); assertFalse(s["visible"]!!.jsonPrimitive.boolean); assertFalse(s.containsKey("revealed"))
+        rig.run("""{"type":"focused"}""")
+        val pop = PopupRig(rig); pop.browser.meta = meta("hidden")
+        rig.surface.popupSink!!.invoke(pop.window)
+        val ps = json(runBlocking { rig.tools.step("""{"tab_id":"t#popup-1","action":{"type":"screenshot","ensure_visible":true},"highlight_ms":0}""") })["screenshot"]!!.jsonObject
+        assertTrue(rig.selects.isEmpty()); assertFalse(ps["visible"]!!.jsonPrimitive.boolean); assertFalse(ps.containsKey("revealed"))
         rig.dir.deleteRecursively()
     }
 
