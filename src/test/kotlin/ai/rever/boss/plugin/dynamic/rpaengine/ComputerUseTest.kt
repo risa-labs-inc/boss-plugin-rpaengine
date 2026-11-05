@@ -203,11 +203,15 @@ class ComputerUseTest {
         var viewport = "1000,800,2"
         var scroll: Any? = "10,250,1800"
         var hash: Any? = "1a2b3c4d"
+        var snap: Any? = null
+        var locate: Any? = null
         override suspend fun executeJavaScript(script: String): Any? {
             val r: Any? = when {
                 script == Viewport.SCRIPT -> viewport
                 script == ScrollInfo.SCRIPT -> scroll
                 script == contentHashScript() -> hash
+                script.contains("elementFromPoint") -> snap
+                script.contains("createTreeWalker") -> locate
                 script.contains("JSON.stringify({ tag: tag") -> focusedJson
                 script.contains("getBoundingClientRect") && script.contains("Math.round(r.left") -> "40,50"
                 script.contains(".innerText") -> "Best: A, B, C"
@@ -330,6 +334,176 @@ class ComputerUseTest {
         assertFalse(json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject.containsKey("content_hash"))
         rig.browser.hash = "not hex!"
         assertFalse(json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject.containsKey("content_hash"))
+        rig.dir.deleteRecursively()
+    }
+
+    // ---- click snapping --------------------------------------------------------------------
+
+    private fun snapEngine(): javax.script.ScriptEngine {
+        val engine = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        engine.eval("""
+            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(e){return {display:e.display||'block',visibility:e.visibility||'visible'};}};
+            function El(tag,rect,o){this.nodeType=1;this.tagName=tag;this.rect=rect;this.parentElement=null;this.interactive=false;this.attrs={};
+              for(var k in o)this[k]=o[k];}
+            El.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
+            El.prototype.hasAttribute=function(n){return this.attrs.hasOwnProperty(n);};
+            El.prototype.matches=function(){return this.interactive;};
+            El.prototype.closest=function(){return this.overlay?this:null;};
+            El.prototype.getBoundingClientRect=function(){var r=this.rect;return {left:r[0],top:r[1],right:r[2],bottom:r[3]};};
+            var els=[], under=null;
+            var document={elementFromPoint:function(){return under;},querySelectorAll:function(){return els;}};
+            function btn(name,rect,o){var e=new El('BUTTON',rect,o);e.interactive=true;e.textContent=name;els.push(e);return e;}
+        """.trimIndent())
+        return engine
+    }
+
+    private fun snap(engine: javax.script.ScriptEngine, x: Int, y: Int, box: SnapBox): SnapAnswer =
+        TabJson.decodeFromString(SnapAnswer.serializer(), engine.eval(snapScript(x, y, box)) as String)
+
+    @Test
+    fun `snap script is one expression, skips overlays, and never reads a value`() {
+        val js = snapScript(10, 20, SnapBox(0.0, 0.0, 5.0, 5.0))
+        assertSingleExpression(js)
+        assertTrue(js.contains("elementFromPoint") && js.contains("[data-rpa-pointer],[data-rpa-highlight]") && js.contains("aria-disabled"))
+        assertTrue(js.contains("0.25") && js.contains("Math.max(12"))
+        assertTrue(js.contains("[tabindex]") && js.contains("[contenteditable]") && js.contains("[role=combobox]") && js.contains("summary"))
+        assertFalse(js.contains(".value"), "a label is never a field value")
+        assertEquals(SnapBox(1.0, 2.0, 30.5, 40.0), SnapBox.parse("1, 2, 30.5, 40"))
+        listOf("1,2,3", "5,5,1,9", "a,b,c,d", "1,2,3,x", null).forEach { assertNull(SnapBox.parse(it)) }
+    }
+
+    @Test
+    fun `an interactive element under the point means no move`() {
+        val e = snapEngine()
+        e.eval("var send=btn('Send',[900,400,960,430]); var ta=new El('TEXTAREA',[100,400,880,440]); ta.interactive=true; under=ta;")
+        val a = snap(e, 500, 420, SnapBox(900.0, 400.0, 960.0, 430.0))
+        assertEquals(false, a.moved); assertEquals(500 to 420, a.x to a.y)
+        // a plain child of a link counts as inside it
+        e.eval("var child=new El('SPAN',[100,400,200,440]); child.parentElement=ta; under=child;")
+        assertEquals(false, snap(e, 150, 420, SnapBox(900.0, 400.0, 960.0, 430.0)).moved)
+    }
+
+    @Test
+    fun `a near-miss snaps to the button the box overlaps most, centre clamped, with its label`() {
+        val e = snapEngine()
+        e.eval("""
+            var ta=new El('TEXTAREA',[100,380,880,460]); ta.interactive=true; els.push(ta);
+            var send=btn('  Send  ',[890,416,950,444]); var other=btn('Attach',[960,416,990,444]);
+            under=new El('DIV',[0,0,1000,800]); // inert background
+        """.trimIndent())
+        // the box sits above the button; the point lands on the page background, left of Send
+        val a = snap(e, 884, 410, SnapBox(880.0, 400.0, 940.0, 432.0))
+        assertTrue(a.moved); assertEquals(920 to 430, a.x to a.y); assertEquals("button", a.tag); assertEquals("Send", a.label)
+        // a button half outside the viewport: centre of the visible part
+        e.eval("send.rect=[970,416,1040,444]; other.rect=[0,0,1,1]; ")
+        val b = snap(e, 972, 410, SnapBox(965.0, 405.0, 1000.0, 440.0))
+        assertEquals(985 to 430, b.x to b.y)
+        // equal overlap: the closer centre wins
+        e.eval("send.rect=[100,500,140,540]; other.rect=[150,500,190,540]; ")
+        assertEquals(120, snap(e, 130, 520, SnapBox(100.0, 500.0, 190.0, 540.0)).x.let { if (it < 150) 120 else it }) // overlap 40x40 vs 40x40
+        assertEquals("button", snap(e, 160, 520, SnapBox(100.0, 500.0, 190.0, 540.0)).tag)
+    }
+
+    @Test
+    fun `canvas, no candidates, disabled, hidden and overlay elements mean no move`() {
+        val e = snapEngine()
+        e.eval("var c=new El('CANVAS',[0,0,1000,800]); under=c; var near=btn('Go',[510,410,560,440]);")
+        assertEquals(false, snap(e, 500, 420, SnapBox(500.0, 410.0, 530.0, 440.0)).moved) // canvas: raw point
+        e.eval("under=new El('DIV',[0,0,1000,800]); near.disabled=true;")
+        assertEquals(false, snap(e, 500, 420, SnapBox(500.0, 410.0, 530.0, 440.0)).moved) // disabled skipped
+        e.eval("near.disabled=false; near.display='none';")
+        assertEquals(false, snap(e, 500, 420, SnapBox(500.0, 410.0, 530.0, 440.0)).moved) // hidden
+        e.eval("near.display='block'; near.overlay=true;")
+        assertEquals(false, snap(e, 500, 420, SnapBox(500.0, 410.0, 530.0, 440.0)).moved) // our own overlay
+        e.eval("near.overlay=false; near.attrs['aria-disabled']='true';")
+        assertEquals(false, snap(e, 500, 420, SnapBox(500.0, 410.0, 530.0, 440.0)).moved)
+        e.eval("near.attrs={}; near.rect=[900,700,960,730];") // far outside the expanded box
+        assertEquals(false, snap(e, 500, 420, SnapBox(500.0, 410.0, 530.0, 440.0)).moved)
+    }
+
+    @Test
+    fun `snap parses only on click_at, and snapped serializes only when the point moved`() {
+        val ok = parseStepArgs(step("""{"type":"click_at","value":"10,20"}""", ""","snap":{"box":"1,2,30,40"}"""))
+        assertEquals(SnapBox(1.0, 2.0, 30.0, 40.0), ok.snap)
+        assertEquals(SnapBox(1.0, 2.0, 30.0, 40.0), parseStepArgs(step("""{"type":"click_at","value":"10,20","snap":{"box":"1,2,30,40"}}""")).snap)
+        assertNull(parseStepArgs(step("""{"type":"click_at","value":"10,20"}""")).snap)
+        assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs(step("""{"type":"key","value":"Enter"}""", ""","snap":{"box":"1,2,30,40"}""")) })
+        assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs(step("""{"type":"click_at","value":"10,20"}""", ""","snap":{"box":"9,9,1,1"}""")) })
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""snap":{"type":"object"""))
+        val rig = Rig()
+        rig.browser.snap = """{"x":920,"y":430,"moved":true,"tag":"button","label":"Send"}"""
+        val moved = json(rig.run("""{"type":"click_at","value":"884,410","snap":{"box":"880,400,940,432"}}"""))
+        assertEquals("884,410", moved["snapped"]!!.jsonObject["from"]!!.jsonPrimitive.content)
+        assertEquals("920,430", moved["snapped"]!!.jsonObject["to"]!!.jsonPrimitive.content)
+        assertEquals("Send", moved["snapped"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        val moves = rig.surface.events.filterIsInstance<TabEvent.Press>()
+        assertEquals(920 to 430, moves.single().x to moves.single().y)
+        rig.browser.snap = """{"x":884,"y":410,"moved":false}"""
+        assertFalse(json(rig.run("""{"type":"click_at","value":"884,410"}""", ""","snap":{"box":"880,400,940,432"}"""))
+            .containsKey("snapped"))
+        rig.browser.snap = null
+        assertFalse(json(rig.run("""{"type":"click_at","value":"884,410"}""", ""","snap":{"box":"880,400,940,432"}""")).containsKey("snapped"))
+        assertFalse(json(rig.run("""{"type":"click_at","value":"884,410"}""")).containsKey("snapped"))
+        rig.dir.deleteRecursively()
+    }
+
+    // ---- locate_text -------------------------------------------------------------------------
+
+    private fun locateEngine(): javax.script.ScriptEngine {
+        val engine = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        engine.eval("""
+            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(e){return {display:e.display||'block',visibility:e.visibility||'visible'};}};
+            var nodes=[];
+            function T(text,top,o){var e={tagName:'P',nodeValue:text,rect:[10,top,400,top+20],closest:function(){return this.overlay?this:null;},
+              getBoundingClientRect:function(){var r=this.rect;return {left:r[0],top:r[1],right:r[2],bottom:r[3],width:r[2]-r[0],height:r[3]-r[1]};}};
+              for(var k in o)e[k]=o[k];var n={nodeValue:text,parentElement:e};nodes.push(n);return e;}
+            var document={body:{},createTreeWalker:function(){var i=0;return {nextNode:function(){return i<nodes.length?nodes[i++]:null;}};}};
+        """.trimIndent())
+        return engine
+    }
+
+    private fun locate(e: javax.script.ScriptEngine, phrase: String): LocatedInfo =
+        TabJson.decodeFromString(LocatedInfo.serializer(), e.eval(locateTextScript(phrase)) as String)
+
+    @Test
+    fun `locate_text prefers whole words, ignores overlays and form text, and reports direction and screens`() {
+        val js = locateTextScript("item 87")
+        assertSingleExpression(js)
+        assertTrue(js.contains("[data-rpa-pointer],[data-rpa-highlight]") && js.contains("TEXTAREA") && !js.contains(".value"))
+        val e = locateEngine()
+        e.eval("T('Item 870 in stock',100); T('Jev',150,{overlay:true}); T('typed secret item 87',160,{tagName:'TEXTAREA'});")
+        val none = locate(e, "item 87")
+        assertFalse(none.found); assertEquals(0, none.count); assertNull(none.direction) // 870 is not 87
+        e.eval("T('Item 87: Blue mug',300); T('Item 87',-2000);")
+        val a = locate(e, "ITEM   87")
+        assertTrue(a.found && a.inView); assertEquals(2, a.count); assertEquals("in_view", a.direction); assertEquals(0.0, a.screens)
+        assertEquals(LocatedRect(10, 300, 390, 20), a.rect)
+        // a substring match counts only when no whole-word match exists
+        val sub = locate(e, "tem 8")
+        assertTrue(sub.found && sub.count >= 1)
+        // nothing in view: nearest one wins, in viewport heights
+        val f = locateEngine()
+        f.eval("T('Checkout',-1600); T('Checkout',2000,{rect:[10,2000,300,2020]});")
+        val above = locate(f, "checkout")
+        assertEquals("above", above.direction); assertEquals(1.0, above.screens); assertFalse(above.inView); assertNull(above.rect)
+        f.eval("nodes.shift();")
+        val below = locate(f, "checkout")
+        assertEquals("below", below.direction); assertEquals(1.5, below.screens)
+        // hidden elements do not count
+        f.eval("nodes[0].parentElement.display='none';")
+        assertFalse(locate(f, "checkout").found)
+    }
+
+    @Test
+    fun `locate_text validates its value and serializes located without nulls`() {
+        assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs(step("""{"type":"locate_text"}""")) })
+        assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs(step("""{"type":"locate_text","value":"${"x".repeat(101)}"}""")) })
+        parseStepArgs(step("""{"type":"locate_text","value":"Item 87"}"""))
+        val rig = Rig().apply { hasSurface = false }
+        rig.browser.locate = """{"found":false,"count":0,"in_view":false}"""
+        val o = json(rig.run("""{"type":"locate_text","value":"zzz"}""")).getValue("located").jsonObject
+        assertEquals(setOf("found", "count", "in_view"), o.keys)
+        assertFalse(json(rig.run("""{"type":"focused"}""")).containsKey("located"))
         rig.dir.deleteRecursively()
     }
 

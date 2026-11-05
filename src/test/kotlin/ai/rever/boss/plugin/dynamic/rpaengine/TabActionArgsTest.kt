@@ -82,7 +82,7 @@ class TabActionArgsTest {
 
     @Test
     fun `schema and description offer download`() {
-        assertTrue(TabActions.STEP_SCHEMA.contains(""""enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text","cu_end","dialog_answer"]"""))
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text","locate_text","cu_end","dialog_answer"]"""))
         assertTrue(TabActions.STEP_SCHEMA.contains("Required for click, input, select, submit, download;"))
         assertTrue(TabActions.STEP_DESCRIPTION.contains("download (rpa_step only, not a plan verb)"))
         assertTrue(TabActions.STEP_DESCRIPTION.contains("HTTP 401/403"), "credentials are omitted; say what that costs")

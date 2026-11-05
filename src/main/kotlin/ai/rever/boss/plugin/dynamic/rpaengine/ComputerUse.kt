@@ -44,10 +44,11 @@ internal object CuTypes {
     const val FOCUSED = "focused"
     const val POINTER_HIDE = "pointer_hide"
     const val PAGE_TEXT = "page_text"
+    const val LOCATE_TEXT = "locate_text"
     const val CU_END = "cu_end"
     const val DIALOG_ANSWER = "dialog_answer"
 
-    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT, CU_END, DIALOG_ANSWER)
+    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT, LOCATE_TEXT, CU_END, DIALOG_ANSWER)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -90,6 +91,135 @@ internal fun contentHashScript(): String =
         "finally{for(var m=0;m<hid.length;m++){try{hid[m][0].style.setProperty('display',hid[m][1],hid[m][2]);}catch(e){}}}})()"
 
 internal val CONTENT_HASH_RE = Regex("[0-9a-f]{1,8}")
+
+internal const val LOCATE_TEXT_MAX = 100
+
+/** Where a phrase sits relative to the viewport; see [locateTextScript]. */
+@Serializable
+internal data class LocatedInfo(
+    val found: Boolean,
+    val count: Int,
+    @SerialName("in_view") val inView: Boolean,
+    /** above | below | in_view; null when not found. */
+    val direction: String? = null,
+    /** Distance of the nearest match from the viewport in viewport heights (0.0 when in view). */
+    val screens: Double? = null,
+    val rect: LocatedRect? = null,
+)
+
+@Serializable
+internal data class LocatedRect(val x: Int, val y: Int, val w: Int, val h: Int)
+
+/**
+ * Finds visible text nodes containing [phrase] (case-insensitive, whitespace-collapsed; overlay, script, style and
+ * form-control text excluded, so never a field value). A whole-word match (no letter or digit touching either end,
+ * so "item 87" misses "Item 870") is preferred: substring matches count only when no whole-word match exists, and never when they cut through a number.
+ * Answers JSON [LocatedInfo] about the match nearest the viewport.
+ */
+internal fun locateTextScript(phrase: String): String =
+    """(function(){try{
+var P=${phrase.asJsString()}.replace(/\s+/g,' ').trim().toLowerCase();
+if(!P)return null;
+var W=window.innerWidth||1,H=window.innerHeight||1,SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEXTAREA:1,SELECT:1,OPTION:1,TITLE:1};
+function word(c){return !!c&&/[a-z0-9_]/i.test(c);}
+function dig(c){return !!c&&/[0-9]/.test(c);}
+var whole=[],part=[];
+var w=document.createTreeWalker(document.body||document.documentElement,4,null),n;
+while((n=w.nextNode())){
+var el=n.parentElement;if(!el||SKIP[el.tagName])continue;
+if(el.closest&&el.closest('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]'))continue;
+var t=(n.nodeValue||'').replace(/\s+/g,' ').toLowerCase();
+var at=t.indexOf(P);if(at<0)continue;
+var cs=window.getComputedStyle(el);if(cs.display==='none'||cs.visibility==='hidden')continue;
+var r=el.getBoundingClientRect();if(!(r.width>0&&r.height>0))continue;
+var isWhole=false,isPart=false;
+for(var i=at;i>=0;i=t.indexOf(P,i+1)){
+var b=i>0?t.charAt(i-1):'',a=t.charAt(i+P.length);
+if(!(word(b)&&word(P.charAt(0)))&&!(word(a)&&word(P.charAt(P.length-1)))){isWhole=true;break;}
+if(!(dig(b)&&dig(P.charAt(0)))&&!(dig(a)&&dig(P.charAt(P.length-1))))isPart=true;}
+if(isWhole)whole.push(r);else if(isPart)part.push(r);}
+var hits=whole.length?whole:part;
+if(!hits.length)return JSON.stringify({found:false,count:0,in_view:false});
+var best=null,bd=0;
+for(var k=0;k<hits.length;k++){var q=hits[k];
+var dy=q.bottom<=0?-q.bottom:(q.top>=H?q.top-H:0),dx=q.right<=0||q.left>=W?1:0;
+var d=dy+(dx?H*10:0);
+if(best===null||d<bd){best=q;bd=d;}}
+var inv=bd===0,dir=inv?'in_view':(best.bottom<=0?'above':'below');
+var o={found:true,count:hits.length,in_view:inv,direction:dir,screens:Math.round(bd/H*10)/10};
+if(inv)o.rect={x:Math.round(best.left),y:Math.round(best.top),w:Math.round(best.width),h:Math.round(best.height)};
+return JSON.stringify(o);
+}catch(e){return null;}})()"""
+
+/** Jev's box for the target, in viewport CSS px. */
+internal data class SnapBox(val left: Double, val top: Double, val right: Double, val bottom: Double) {
+    companion object {
+        /** "left,top,right,bottom" with right > left and bottom > top, or null. */
+        fun parse(value: String?): SnapBox? {
+            val p = value?.split(',')?.map { it.trim().toDoubleOrNull()?.takeIf { d -> d.isFinite() } ?: return null } ?: return null
+            if (p.size != 4 || p[2] <= p[0] || p[3] <= p[1]) return null
+            return SnapBox(p[0], p[1], p[2], p[3])
+        }
+    }
+}
+
+/** Where a click_at really landed after snapping; present only when the point moved. */
+@Serializable
+internal data class SnapInfo(val from: String, val to: String, val tag: String? = null, val label: String? = null)
+
+/** The page's answer to [snapScript]. */
+@Serializable
+internal data class SnapAnswer(val x: Int, val y: Int, val moved: Boolean = false, val tag: String? = null, val label: String? = null)
+
+private const val SNAP_INTERACTIVE_SEL =
+    "a[href],button,input,select,textarea,label,summary,[contenteditable],[onclick]," +
+        "[role=button],[role=link],[role=checkbox],[role=switch],[role=tab],[role=menuitem],[role=option],[role=radio],[role=combobox],[role=textbox]"
+
+/**
+ * One page script that decides where a click at ([x],[y]) should land given [box]: unchanged when an interactive
+ * element is under the point (or the point is on a canvas); otherwise the centre of the visible interactive element
+ * overlapping the box most (box grown by 25%, min 12 px, to find candidates; ties go to the closest centre).
+ * Answers JSON [SnapAnswer]; never reads a field value.
+ */
+internal fun snapScript(x: Int, y: Int, box: SnapBox): String =
+    """(function(){try{
+var x=$x,y=$y,B=[${box.left},${box.top},${box.right},${box.bottom}],SEL=${SNAP_INTERACTIVE_SEL.asJsString()};
+var W=window.innerWidth||1,H=window.innerHeight||1;
+function inOv(e){return !!(e.closest&&e.closest('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]'));}
+function inter(e){
+if(!e||e.nodeType!==1||inOv(e))return false;
+if(e.disabled||e.getAttribute('aria-disabled')==='true'||e.hidden)return false;
+if(e.tagName==='INPUT'&&(e.getAttribute('type')||'').toLowerCase()==='hidden')return false;
+return e.matches(SEL)||(e.hasAttribute('tabindex')&&e.tabIndex>=0);}
+function vis(e){
+var r=e.getBoundingClientRect(),cs=window.getComputedStyle(e);
+if(cs.display==='none'||cs.visibility==='hidden')return null;
+var l=Math.max(r.left,0),t=Math.max(r.top,0),rr=Math.min(r.right,W),bb=Math.min(r.bottom,H);
+return(rr>l&&bb>t)?[l,t,rr,bb]:null;}
+function ov(a,b){var w=Math.min(a[2],b[2])-Math.max(a[0],b[0]),h=Math.min(a[3],b[3])-Math.max(a[1],b[1]);return(w>0&&h>0)?w*h:0;}
+function hit(a,b){return Math.min(a[2],b[2])>=Math.max(a[0],b[0])&&Math.min(a[3],b[3])>=Math.max(a[1],b[1]);}
+function label(e){
+var tag=e.tagName.toLowerCase(),s=norm(e.getAttribute('aria-label'));
+if(!s&&e.labels&&e.labels.length)s=norm(e.labels[0].textContent);
+if(!s&&tag!=='input'&&tag!=='textarea'&&tag!=='select')s=norm(e.textContent);
+if(!s)s=norm(e.getAttribute('title'))||norm(e.getAttribute('placeholder'))||norm(e.getAttribute('name'));
+return s.slice(0,80);}
+function norm(v){return(v||'').replace(/\s+/g,' ').trim();}
+function out(nx,ny,el){var m=nx!==x||ny!==y;return JSON.stringify(m?{x:nx,y:ny,moved:true,tag:el.tagName.toLowerCase(),label:label(el)||null}:{x:x,y:y,moved:false});}
+var under=document.elementFromPoint(x,y);
+if(under&&under.tagName==='CANVAS')return out(x,y,null);
+for(var n=under;n&&n.nodeType===1;n=n.parentElement){if(inter(n))return out(x,y,n);}
+var bw=B[2]-B[0],bh=B[3]-B[1],px=Math.max(12,bw*0.25),py=Math.max(12,bh*0.25);
+var wide=[B[0]-px,B[1]-py,B[2]+px,B[3]+py],best=null,bestA=-1,bestD=0;
+var all=document.querySelectorAll(SEL+',[tabindex]');
+for(var i=0;i<all.length;i++){var e=all[i];if(!inter(e))continue;var r=vis(e);if(!r||!hit(r,wide))continue;
+var a=ov(r,B),cx=(r[0]+r[2])/2,cy=(r[1]+r[3])/2,d=Math.sqrt((cx-x)*(cx-x)+(cy-y)*(cy-y));
+if(a>bestA||(a===bestA&&d<bestD)){best=e;bestA=a;bestD=d;best.__r=r;}}
+if(!best)return out(x,y,null);
+var rr=best.__r;delete best.__r;
+var tx=Math.min(Math.max(Math.round((rr[0]+rr[2])/2),0),W-1),ty=Math.min(Math.max(Math.round((rr[1]+rr[3])/2),0),H-1);
+return out(tx,ty,best);
+}catch(e){return null;}})()"""
 
 /** "x,y" (CSS px, decimals rounded) or null. */
 internal fun parsePoint(value: String?): Pair<Int, Int>? {
@@ -195,6 +325,8 @@ internal class CuOutcome(
     val screenshot: ScreenshotInfo? = null,
     val focused: FocusedInfo? = null,
     val text: String? = null,
+    val snapped: SnapInfo? = null,
+    val located: LocatedInfo? = null,
 )
 
 // ---------------------------------------------------------------------------------------------
@@ -773,6 +905,7 @@ internal class ComputerUse(
         action: RpaActionConfig,
         pointer: PointerSpec?,
         allowSensitive: Boolean,
+        snap: SnapBox? = null,
     ): CuOutcome {
         val value = action.value
         if (action.type != CuTypes.CU_END && action.type != CuTypes.DIALOG_ANSWER) startCapture(browser, tabId)
@@ -805,13 +938,19 @@ internal class ComputerUse(
                     ?: return CuOutcome(false, "Could not read the page text (the page may be navigating)")
                 CuOutcome(true, text = text)
             }
+            CuTypes.LOCATE_TEXT -> {
+                val located = (orNullUnlessCancelled { browser.executeJavaScript(locateTextScript(value.orEmpty())) } as? String)
+                    ?.let { runCatching { TabJson.decodeFromString(LocatedInfo.serializer(), it) }.getOrNull() }
+                    ?: return CuOutcome(false, "Could not search the page text (the page may be navigating)")
+                CuOutcome(true, located = located)
+            }
             CuTypes.FOCUSED -> CuOutcome(true, focused = readFocused(browser, selectAll = false) ?: return CuOutcome(false, "Could not read the focused element (the page may be navigating)"))
             else -> {
                 val surface = surfaceFor(browser)
                     ?: return CuOutcome(false, "Screenshots and real input need a JxBrowser tab; none is behind this one")
                 when (action.type) {
                     CuTypes.SCREENSHOT -> screenshot(browser, surface, tabId, value?.trim()?.toIntOrNull() ?: SHOT_DEFAULT_MAX_SIDE)
-                    CuTypes.CLICK_AT -> clickAt(browser, surface, tabId, value, pointer)
+                    CuTypes.CLICK_AT -> clickAt(browser, surface, tabId, value, pointer, snap)
                     CuTypes.TYPE_TEXT -> typeText(browser, surface, value.orEmpty(), allowSensitive)
                     CuTypes.KEY -> key(surface, value)
                     CuTypes.SCROLL_BY -> scrollBy(browser, surface, tabId, value, pointer)
@@ -863,16 +1002,28 @@ internal class ComputerUse(
         return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash))
     }
 
-    private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?): CuOutcome {
-        val (x, y) = parsePoint(value) ?: return CuOutcome(false, "click_at value must be 'x,y' in CSS px")
+    private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, snap: SnapBox? = null): CuOutcome {
+        var (x, y) = parsePoint(value) ?: return CuOutcome(false, "click_at value must be 'x,y' in CSS px")
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         pointInViewport(x, y, viewport.width, viewport.height)
             ?: return CuOutcome(false, "($x,$y) is outside the ${viewport.width}x${viewport.height} viewport")
+        var snapped: SnapInfo? = null
+        if (snap != null) {
+            val answer = (orNullUnlessCancelled { browser.executeJavaScript(snapScript(x, y, snap)) } as? String)
+                ?.let { runCatching { TabJson.decodeFromString(SnapAnswer.serializer(), it) }.getOrNull() }
+            if (answer != null && answer.moved) {
+                val to = pointInViewport(answer.x, answer.y, viewport.width, viewport.height)
+                if (to != null) {
+                    snapped = SnapInfo("$x,$y", "${to.first},${to.second}", answer.tag, answer.label)
+                    x = to.first; y = to.second
+                }
+            }
+        }
         if (pointer != null) glide(browser, tabId, x, y, pointer, ripple = true)
         surface.focus()
-        if (!surface.play(TabGestures.click(x, y))) return CuOutcome(false, "The browser did not accept the click")
+        if (!surface.play(TabGestures.click(x, y))) return CuOutcome(false, "The browser did not accept the click", snapped = snapped)
         delay(ActionTiming.ACTION_SETTLE_MS)
-        return CuOutcome(true)
+        return CuOutcome(true, snapped = snapped)
     }
 
     private suspend fun typeText(browser: BrowserIntegration, surface: TabSurface, text: String, allowSensitive: Boolean): CuOutcome {
