@@ -479,11 +479,11 @@ class ComputerUseTest {
         assertTrue(a.found && a.inView); assertEquals(2, a.count); assertEquals("in_view", a.direction); assertEquals(0.0, a.screens)
         assertEquals(LocatedRect(10, 300, 390, 20), a.rect)
         // a substring match counts only when no whole-word match exists
-        val sub = locate(e, "tem 8")
+        val sub = locate(e, "lue mu")
         assertTrue(sub.found && sub.count >= 1)
         // nothing in view: nearest one wins, in viewport heights
         val f = locateEngine()
-        f.eval("T('Checkout',-1600); T('Checkout',2000,{rect:[10,2000,300,2020]});")
+        f.eval("T('Checkout',-800); T('Checkout',2000,{rect:[10,2000,300,2020]});")
         val above = locate(f, "checkout")
         assertEquals("above", above.direction); assertEquals(1.0, above.screens); assertFalse(above.inView); assertNull(above.rect)
         f.eval("nodes.shift();")
