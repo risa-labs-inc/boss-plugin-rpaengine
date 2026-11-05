@@ -202,10 +202,12 @@ class ComputerUseTest {
         var focusedJson = """{"tag":"input","editable":true,"label":"Search","type":"text"}"""
         var viewport = "1000,800,2"
         var scroll: Any? = "10,250,1800"
+        var hash: Any? = "1a2b3c4d"
         override suspend fun executeJavaScript(script: String): Any? {
             val r: Any? = when {
                 script == Viewport.SCRIPT -> viewport
                 script == ScrollInfo.SCRIPT -> scroll
+                script == contentHashScript() -> hash
                 script.contains("JSON.stringify({ tag: tag") -> focusedJson
                 script.contains("getBoundingClientRect") && script.contains("Math.round(r.left") -> "40,50"
                 script.contains(".innerText") -> "Best: A, B, C"
@@ -213,6 +215,7 @@ class ComputerUseTest {
             }
             log.add(
                 when {
+                    script == contentHashScript() -> "hash"
                     script.contains("querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]')") -> "hide"
                     script == ScrollInfo.SCRIPT -> "scroll"
                     script.contains("__rpa_pointer") && script.contains("root.style.transform") -> "pointer"
@@ -233,6 +236,13 @@ class ComputerUseTest {
         override suspend fun bitmap(): BufferedImage? { log.add("bitmap"); return bitmap }
         override suspend fun dispatch(event: TabEvent): Boolean { events += event; log.add("event:${event::class.simpleName}"); return accept }
         override suspend fun focus() { log.add("focus") }
+        var sink: DialogSink? = null
+        var captures = 0
+        var restores = 0
+        override fun captureDialogs(sink: DialogSink): DialogCapture? {
+            captures++; this.sink = sink
+            return object : DialogCapture { override fun restore() { restores++ } }
+        }
     }
 
     private class FakeTabs(private val b: BrowserIntegration) : ActiveTabsProvider {
@@ -269,6 +279,139 @@ class ComputerUseTest {
         assertSingleExpression(pageTextScript(20_000))
         // Privacy: rendered text only, never form field values.
         assertFalse(pageTextScript(10).contains(".value"))
+    }
+
+    @Test
+    fun `page_text hides every overlay node while it reads and puts them back`() {
+        val script = pageTextScript(100)
+        assertTrue(script.contains("[data-rpa-pointer],[data-rpa-highlight]"))
+        assertTrue(script.contains("setProperty('display','none'") && script.contains("finally"))
+        assertTrue(script.indexOf("display','none'") < script.indexOf("innerText"))
+    }
+
+    @Test
+    fun `content_hash script excludes overlays, reads no raw values, and tracks content`() {
+        val js = contentHashScript()
+        assertSingleExpression(js)
+        assertTrue(js.contains("[data-rpa-pointer],[data-rpa-highlight]") && js.contains("setProperty('display','none'"))
+        assertTrue(js.indexOf("display','none'") < js.indexOf("innerText") && js.contains("finally"))
+        assertTrue(js.contains("location.hash") && js.contains("checked") && js.contains("selectedIndex") && js.contains("el.value.length"))
+        assertFalse(js.replace("el.value.length", "").replace("typeof el.value", "").contains(".value"), "values are only ever measured")
+        // Run it against a tiny fake DOM.
+        val engine = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        engine.eval("""
+            function El(o){for(var k in o)this[k]=o[k];var d='';this.style={getPropertyValue:function(){return d;},getPropertyPriority:function(){return '';},setProperty:function(n,v){d=v;}};this.hidden=function(){return d==='none';};}
+            var overlay=new El({text:'Jev'}), page=new El({text:'Cart 0'}), box=new El({type:'text',value:'secret',checked:false});
+            var document={body:{get innerText(){return (page.hidden()?'':page.text)+(overlay.hidden()?'':overlay.text);}},documentElement:{},
+              querySelectorAll:function(q){return q.indexOf('data-rpa')>=0?[overlay]:[box];}};
+            var location={hash:''};
+        """.trimIndent())
+        val base = engine.eval(js) as String
+        assertTrue(CONTENT_HASH_RE.matches(base))
+        assertEquals(base, engine.eval(js)) // stable, and the overlay is shown again afterwards
+        assertEquals(false, engine.eval("overlay.hidden()"))
+        engine.eval("overlay.text='Jev changed'")
+        assertEquals(base, engine.eval(js), "overlay text does not move it")
+        engine.eval("box.value='other!!'")
+        assertTrue(base != engine.eval(js), "value length does")
+        engine.eval("box.value='secret'")
+        assertEquals(base, engine.eval(js), "same length, different value: private, so equal")
+        engine.eval("page.text='Cart 1'"); val c1 = engine.eval(js)
+        assertTrue(base != c1)
+        engine.eval("location.hash='#/checkout'"); assertTrue(c1 != engine.eval(js))
+        engine.eval("box.checked=true"); engine.eval(js)
+    }
+
+    @Test
+    fun `screenshot reports content_hash and omits it when the read fails`() {
+        val rig = Rig()
+        assertEquals("1a2b3c4d", json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject["content_hash"]!!.jsonPrimitive.content)
+        rig.browser.hash = null
+        assertFalse(json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject.containsKey("content_hash"))
+        rig.browser.hash = "not hex!"
+        assertFalse(json(rig.run("""{"type":"screenshot"}"""))["screenshot"]!!.jsonObject.containsKey("content_hash"))
+        rig.dir.deleteRecursively()
+    }
+
+    private fun dialogCall(rig: Rig, type: String, message: String): List<String> {
+        val calls = mutableListOf<String>()
+        rig.surface.sink!!.onDialog(DialogInfo(type, message, url = "https://a.test/")) { a, t -> calls += "$a:$t" }
+        return calls
+    }
+
+    @Test
+    fun `capture starts at the first CU verb, a dialog rides on every result, dialog_answer answers it`() {
+        val rig = Rig()
+        assertEquals(0, rig.surface.captures)
+        assertNull(json(rig.run("""{"type":"focused"}"""))["dialog"])
+        assertEquals(1, rig.surface.captures)
+        rig.run("""{"type":"key","value":"Enter"}""")
+        assertEquals(1, rig.surface.captures) // once per tab
+        val calls = dialogCall(rig, "confirm", "Delete it?")
+        val blocked = json(rig.run("""{"type":"click_at","value":"10,10"}"""))
+        assertFalse(blocked["ok"]!!.jsonPrimitive.boolean)
+        val d = blocked["dialog"]!!.jsonObject
+        assertEquals("confirm", d["type"]!!.jsonPrimitive.content); assertEquals("Delete it?", d["message"]!!.jsonPrimitive.content)
+        assertEquals("https://a.test/", d["url"]!!.jsonPrimitive.content); assertFalse(d.containsKey("default_value"))
+        assertNotNull(json(rig.run("""{"type":"screenshot"}"""))["dialog"])
+        assertTrue(calls.isEmpty())
+        val ans = json(rig.run("""{"type":"dialog_answer","value":"ok"}"""))
+        assertTrue(ans["ok"]!!.jsonPrimitive.boolean); assertFalse(ans.containsKey("dialog"))
+        assertEquals(listOf("true:null"), calls)
+        assertTrue(json(rig.run("""{"type":"focused"}""")).let { it["ok"]!!.jsonPrimitive.boolean && !it.containsKey("dialog_auto") })
+        val none = json(rig.run("""{"type":"dialog_answer","value":"cancel"}"""))
+        assertFalse(none["ok"]!!.jsonPrimitive.boolean); assertTrue(none["error"]!!.jsonPrimitive.content.contains("No browser dialog"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `a second dialog is auto-answered and reported once as dialog_auto`() {
+        val rig = Rig()
+        rig.run("""{"type":"focused"}""")
+        dialogCall(rig, "confirm", "one")
+        val second = dialogCall(rig, "confirm", "two")
+        assertEquals(listOf("false:null"), second)
+        val r = json(rig.run("""{"type":"dialog_answer","value":"ok"}"""))
+        val auto = r["dialog_auto"]!!.jsonArray.single().jsonObject
+        assertEquals("two", auto["message"]!!.jsonPrimitive.content); assertEquals("second_dialog", auto["reason"]!!.jsonPrimitive.content)
+        assertFalse(json(rig.run("""{"type":"focused"}""")).containsKey("dialog_auto"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `cu_end restores once, answers a held dialog safely, and a later CU verb captures again`() {
+        val rig = Rig()
+        rig.run("""{"type":"focused"}""")
+        val calls = dialogCall(rig, "prompt", "name?")
+        val end = json(rig.run("""{"type":"cu_end"}"""))
+        assertTrue(end["ok"]!!.jsonPrimitive.boolean); assertFalse(end.containsKey("dialog"))
+        assertEquals(1, rig.surface.restores); assertEquals(listOf("false:null"), calls)
+        rig.run("""{"type":"cu_end"}""")
+        assertEquals(1, rig.surface.restores) // nothing left to restore
+        rig.run("""{"type":"focused"}""")
+        assertEquals(2, rig.surface.captures)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `dispose restores every captured tab`() {
+        val rig = Rig()
+        rig.run("""{"type":"focused"}""")
+        rig.tools.dispose()
+        assertEquals(1, rig.surface.restores)
+        rig.tools.dispose()
+        assertEquals(1, rig.surface.restores)
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `dialog_answer needs a valid value, and the schema lists the new verbs`() {
+        listOf("""{"type":"dialog_answer"}""", """{"type":"dialog_answer","value":"yes"}""").forEach {
+            assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs(step(it)) })
+        }
+        parseStepArgs(step("""{"type":"dialog_answer","value":"ok:hi"}""")); parseStepArgs(step("""{"type":"cu_end"}"""))
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""cu_end","dialog_answer"]"""))
+        assertTrue(TabActions.STEP_DESCRIPTION.contains("dialog_answer") && TabActions.STEP_DESCRIPTION.contains("120 s"))
     }
 
     @Test

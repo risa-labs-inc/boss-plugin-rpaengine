@@ -44,8 +44,10 @@ internal object CuTypes {
     const val FOCUSED = "focused"
     const val POINTER_HIDE = "pointer_hide"
     const val PAGE_TEXT = "page_text"
+    const val CU_END = "cu_end"
+    const val DIALOG_ANSWER = "dialog_answer"
 
-    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT)
+    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT, CU_END, DIALOG_ANSWER)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -63,7 +65,31 @@ internal const val PAGE_TEXT_LIMIT = 100_000
 
 /** The page's visible text (innerText: rendered text only, never form field values), cut to [max] chars. */
 internal fun pageTextScript(max: Int): String =
-    "(function(){try{var t=(document.body||document.documentElement).innerText||'';return t.length>$max?t.slice(0,$max):t;}catch(e){return null;}})()"
+    "(function(){var hid=[];try{" +
+        "var n=document.querySelectorAll('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]');" +
+        "for(var i=0;i<n.length;i++){hid.push([n[i],n[i].style.getPropertyValue('display'),n[i].style.getPropertyPriority('display')]);n[i].style.setProperty('display','none','important');}" +
+        "var t=(document.body||document.documentElement).innerText||'';return t.length>$max?t.slice(0,$max):t;}catch(e){return null;}" +
+        "finally{for(var j=0;j<hid.length;j++){try{hid[j][0].style.setProperty('display',hid[j][1],hid[j][2]);}catch(e){}}}})()"
+
+/**
+ * A short stable hash (djb2, hex) of what a person would call the page's content: rendered text without this
+ * plugin's overlay nodes, location.hash, and each form control's type, checked, selectedIndex and value LENGTH
+ * (never a value). Video frames and animations do not move it; typing and clicks that change content do.
+ */
+internal fun contentHashScript(): String =
+    "(function(){var hid=[];try{" +
+        "var n=document.querySelectorAll('[$POINTER_ATTR],[$HIGHLIGHT_ATTR]');" +
+        "for(var i=0;i<n.length;i++){hid.push([n[i],n[i].style.getPropertyValue('display'),n[i].style.getPropertyPriority('display')]);n[i].style.setProperty('display','none','important');}" +
+        "var parts=[(document.body||document.documentElement).innerText||'',location.hash||''];" +
+        "var c=document.querySelectorAll('input,select,textarea');" +
+        "for(var k=0;k<c.length;k++){var el=c[k];" +
+        "parts.push((el.type||el.tagName)+'|'+(el.checked?1:0)+'|'+(el.selectedIndex===undefined?'':el.selectedIndex)+'|'+(typeof el.value==='string'?el.value.length:0));}" +
+        "var s=parts.join('\\u0001'),h=5381;" +
+        "for(var j=0;j<s.length;j++){h=((h<<5)+h+s.charCodeAt(j))|0;}" +
+        "return (h>>>0).toString(16);}catch(e){return null;}" +
+        "finally{for(var m=0;m<hid.length;m++){try{hid[m][0].style.setProperty('display',hid[m][1],hid[m][2]);}catch(e){}}}})()"
+
+internal val CONTENT_HASH_RE = Regex("[0-9a-f]{1,8}")
 
 /** "x,y" (CSS px, decimals rounded) or null. */
 internal fun parsePoint(value: String?): Pair<Int, Int>? {
@@ -148,6 +174,8 @@ internal data class ScreenshotInfo(
     val dpr: Double,
     /** Absent when the page would not answer the scroll read. */
     val scroll: ScrollInfo? = null,
+    /** Hash of the page's content and form state (see [contentHashScript]); absent when the read failed. */
+    @SerialName("content_hash") val contentHash: String? = null,
 )
 
 /** What holds keyboard focus. Never the field's value. */
@@ -321,6 +349,9 @@ internal interface TabSurface {
 
     /** Give the page keyboard focus before a key sequence. */
     suspend fun focus() {}
+
+    /** Start routing this tab's alert/confirm/prompt/beforeunload to [sink]; null when the tab cannot. */
+    fun captureDialogs(sink: DialogSink): DialogCapture? = null
 }
 
 /** Plays [events] in order, sleeping on pauses. False as soon as one dispatch fails. */
@@ -380,6 +411,9 @@ internal class JxBrowserSurface private constructor(private val browser: Any) : 
     override suspend fun focus() {
         runCatching { cls(BROWSER).getMethod("focus").invoke(browser) }
     }
+
+    override fun captureDialogs(sink: DialogSink): DialogCapture? =
+        runCatching { ProxyDialogCapture.install(JxCallbackHost(browser), loader, JX_DIALOG_SPECS, sink) }.getOrNull()
 
     private fun cls(name: String): Class<*> = Class.forName(name, true, loader)
 
@@ -699,6 +733,40 @@ internal class ComputerUse(
     /** The label and color the pointer last used per tab, so a screenshot can put it back unchanged. */
     private val specs = java.util.concurrent.ConcurrentHashMap<String, PointerSpec>()
 
+    private class TabDialogs(val pending: PendingDialogs, val capture: DialogCapture)
+
+    private val dialogs = java.util.concurrent.ConcurrentHashMap<String, TabDialogs>()
+
+    private val newPending: () -> PendingDialogs = { PendingDialogs() }
+
+    /** The tab's pending dialog, for every rpa_step result. */
+    fun pendingDialog(tabId: String): DialogInfo? = dialogs[tabId]?.pending?.current()
+
+    /** Dialogs this plugin auto-answered since the last result (second dialog, timeout, capture end). */
+    fun drainAutoDialogs(tabId: String): List<AutoDialog> = dialogs[tabId]?.pending?.drainAuto().orEmpty()
+
+    /** Restores every tab's host callbacks (plugin dispose). */
+    fun dispose() {
+        dialogs.keys.toList().forEach { endCapture(it) }
+    }
+
+    private fun endCapture(tabId: String) {
+        val d = dialogs.remove(tabId) ?: return
+        d.pending.close()
+        runCatching { d.capture.restore() }
+    }
+
+    /** First computer-use action on a tab: remember the host's callbacks and install ours. */
+    private fun startCapture(browser: BrowserIntegration, tabId: String) {
+        if (dialogs.containsKey(tabId)) return
+        val surface = surfaceFor(browser) ?: return
+        val pending = newPending()
+        val capture = surface.captureDialogs { info, responder -> pending.offer(info, responder) } ?: return
+        if (dialogs.putIfAbsent(tabId, TabDialogs(pending, capture)) != null) {
+            capture.restore() // lost a race: ours was installed twice, keep the first
+        }
+    }
+
     suspend fun run(
         browser: BrowserIntegration,
         tabId: String,
@@ -707,7 +775,24 @@ internal class ComputerUse(
         allowSensitive: Boolean,
     ): CuOutcome {
         val value = action.value
+        if (action.type != CuTypes.CU_END && action.type != CuTypes.DIALOG_ANSWER) startCapture(browser, tabId)
         return when (action.type) {
+            CuTypes.CU_END -> {
+                endCapture(tabId) // first: a held dialog is answered before any script could block on it
+                positions.remove(tabId)
+                specs.remove(tabId)
+                orNullUnlessCancelled { browser.executeJavaScript(pointerRemoveScript()) }
+                CuOutcome(true)
+            }
+            CuTypes.DIALOG_ANSWER -> {
+                val answer = DialogAnswer.parse(value) ?: return CuOutcome(false, "dialog_answer value must be 'ok', 'cancel' or 'ok:<text>'")
+                val pending = dialogs[tabId]?.pending
+                // Off the caller's thread, never the EDT: the Action's send is a plain RPC reply.
+                val answered = pending != null && withContext(kotlinx.coroutines.Dispatchers.IO) { pending.answer(answer) }
+                if (!answered) return CuOutcome(false, "No browser dialog is pending on this tab")
+                delay(ActionTiming.ACTION_SETTLE_MS)
+                CuOutcome(true)
+            }
             CuTypes.POINTER_HIDE -> {
                 positions.remove(tabId)
                 specs.remove(tabId)
@@ -760,6 +845,7 @@ internal class ComputerUse(
     private suspend fun screenshot(browser: BrowserIntegration, surface: TabSurface, tabId: String, maxSide: Int): CuOutcome {
         val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
         val scroll = ScrollInfo.parse(orNullUnlessCancelled { browser.executeJavaScript(ScrollInfo.SCRIPT) })
+        val contentHash = (orNullUnlessCancelled { browser.executeJavaScript(contentHashScript()) } as? String)?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
         orNullUnlessCancelled { browser.executeJavaScript(overlayRemoveScript()) }
         val image = try {
             delay(OVERLAY_SETTLE_MS) // one compositor frame, so the bitmap no longer holds the overlay
@@ -774,7 +860,7 @@ internal class ComputerUse(
         } ?: return CuOutcome(false, "The browser returned no bitmap")
         val (w, h) = fitShotSize(image.width, image.height, maxSide)
         val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h)))
-        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll))
+        return CuOutcome(true, screenshot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, contentHash))
     }
 
     private suspend fun clickAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?): CuOutcome {

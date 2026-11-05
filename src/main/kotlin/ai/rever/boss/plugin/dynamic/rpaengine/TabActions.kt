@@ -176,6 +176,7 @@ internal fun parseStepArgs(raw: String): StepArgs {
         CuTypes.TYPE_TEXT -> if (value == null) invalid("'type_text' requires action.value (the text to type)")
         CuTypes.KEY -> if (TabKeys.parse(value) == null) invalid("'key' requires action.value, a key name like Enter, Escape, Tab, ArrowDown or ctrl+a")
         CuTypes.SCROLL_BY -> if (parseScrollDelta(value) == null) invalid("'scroll_by' requires action.value 'dy' or 'dx,dy' (integer px)")
+        CuTypes.DIALOG_ANSWER -> if (DialogAnswer.parse(value) == null) invalid("'dialog_answer' requires action.value 'ok', 'cancel' or 'ok:<text>' (text answers a prompt)")
     }
     return StepArgs(
         tabId,
@@ -251,6 +252,10 @@ internal data class StepResult(
     val focused: FocusedInfo? = null,
     /** Set only by `page_text`. */
     val text: String? = null,
+    /** The browser dialog waiting for `dialog_answer`; present in every result while one is pending. */
+    val dialog: DialogInfo? = null,
+    /** Dialogs this plugin answered itself since the previous result. */
+    @SerialName("dialog_auto") val dialogAuto: List<AutoDialog>? = null,
 )
 
 @Serializable
@@ -269,8 +274,15 @@ internal data class DownloadInfo(
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
     return JsonObject(
-        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text") && v is JsonNull }
-            .mapValues { (k, v) -> if (k == "screenshot" && v is JsonObject) JsonObject(v.filterNot { (sk, sv) -> sk == "scroll" && sv is JsonNull }) else v },
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto") && v is JsonNull }
+            .mapValues { (k, v) ->
+                when {
+                    k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash") && sv is JsonNull })
+                    k == "dialog" && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
+                    else -> v
+                }
+            }
+            .filterNot { (k, v) -> k == "dialog_auto" && v is kotlinx.serialization.json.JsonArray && v.isEmpty() },
     ).toString()
 }
 
@@ -942,6 +954,18 @@ internal class TabActions(
         // the step without typing.
         val guard = if (args.action.type == ActionTypes.INPUT && !args.allowSensitive) SENSITIVE_GUARD_JS else null
         var cu: CuOutcome? = null
+        // A page blocked in alert()/confirm() would hang any script we send; only an answer or cu_end may proceed.
+        val waiting = if (action.type != CuTypes.DIALOG_ANSWER && action.type != CuTypes.CU_END) computerUse.pendingDialog(args.tabId) else null
+        if (waiting != null) {
+            return StepResult(
+                ok = false,
+                error = "A browser dialog (${waiting.type}) is waiting; call dialog_answer with 'ok', 'cancel' or 'ok:<text>' first",
+                urlBefore = before, urlAfter = before, navigated = false,
+                durationMs = Clock.System.now().toEpochMilliseconds() - started,
+                dialog = waiting,
+                dialogAuto = computerUse.drainAutoDialogs(args.tabId).ifEmpty { null },
+            )
+        }
         val (ok, error, download) =
             when (action.type) {
                 in CuTypes.ALL -> {
@@ -971,8 +995,13 @@ internal class TabActions(
             screenshot = cu?.screenshot,
             focused = cu?.focused,
             text = cu?.text,
+            dialog = computerUse.pendingDialog(args.tabId),
+            dialogAuto = computerUse.drainAutoDialogs(args.tabId).ifEmpty { null },
         )
     }
+
+    /** Plugin dispose: give every captured tab its host dialog callbacks back. */
+    fun dispose() = computerUse.dispose()
 
     /** Same failure semantics as a runner verb: an exception is (false, reason), cancellation rethrows. */
     private suspend fun download(
@@ -1095,14 +1124,20 @@ internal class TabActions(
                 "run_script, switch_frame and assert are refused. " +
                 "Computer-use verbs act on what is on screen, in viewport CSS px, with real browser input: " +
                 "screenshot (value: max side px, default 1568) saves a JPEG and returns screenshot " +
-                "{path, width, height, css_width, css_height, dpr} (the pointer overlay is hidden in it); " +
+                "{path, width, height, css_width, css_height, dpr, scroll, content_hash} (the pointer overlay is hidden in it; content_hash changes when the page's text or form state changes, not for video or animation); " +
                 "click_at (value 'x,y'); type_text (value: text; selects the focused field's content first, replaces it; " +
                 "on a <select> it type-aheads the option); key (value: Enter, Escape, Tab, ArrowDown, ctrl+a, ...); " +
                 "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
                 "{tag, editable, label, type, options, sensitive}, never a value); pointer_hide (removes the overlay); " +
                 "page_text (read-only, value: max chars, default 20000, max 100000: returns text = the page's rendered innerText, never field values). " +
                 "Optional top-level pointer {label, color} shows a labelled agent cursor that glides to the action point " +
-                "(the element centre for selector actions) and ripples on click; it works in any tab and stays until pointer_hide."
+                "(the element centre for selector actions) and ripples on click; it works in any tab and stays until pointer_hide. " +
+                "Browser dialogs: from a tab's first computer-use verb its alert/confirm/prompt/beforeunload dialogs are held " +
+                "(one per tab); while one is pending every result carries dialog {type: alert|confirm|prompt|beforeunload, message, " +
+                "default_value?, ok_text?, cancel_text?, url?} and every other verb is refused until dialog_answer (value 'ok', " +
+                "'cancel' or 'ok:<text>' for a prompt) answers it. A dialog unanswered for 120 s is cancelled (alert: ok); " +
+                "dialog_auto lists dialogs answered automatically. cu_end (value ignored) ends computer use on the tab: " +
+                "the host's dialog handlers are restored and the pointer is removed."
 
         const val OBSERVE_SCHEMA =
             """{"type":"object","properties":{""" +
@@ -1114,9 +1149,9 @@ internal class TabActions(
             """{"type":"object","properties":{""" +
                 """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list)."},""" +
                 """"action":{"type":"object","properties":{""" +
-                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text"]},""" +
+                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text","cu_end","dialog_answer"]},""" +
                 """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit, download; optional for keypress (defaults to the focused element)."},""" +
-                """"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1568); click_at (required): 'x,y' CSS px in the viewport; type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right."}""" +
+                """"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1568); click_at (required): 'x,y' CSS px in the viewport; type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right; dialog_answer (required): 'ok' | 'cancel' | 'ok:<text>' (text answers a prompt)."}""" +
                 """},"required":["type"]},""" +
                 """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."},""" +
                 """"allow_sensitive":{"type":"boolean","default":false,"description":"input and type_text: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."},"pointer":{"type":"object","properties":{"label":{"type":"string","description":"Text on the cursor pill, e.g. 'Jev · Research'."},"color":{"type":"string","description":"Hex color, e.g. #6D28D9."}},"description":"Show an agent cursor that glides to the action point first. Absent = no overlay."}""" +
