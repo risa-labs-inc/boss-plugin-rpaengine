@@ -841,7 +841,7 @@ class ComputerUseTest {
             assertEquals(TabErrorCodes.INVALID_INPUT, code { parseStepArgs(step(it)) })
         }
         parseStepArgs(step("""{"type":"dialog_answer","value":"ok:hi"}""")); parseStepArgs(step("""{"type":"cu_end"}"""))
-        assertTrue(TabActions.STEP_SCHEMA.contains(""""cu_end","dialog_answer"]"""))
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""cu_end","dialog_answer","hover_at"]"""))
         assertTrue(TabActions.STEP_DESCRIPTION.contains("dialog_answer") && TabActions.STEP_DESCRIPTION.contains("120 s"))
     }
 

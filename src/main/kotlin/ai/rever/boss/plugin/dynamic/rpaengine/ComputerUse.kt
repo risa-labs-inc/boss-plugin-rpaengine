@@ -56,8 +56,9 @@ internal object CuTypes {
     const val CU_END = "cu_end"
     const val DIALOG_ANSWER = "dialog_answer"
     const val LOOK = "look"
+    const val HOVER_AT = "hover_at"
 
-    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT, LOCATE_TEXT, LOOK, CU_END, DIALOG_ANSWER)
+    val ALL = setOf(SCREENSHOT, CLICK_AT, TYPE_TEXT, KEY, SCROLL_BY, FOCUSED, POINTER_HIDE, PAGE_TEXT, LOCATE_TEXT, LOOK, CU_END, DIALOG_ANSWER, HOVER_AT)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -73,12 +74,32 @@ internal const val SCROLL_MAX_PX = 6000
 internal const val PAGE_TEXT_DEFAULT = 20_000
 internal const val PAGE_TEXT_LIMIT = 100_000
 
-/** The page's visible text (innerText: rendered text only, never form field values), cut to [max] chars. */
+/**
+ * Open shadow roots, self-contained: `shRoots()` every open shadow root under the document (recursively, closed ones
+ * cannot be seen), `deepAll(sel)` querySelectorAll across the document and those roots (light DOM first),
+ * `ccontains(a, b)` contains across shadow boundaries, `shText()` the rendered text of the shadow roots.
+ */
+internal const val SHADOW_JS: String =
+    "function shRoots(){var out=[];try{(function walk(root,d){if(d>8)return;var all=root.querySelectorAll('*');" +
+        "for(var i=0;i<all.length;i++){var s=all[i].shadowRoot;if(s){out.push(s);walk(s,d+1);}}})(document,0);}catch(e){}return out;}" +
+        // With shadow roots: the flat tree in rendered order (shadow content in place of its host's children, slotted
+        // elements where their slot is). Without: plain querySelectorAll.
+        "function deepAll(sel){var l=document.querySelectorAll(sel),out=[],i;if(!shRoots().length){for(i=0;i<l.length;i++){out.push(l[i]);}return out;}" +
+        "var seen=0;function fv(c,d){if(d>60||++seen>50000)return;try{if(c.matches&&c.matches(sel)){out.push(c);}}catch(x){}" +
+        "if(c.localName==='slot'&&c.assignedElements){var a=c.assignedElements({flatten:true});if(a.length){for(var j=0;j<a.length;j++){fv(a[j],d+1);}return;}}" +
+        "kids(c.shadowRoot||c,d);}" +
+        "function kids(n,d){var k=n.children||[];for(var q=0;q<k.length;q++){fv(k[q],d+1);}}" +
+        "fv(document.documentElement,0);return out;}" +
+        "function ccontains(a,b){for(var n=b;n;n=n.parentNode||n.host){if(n===a){return true;}}return false;}" +
+        "function shText(skip){var r=shRoots(),out=[];for(var k=0;k<r.length;k++){var c=r[k].children||[],s='';" +
+        "for(var i=0;i<c.length;i++){var t=c[i].innerText;if(t){s+=t+'\\n';}}s=s.replace(/\\s+$/,'');if(s&&(skip||'').indexOf(s)<0){out.push(s);}}return out.join('\\n');}"
+
+/** The page's visible text (innerText: rendered text only, never form field values), cut to [max] chars; open shadow roots' text is appended. */
 internal fun pageTextScript(max: Int): String =
     "(function(){var hid=[];try{" +
         "var n=document.querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]');" +
         "for(var i=0;i<n.length;i++){hid.push([n[i],n[i].style.getPropertyValue('display'),n[i].style.getPropertyPriority('display')]);n[i].style.setProperty('display','none','important');}" +
-        "var t=(document.body||document.documentElement).innerText||'';return t.length>$max?t.slice(0,$max):t;}catch(e){return null;}" +
+        SHADOW_JS + "var t=(document.body||document.documentElement).innerText||'';var sh=shText(t);if(sh){t+=(t?'\\n':'')+sh;}return t.length>$max?t.slice(0,$max):t;}catch(e){return null;}" +
         "finally{for(var j=0;j<hid.length;j++){try{hid[j][0].style.setProperty('display',hid[j][1],hid[j][2]);}catch(e){}}}})()"
 
 /**
@@ -90,10 +111,18 @@ internal fun contentHashScript(): String =
     "(function(){var hid=[];try{" +
         "var n=document.querySelectorAll('[data-rpa-pointer],[data-rpa-highlight]');" +
         "for(var i=0;i<n.length;i++){hid.push([n[i],n[i].style.getPropertyValue('display'),n[i].style.getPropertyPriority('display')]);n[i].style.setProperty('display','none','important');}" +
-        "var parts=[(document.body||document.documentElement).innerText||'',location.hash||''];" +
-        "var c=document.querySelectorAll('input,select,textarea');" +
+        SHADOW_JS + "var bt=(document.body||document.documentElement).innerText||'';var parts=[bt,location.hash||'',shText(bt)];" +
+        "var c=deepAll('input,select,textarea');" +
         "for(var k=0;k<c.length;k++){var el=c[k];" +
         "parts.push((el.type||el.tagName)+'|'+(el.checked?1:0)+'|'+(el.selectedIndex===undefined?'':el.selectedIndex)+'|'+(typeof el.value==='string'?el.value.length:0));}" +
+        // ARIA state of widgets (switches, tabs, menus) and which element holds focus (tag, name, position; never its content).
+        "var ar=deepAll('[aria-checked],[aria-pressed],[aria-selected],[aria-expanded]');" +
+        "for(var a=0;a<ar.length;a++){var w=ar[a];if(!w.getAttribute)continue;" +
+        "parts.push('a|'+w.tagName+'|'+w.getAttribute('aria-checked')+'|'+w.getAttribute('aria-pressed')+'|'+w.getAttribute('aria-selected')+'|'+w.getAttribute('aria-expanded'));}" +
+        "var ae=document.activeElement;while(ae&&ae.shadowRoot&&ae.shadowRoot.activeElement){ae=ae.shadowRoot.activeElement;}" +
+        "if(ae&&ae.getAttribute&&ae!==document.body&&ae!==document.documentElement){" +
+        "var fc=deepAll('input,select,textarea,button,a,iframe,frame,[tabindex],[contenteditable]');" +
+        "parts.push('f|'+ae.tagName+'|'+(ae.getAttribute('aria-label')||ae.getAttribute('placeholder')||ae.getAttribute('name')||ae.getAttribute('id')||'')+'|'+Array.prototype.indexOf.call(fc,ae));}" +
         "var s=parts.join('\\u0001'),h=5381;" +
         "for(var j=0;j<s.length;j++){h=((h<<5)+h+s.charCodeAt(j))|0;}" +
         "return (h>>>0).toString(16);}catch(e){return null;}" +
@@ -126,14 +155,15 @@ internal data class LocatedRect(val x: Int, val y: Int, val w: Int, val h: Int)
  * Answers JSON [LocatedInfo] about the match nearest the viewport.
  */
 internal fun locateTextScript(phrase: String): String =
-    """(function(){try{
+    """(function(){try{$SHADOW_JS
 var P=${phrase.asJsString()}.replace(/\s+/g,' ').trim().toLowerCase();
 if(!P)return null;
 var W=window.innerWidth||1,H=window.innerHeight||1,SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEXTAREA:1,SELECT:1,OPTION:1,TITLE:1};
 function word(c){return !!c&&/[a-z0-9_]/i.test(c);}
 function dig(c){return !!c&&/[0-9]/.test(c);}
-var whole=[],part=[];
-var w=document.createTreeWalker(document.body||document.documentElement,4,null),n;
+var whole=[],part=[],roots=[document.body||document.documentElement].concat(shRoots());
+for(var ri=0;ri<roots.length;ri++){
+var w=document.createTreeWalker(roots[ri],4,null),n;
 while((n=w.nextNode())){
 var el=n.parentElement;if(!el||SKIP[el.tagName])continue;
 if(el.closest&&el.closest('[data-rpa-pointer],[data-rpa-highlight]'))continue;
@@ -146,7 +176,7 @@ for(var i=at;i>=0;i=t.indexOf(P,i+1)){
 var b=i>0?t.charAt(i-1):'',a=t.charAt(i+P.length);
 if(!(word(b)&&word(P.charAt(0)))&&!(word(a)&&word(P.charAt(P.length-1)))){isWhole=true;break;}
 if(!(dig(b)&&dig(P.charAt(0)))&&!(dig(a)&&dig(P.charAt(P.length-1))))isPart=true;}
-if(isWhole)whole.push(r);else if(isPart)part.push(r);}
+if(isWhole)whole.push(r);else if(isPart)part.push(r);}}
 var hits=whole.length?whole:part;
 if(!hits.length)return JSON.stringify({found:false,count:0,in_view:false});
 var best=null,bd=0;
@@ -191,7 +221,7 @@ private const val SNAP_INTERACTIVE_SEL =
  * Answers JSON [SnapAnswer]; never reads a field value.
  */
 internal fun snapScript(x: Int, y: Int, box: SnapBox): String =
-    """(function(){try{
+    """(function(){try{$SHADOW_JS
 var x=$x,y=$y,B=[${box.left},${box.top},${box.right},${box.bottom}],SEL=${SNAP_INTERACTIVE_SEL.asJsString()};
 var W=window.innerWidth||1,H=window.innerHeight||1;
 function inOv(e){return !!(e.closest&&e.closest('[data-rpa-pointer],[data-rpa-highlight]'));}
@@ -216,11 +246,12 @@ return s.slice(0,80);}
 function norm(v){return(v||'').replace(/\s+/g,' ').trim();}
 function out(nx,ny,el){var m=nx!==x||ny!==y;return JSON.stringify(m?{x:nx,y:ny,moved:true,tag:el.tagName.toLowerCase(),label:label(el)||null}:{x:x,y:y,moved:false});}
 var under=document.elementFromPoint(x,y);
+for(var sd=0;under&&under.shadowRoot&&under.shadowRoot.elementFromPoint&&sd<8;sd++){var inner=under.shadowRoot.elementFromPoint(x,y);if(!inner||inner===under)break;under=inner;}
 if(under&&(under.tagName==='CANVAS'||under.tagName==='IFRAME'||under.tagName==='FRAME'))return out(x,y,null);
-for(var n=under;n&&n.nodeType===1;n=n.parentElement){if(inter(n))return out(x,y,n);}
+for(var n=under;n&&n.nodeType===1;n=n.parentElement||(n.parentNode&&n.parentNode.host)){if(inter(n))return out(x,y,n);}
 var bw=B[2]-B[0],bh=B[3]-B[1],px=Math.max(12,bw*0.25),py=Math.max(12,bh*0.25);
 var wide=[B[0]-px,B[1]-py,B[2]+px,B[3]+py],best=null,bestA=-1,bestD=0;
-var all=document.querySelectorAll(SEL+',[tabindex]');
+var all=deepAll(SEL+',[tabindex]');
 for(var i=0;i<all.length;i++){var e=all[i];if(!inter(e))continue;var r=vis(e);if(!r||!hit(r,wide))continue;
 var a=ov(r,B),cx=(r[0]+r[2])/2,cy=(r[1]+r[3])/2,d=Math.sqrt((cx-x)*(cx-x)+(cy-y)*(cy-y));
 if(a>bestA||(a===bestA&&d<bestD)){best=e;bestA=a;bestD=d;best.__r=r;}}
@@ -360,6 +391,33 @@ internal fun focusedLengthScript(): String =
 /** The length a replace-all of [text] leaves in a field: Enter and Tab are keystrokes, not content. */
 internal fun typedLength(text: String): Int = text.count { it != '\n' && it != '\r' && it != '\t' }
 
+/** A newly appeared, still empty frame in a look: how long to wait for it to populate before the one re-read. */
+internal const val FRAME_POPULATE_MS = 800L
+internal const val FRAME_POPULATE_POLL_MS = 100L
+
+/** The focused element's xpath, as `fxp(el)`; shared so two reads of focus compare. Expects [OBSERVE_HELPERS_JS]. */
+internal const val FOCUS_XP_JS =
+    "function fxp(e) { var parts = [], n = e; for (; n && n.nodeType === 1; n = n.parentNode) { var i = 1; " +
+        "for (var s = n.previousSibling; s; s = s.previousSibling) { if (s.nodeType === 1 && s.nodeName === n.nodeName) { i++; } } " +
+        "parts.unshift(xpathStep(n.namespaceURI, n.localName, n.nodeName, i)); } var p = '/' + parts.join('/'); " +
+        "return (n && n.nodeType === 11 && n.host) ? fxp(n.host) + '/#shadow' + p : p; } "
+
+/** The focused input/textarea after typing: its xpath, content length and djb2 hash; the content itself only with [reveal]. */
+internal fun focusedValueScript(reveal: Boolean): String =
+    "(function () { /*rpa-value*/ try { " + OBSERVE_HELPERS_JS + FOCUS_XP_JS +
+        "var el = document.activeElement; while (el && el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; } " +
+        "if (!el || !el.tagName) { return null; } var t = el.tagName.toLowerCase(); " +
+        "if (t !== 'input' && t !== 'textarea') { return JSON.stringify({ xp: fxp(el) }); } " +
+        "var s = typeof el.value === 'string' ? el.value : '', h = 5381; for (var j = 0; j < s.length; j++) { h = ((h << 5) + h + s.charCodeAt(j)) | 0; } " +
+        "return JSON.stringify({ xp: fxp(el), n: s.length, h: (h >>> 0).toString(16)" + (if (reveal) ", v: s.slice(0, $VALUE_MAX)" else "") + " }); " +
+        "} catch (e) { return null; } })()"
+
+internal const val VALUE_MAX = 500
+
+/** The page's answer to [focusedValueScript]. */
+@Serializable
+internal data class FieldValue(val xp: String? = null, val n: Int? = null, val h: String? = null, val v: String? = null)
+
 internal const val REVEAL_POLL_MS = 50L
 internal const val REVEAL_TIMEOUT_MS = 1_500L
 internal const val REVEAL_FRAME_MS = 120L
@@ -439,6 +497,12 @@ internal class CuOutcome(
     val note: String? = null,
     /** type_text: false when the typed text had not landed in the field by the cap; null otherwise. */
     val typedComplete: Boolean? = null,
+    /** type_text: what the field holds after typing (non-sensitive fields only), whether it is exactly the text, and whether it was retyped. */
+    val value: String? = null,
+    val valueOk: Boolean? = null,
+    val retyped: Boolean? = null,
+    /** hover_at by element: the element the mouse rests on. */
+    val hovered: ClickedInfo? = null,
 )
 
 /** The element a click_at / type_text `element` resolved to. */
@@ -977,9 +1041,7 @@ internal fun focusedScript(selectAll: Boolean): String =
         "try { for (var k = 0; k < window.frames.length; k++) { if (window.frames[k] === el.contentWindow) { fi = k; break; } } } catch (e1) {} " +
         "return JSON.stringify({ tag: tag, editable: false, hf: hf, fr: { i: Array.prototype.indexOf.call(fl, el), fi: fi, name: el.getAttribute('name') || '', " +
         "lab: norm(el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('name') || '') } }); } " +
-        "function fxp(e) { var parts = []; for (var n = e; n && n.nodeType === 1; n = n.parentNode) { var i = 1; " +
-        "for (var s = n.previousSibling; s; s = s.previousSibling) { if (s.nodeType === 1 && s.nodeName === n.nodeName) { i++; } } " +
-        "parts.unshift(xpathStep(n.namespaceURI, n.localName, n.nodeName, i)); } return '/' + parts.join('/'); } " +
+        FOCUS_XP_JS +
         "var type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : null; " +
         "var role = el.getAttribute('role'); " +
         "var ce = el.isContentEditable === true && tag !== 'input' && tag !== 'textarea'; " +
@@ -1024,6 +1086,9 @@ internal class ComputerUse(
     private val registries = java.util.concurrent.ConcurrentHashMap<String, PopupRegistry>()
 
     private val newPending: () -> PendingDialogs = { PendingDialogs() }
+
+    /** Each tab's frames at its latest look ("path|url"), to tell a newly appeared frame. */
+    private val lastFrames = java.util.concurrent.ConcurrentHashMap<String, Set<String>>()
 
     /** The element marks of each tab's latest look, by id. */
     private val marks = java.util.concurrent.ConcurrentHashMap<String, Map<String, MarkRef>>()
@@ -1109,6 +1174,7 @@ internal class ComputerUse(
                 positions.remove(tabId)
                 specs.remove(tabId)
                 marks.remove(tabId)
+                lastFrames.remove(tabId)
                 orNullUnlessCancelled { browser.executeJavaScript(pointerRemoveScript()) }
                 CuOutcome(true)
             }
@@ -1166,9 +1232,10 @@ internal class ComputerUse(
                             clicked = c.clicked
                         }
                         val t = typeText(browser, surface, tabId, value.orEmpty(), allowSensitive, focusBrowser = clicked == null)
-                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked, note = t.note, typedComplete = t.typedComplete)
+                        CuOutcome(t.ok, t.error, focused = t.focused, clicked = clicked, note = t.note, typedComplete = t.typedComplete, value = t.value, valueOk = t.valueOk, retyped = t.retyped)
                     }
                     CuTypes.KEY -> key(browser, surface, tabId, value)
+                    CuTypes.HOVER_AT -> hoverAt(browser, surface, tabId, value, pointer, element)
                     CuTypes.SCROLL_BY -> scrollBy(browser, surface, tabId, value, pointer)
                     else -> CuOutcome(false, "Unknown action type '${action.type}'")
                 }
@@ -1206,7 +1273,7 @@ internal class ComputerUse(
         val top = (orNullUnlessCancelled { browser.executeJavaScript(script) } as? String)
             ?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } as? JsonObject ?: return null
         val vp = Viewport.parse(strOf(top, "v")) ?: Viewport(1, 1, 1.0)
-        return top to walkFrames(FrameView.top(vp.width, vp.height, urlOf(top)), top, kids, script)
+        return top to walkFrames(FrameView.top(vp.width, vp.height, urlOf(top)), top, kids, script).answers
     }
 
     /** One read of [focusedScript] in [target]: what it says plus the parts that stay inside rpaengine. */
@@ -1314,38 +1381,64 @@ internal class ComputerUse(
         val opts = try { LookOptions.parse(value) } catch (e: IllegalArgumentException) { return CuOutcome(false, e.message) }
         var revealed = false
         if (reveal != null) revealed = ensureShown(browser, reveal).second
-        val raw = (orNullUnlessCancelled { browser.executeJavaScript(lookScript(opts)) } as? String)
-            ?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } as? JsonObject
-            ?: return CuOutcome(false, "Could not read the page (the page may be navigating)")
         fun part(o: JsonObject, k: String): String? = strOf(o, k)
-        val viewport = Viewport.parse(part(raw, "vp")) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
-        val meta = PageMeta.parse(part(raw, "meta"))
-        val scroll = ScrollInfo.parse(part(raw, "scroll"))
         fun hashOf(o: JsonObject) = part(o, "hash")?.trim('"')?.takeIf { CONTENT_HASH_RE.matches(it) }
-        val kids = surface.childFrames()
-        val frames = if (kids.isEmpty()) emptyList() else
-            walkFrames(FrameView.top(viewport.width, viewport.height, meta?.url ?: urlOf(raw)), raw, kids, lookScript(opts, child = true))
-        val hash = hashOf(raw)?.let { if (frames.isEmpty()) it else combineHashes(listOf(it) + frames.map { f -> hashOf(f.data) }) }
-        fun locatedIn(o: JsonObject, phrase: String): LocatedInfo? = decodeLocated(((o["located"] as? JsonObject)?.get(phrase) as? JsonPrimitive)?.takeIf { it.isString }?.content)
-        val located = LinkedHashMap<String, LocatedInfo>()
-        for (phrase in opts.locate) {
-            val top = locatedIn(raw, phrase) ?: LocatedInfo(found = false, count = 0, inView = false)
-            located[phrase] = if (frames.isEmpty()) top else mergeLocated(top, frames.mapNotNull { f -> locatedIn(f.data, phrase)?.let { f.view to it } })
-        }
         fun elsOf(o: JsonObject) = part(o, "els")
             ?.let { runCatching { TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(RawLookElement.serializer()), it) }.getOrNull() }
             .orEmpty().filter { isMarkId(it.id) }
-        val placed = placeElements(elsOf(raw), frames.map { it.view to elsOf(it.data) })
-        if (opts.elements) marks[tabId] = placed.associate { it.element.id to it.mark }
-        val pageText = if (!opts.pageText) null else part(raw, "text").let { t ->
-            if (frames.isEmpty()) t else joinFrameText(t.orEmpty(), frames.map { it.view.host to part(it.data, "text").orEmpty() }, PAGE_TEXT_DEFAULT)
+        var retried = false
+        while (true) {
+            val raw = (orNullUnlessCancelled { browser.executeJavaScript(lookScript(opts)) } as? String)
+                ?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } as? JsonObject
+                ?: return CuOutcome(false, "Could not read the page (the page may be navigating)")
+            val viewport = Viewport.parse(part(raw, "vp")) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
+            val meta = PageMeta.parse(part(raw, "meta"))
+            val scroll = ScrollInfo.parse(part(raw, "scroll"))
+            // The frame tree is read afresh on every look: frames created or navigated since the last one are included.
+            val kids = surface.childFrames()
+            val walk = if (kids.isEmpty()) FrameWalk(emptyList(), emptyList()) else
+                walkFrames(FrameView.top(viewport.width, viewport.height, meta?.url ?: urlOf(raw)), raw, kids, lookScript(opts, child = true))
+            val frames = walk.answers
+            val placed = placeElements(elsOf(raw), frames.map { it.view to elsOf(it.data) })
+            // A frame that is new since the last look, on screen and still empty is usually still loading (a login
+            // dialog's iframe right after the click): give it up to FRAME_POPULATE_MS to populate, then read once more.
+            if (!retried && frames.isNotEmpty()) {
+                val seen = lastFrames[tabId].orEmpty()
+                val blank = frames.filter { f -> f.view.clip != null && frameKey(f.view) !in seen && placed.none { it.element.frame == f.view.path } }
+                if (blank.isNotEmpty()) {
+                    retried = true
+                    val deadline = System.currentTimeMillis() + FRAME_POPULATE_MS
+                    while (System.currentTimeMillis() < deadline) {
+                        delay(FRAME_POPULATE_POLL_MS)
+                        val counts = blank.map { f -> (orNullUnlessCancelled { f.view.handle?.eval(interactiveCountScript()) } as? Number)?.toInt() ?: 0 }
+                        if (counts.any { it > 0 }) break
+                    }
+                    lastFrames[tabId] = frames.map { frameKey(it.view) }.toSet()
+                    continue
+                }
+            }
+            lastFrames[tabId] = frames.map { frameKey(it.view) }.toSet()
+            val hash = hashOf(raw)?.let { if (frames.isEmpty()) it else combineHashes(listOf(it) + frames.map { f -> hashOf(f.data) }) }
+            fun locatedIn(o: JsonObject, phrase: String): LocatedInfo? = decodeLocated(((o["located"] as? JsonObject)?.get(phrase) as? JsonPrimitive)?.takeIf { it.isString }?.content)
+            val located = LinkedHashMap<String, LocatedInfo>()
+            for (phrase in opts.locate) {
+                val top = locatedIn(raw, phrase) ?: LocatedInfo(found = false, count = 0, inView = false)
+                located[phrase] = if (frames.isEmpty()) top else mergeLocated(top, frames.mapNotNull { f -> locatedIn(f.data, phrase)?.let { f.view to it } })
+            }
+            if (opts.elements) marks[tabId] = placed.associate { it.element.id to it.mark }
+            val pageText = if (!opts.pageText) null else part(raw, "text").let { t ->
+                if (frames.isEmpty()) t else joinFrameText(t.orEmpty(), frames.map { it.view.host to part(it.data, "text").orEmpty() }, PAGE_TEXT_DEFAULT)
+            }
+            val debug = walk.debug.map { d -> d.copy(elements = placed.count { it.element.frame == d.path }) }.ifEmpty { null }
+            val image = surface.bitmap() ?: return CuOutcome(false, "The browser returned no bitmap")
+            val (w, h) = fitShotSize(image.width, image.height, opts.maxSide)
+            val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h), opts.quality))
+            val shot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, hash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }, meta?.modal)
+            return CuOutcome(true, look = LookResult(shot, located, placed.map { it.element }, pageText = pageText, framesDebug = debug))
         }
-        val image = surface.bitmap() ?: return CuOutcome(false, "The browser returned no bitmap")
-        val (w, h) = fitShotSize(image.width, image.height, opts.maxSide)
-        val file = shots.save(tabId, encodeJpeg(scaleImage(image, w, h), opts.quality))
-        val shot = ScreenshotInfo(file.absolutePath, w, h, viewport.width, viewport.height, viewport.dpr, scroll, hash, meta?.url, meta?.title, meta?.visible, revealed.takeIf { it }, meta?.modal)
-        return CuOutcome(true, look = LookResult(shot, located, placed.map { it.element }, pageText = pageText))
     }
+
+    private fun frameKey(v: FrameView) = "${v.path}|${v.url}"
 
     /**
      * Resolves mark [id]: its current clickable point in TOP-viewport px, or why there is none (disabled/covered/gone),
@@ -1443,6 +1536,10 @@ internal class ComputerUse(
         delay(FRAME_MS)
     }
 
+    private suspend fun readValue(target: BrowserIntegration, reveal: Boolean): FieldValue? =
+        (orNullUnlessCancelled { withTimeoutOrNull(QUIET_CALL_TIMEOUT_MS) { target.executeJavaScript(focusedValueScript(reveal)) } } as? String)
+            ?.let { runCatching { TabJson.decodeFromString(FieldValue.serializer(), it) }.getOrNull() }
+
     /**
      * After the key events went out: polls the focused field's content length in [target] until it is [expected] or has
      * not changed for [TYPE_STABLE_MS]; false when max([TYPE_CAP_MIN_MS], [TYPE_CAP_PER_CHAR_MS] x chars) passed first.
@@ -1490,13 +1587,58 @@ internal class ComputerUse(
         }
         if (!surface.play(events)) return CuOutcome(false, "The browser did not accept the key events", focused = focused)
         // The engine applies key events asynchronously: done only when the text has landed (a <select> keeps the old behaviour).
-        val complete = isSelect || awaitTyped(read.target, typedLength(text), text.length)
+        var complete = isSelect || awaitTyped(read.target, typedLength(text), text.length)
+        // Self-check: the same field (focus did not move) must now hold exactly the text; otherwise select-all and retype once.
+        // Compared by length and hash, so a sensitive field's content never leaves the page.
+        val reveal = !focused.sensitive
+        val verifiable = !isSelect && (focused.tag == "input" || focused.tag == "textarea") && read.xp != null && text.none { it == '\n' || it == '\r' || it == '\t' }
+        fun sameField(v: FieldValue?) = v?.takeIf { it.xp == read.xp && it.n != null }
+        fun exact(v: FieldValue) = v.n == text.length && v.h == djb2Hex(text)
+        var checked: FieldValue? = if (verifiable) sameField(readValue(read.target, reveal)) else null
+        var retyped = false
+        if (checked != null && !exact(checked)) {
+            focusOnce(read.target, selectAll = true)
+            if (surface.play(TabGestures.type(text))) {
+                retyped = true
+                complete = awaitTyped(read.target, typedLength(text), text.length)
+                checked = sameField(readValue(read.target, reveal))
+            }
+        }
         quietIn(browser, tabId, read.target.takeIf { read.inFrame })
         val after = readFocusedDeep(browser, surface)
         val note = if (after != null && read.xp != null && (after.xp != read.xp || after.info.frame != read.info.frame)) {
             "Focus moved while typing from '${focused.label ?: focused.tag}' to '${after.info.label ?: after.info.tag}' (the page advanced it, as split code boxes do)"
         } else null
-        return CuOutcome(true, focused = after?.info ?: focused, note = note, typedComplete = if (complete) null else false)
+        return CuOutcome(true, focused = after?.info ?: focused, note = note, typedComplete = if (complete) null else false,
+            value = if (reveal) checked?.v else null, valueOk = checked?.let(::exact), retyped = retyped.takeIf { it })
+    }
+
+    /**
+     * A real mouse move to the point (an element's visible centre, or x,y) and nothing else, so CSS :hover menus open.
+     * No later read-only verb (look, screenshot, page_text...) moves the mouse, so what opened stays open.
+     */
+    private suspend fun hoverAt(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?, pointer: PointerSpec?, element: String?): CuOutcome {
+        val fallback = parsePoint(value)
+        var hovered: ClickedInfo? = null
+        var at: Pair<Int, Int>? = null
+        var frame: BrowserIntegration? = null
+        if (element != null) {
+            val (a, f) = resolveMark(browser, surface, tabId, element)
+            val name = a.label ?: marks[tabId]?.get(element)?.label ?: element
+            when (a.state) {
+                "ok" -> { at = a.x to a.y; hovered = ClickedInfo(element, a.label, a.tag); frame = f }
+                "covered" -> return CuOutcome(false, "'$name' is covered by ${a.cover ?: "another element"}")
+                else -> if (fallback == null) return CuOutcome(false, if (a.state == "disabled") "'$name' is disabled; hover its x,y instead" else "Element '$element' is gone and no x,y fallback was given; take a new look")
+            }
+        }
+        val (x, y) = at ?: fallback ?: return CuOutcome(false, "hover_at value must be 'x,y' in CSS px")
+        val viewport = readViewport(browser) ?: return CuOutcome(false, "Could not read the viewport size (the page may be navigating)")
+        pointInViewport(x, y, viewport.width, viewport.height)
+            ?: return CuOutcome(false, "($x,$y) is outside the ${viewport.width}x${viewport.height} viewport")
+        if (pointer != null) glide(browser, tabId, x, y, pointer, ripple = false)
+        if (!surface.play(listOf(TabEvent.Move(x, y)))) return CuOutcome(false, "The browser did not accept the mouse move")
+        quietIn(browser, tabId, frame)
+        return CuOutcome(true, hovered = hovered)
     }
 
     private suspend fun key(browser: BrowserIntegration, surface: TabSurface, tabId: String, value: String?): CuOutcome {

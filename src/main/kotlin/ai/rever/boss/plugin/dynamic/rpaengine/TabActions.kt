@@ -181,7 +181,7 @@ internal fun parseStepArgs(raw: String): StepArgs {
             else -> invalid("'element' must be a mark id like m12 from the latest look")
         }
     }
-    if (element != null && type != CuTypes.CLICK_AT && type != CuTypes.TYPE_TEXT) invalid("'element' applies only to click_at and type_text")
+    if (element != null && type != CuTypes.CLICK_AT && type != CuTypes.TYPE_TEXT && type != CuTypes.HOVER_AT) invalid("'element' applies only to click_at, type_text and hover_at")
     if (type in SELECTOR_REQUIRED && selector.type == SelectorTypes.NONE) {
         invalid("'$type' requires action.selector")
     }
@@ -196,6 +196,7 @@ internal fun parseStepArgs(raw: String): StepArgs {
             invalid("'screenshot' value must be a max side in px between $SHOT_MIN_SIDE and $SHOT_MAX_SIDE_LIMIT")
         }
         CuTypes.CLICK_AT -> if (parsePoint(value) == null && !(element != null && value == null)) invalid("'click_at' requires action.value 'x,y' (CSS px in the viewport), or an element id with an optional x,y fallback")
+        CuTypes.HOVER_AT -> if (parsePoint(value) == null && !(element != null && value == null)) invalid("'hover_at' requires action.value 'x,y' (CSS px in the viewport), or an element id with an optional x,y fallback")
         CuTypes.LOOK -> try { LookOptions.parse(value) } catch (e: IllegalArgumentException) { invalid(e.message ?: "invalid look options") }
         CuTypes.TYPE_TEXT -> if (value == null) invalid("'type_text' requires action.value (the text to type)")
         CuTypes.KEY -> if (TabKeys.parse(value) == null) invalid("'key' requires action.value, a key name like Enter, Escape, Tab, ArrowDown or ctrl+a")
@@ -312,6 +313,12 @@ internal data class StepResult(
     val note: String? = null,
     /** type_text only: false when the typed text had not fully landed in the field by the time cap. */
     @SerialName("typed_complete") val typedComplete: Boolean? = null,
+    /** type_text: the field's content after typing (never for a sensitive field), whether it is exactly the text, and whether it was retyped once. */
+    val value: String? = null,
+    @SerialName("value_ok") val valueOk: Boolean? = null,
+    val retyped: Boolean? = null,
+    /** hover_at by element: the element the mouse rests on. */
+    val hovered: ClickedInfo? = null,
 )
 
 @Serializable
@@ -330,7 +337,7 @@ internal data class DownloadInfo(
 internal fun stepResultJson(result: StepResult): String {
     val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
     return JsonObject(
-        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups" || k == "note" || k == "typed_complete") && v is JsonNull }
+        o.filterNot { (k, v) -> (k == "screenshot" || k == "focused" || k == "text" || k == "dialog" || k == "dialog_auto" || k == "snapped" || k == "located" || k == "clicked" || k == "look" || k == "popups" || k == "note" || k == "typed_complete" || k == "value" || k == "value_ok" || k == "retyped" || k == "hovered") && v is JsonNull }
             .mapValues { (k, v) ->
                 when {
                     k == "popups" && v is kotlinx.serialization.json.JsonArray ->
@@ -338,7 +345,7 @@ internal fun stepResultJson(result: StepResult): String {
                     k == "screenshot" && v is JsonObject -> JsonObject(v.filterNot { (sk, sv) -> (sk == "scroll" || sk == "content_hash" || sk == "url" || sk == "title" || sk == "visible" || sk == "revealed" || sk == "modal") && sv is JsonNull })
                     k == "look" && v is JsonObject -> pruneNulls(v)
                     k == "focused" && v is JsonObject -> JsonObject(v.filterNot { (fk, fv) -> fk == "frame" && fv is JsonNull })
-                    (k == "dialog" || k == "snapped" || k == "located" || k == "clicked") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
+                    (k == "dialog" || k == "snapped" || k == "located" || k == "clicked" || k == "hovered") && v is JsonObject -> JsonObject(v.filterNot { it.value is JsonNull })
                     else -> v
                 }
             }
@@ -906,7 +913,7 @@ internal const val STEP_URL_SETTLE_MS = 300L
 /** The shorter settle of the computer-use action verbs: their quiet wait already stops on a location change. */
 internal const val STEP_URL_SETTLE_QUIET_MS = 100L
 
-internal val STEP_QUIET_ACTION_TYPES = setOf(CuTypes.CLICK_AT, CuTypes.TYPE_TEXT, CuTypes.KEY, CuTypes.SCROLL_BY, CuTypes.DIALOG_ANSWER)
+internal val STEP_QUIET_ACTION_TYPES = setOf(CuTypes.CLICK_AT, CuTypes.HOVER_AT, CuTypes.TYPE_TEXT, CuTypes.KEY, CuTypes.SCROLL_BY, CuTypes.DIALOG_ANSWER)
 
 /** Post-step wait before the URL is read again: none for read-only verbs, 100 ms after a quiet-waited verb, else 300 ms. */
 internal fun stepUrlSettleMs(type: String): Long = when (type) {
@@ -1012,7 +1019,7 @@ internal class TabActions(
         val popupOf = splitPopupId(args.tabId)
         val browser = if (popupOf != null) {
             if (args.action.type !in CuTypes.ALL) {
-                throw TabToolException(TabErrorCodes.UNSUPPORTED_ACTION, "'${args.action.type}' needs a tab's DOM; use computer-use verbs (screenshot, look, click_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on popup windows")
+                throw TabToolException(TabErrorCodes.UNSUPPORTED_ACTION, "'${args.action.type}' needs a tab's DOM; use computer-use verbs (screenshot, look, click_at, hover_at, type_text, key, scroll_by, focused, page_text, locate_text, dialog_answer, cu_end) on popup windows")
             }
             computerUse.popupTarget(args.tabId)?.integration
                 ?: throw TabToolException(TabErrorCodes.TAB_NOT_FOUND, "No open popup window '${args.tabId}'")
@@ -1122,6 +1129,10 @@ internal class TabActions(
             popups = popupsNow,
             note = cu?.note,
             typedComplete = cu?.typedComplete,
+            value = cu?.value,
+            valueOk = cu?.valueOk,
+            retyped = cu?.retyped,
+            hovered = cu?.hovered,
         )
     }
 
@@ -1256,11 +1267,13 @@ internal class TabActions(
                 "snapped {from, to, tag, label} only when it moved; canvas or no candidate = the raw point); type_text (value: text; selects the focused field's content first, replaces it; " +
                 "on a <select> it type-aheads the option); key (value: Enter, Escape, Tab, ArrowDown, ctrl+a, ...); " +
                 "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
-                "{tag, editable, label, type, options, sensitive, frame?}, never a value; focus inside an iframe is followed into that frame; type_text adds note when the page moved focus while typing, e.g. split code boxes, returns once the typed text has landed in the field and adds typed_complete: false when it had not by the cap; after a click on a field element, keys wait until it has focus); pointer_hide (removes the overlay); " +
+                "{tag, editable, label, type, options, sensitive, frame?}, never a value; focus inside an iframe is followed into that frame; type_text adds note when the page moved focus while typing, e.g. split code boxes, returns once the typed text has landed in the field and adds typed_complete: false when it had not by the cap; then checks the field holds exactly the text (select-all + retype once if not; retyped: true) and returns value (not for sensitive fields) and value_ok; after a click on a field element, keys wait until it has focus); pointer_hide (removes the overlay); " +
                 "page_text (read-only, value: max chars, default 20000, max 100000: returns text = the page's rendered innerText, never field values). " +
                 "look (read-only; value: a JSON string of options {max_side: 1100, quality: 0.7, locate: [phrases], elements: true, ensure_visible: false, page_text: false}) returns everything for one decision in one call: " +
                 "look {screenshot {...as above}, located {phrase: {found, count, in_view, direction, screens, rect?}}, elements [{id: 'm1'.., role, tag, label, value_kind?: text|empty|checked|unchecked|selected:<option>, rect {x,y,w,h}, disabled, covered, context, editable, href_host?, frame?}], page_text?, popups?, dialog?}; " +
-                "look, page_text, locate_text and content_hash also cover iframes (cross-origin and nested, up to 10 frames, 3 deep): a frame element carries frame (a path like '0' or '0.1') and its rect in top-viewport px, elements of a frame scrolled out of view or hidden are left out, page_text adds each frame's text as '[frame <host>]' blocks; " +
+                "look, page_text, locate_text and content_hash also cover iframes (cross-origin and nested, up to 10 frames, 3 deep): a frame element carries frame (a path like '0' or '0.1') and its rect in top-viewport px, elements of a frame scrolled out of view or hidden are left out, page_text adds each frame's text as '[frame <host>]' blocks; look adds frames_debug [{path, url, name, matched_iframe {src, rect}, excluded_reason, elements}]; content_hash also moves with ARIA checked/pressed/selected/expanded state and with which element has focus; " +
+                "all of these also reach into open shadow roots (web components; closed ones cannot be read); " +
+                "hover_at (value 'x,y' or element) moves the real mouse there and nothing else, so CSS :hover menus open; no read-only verb moves the mouse afterwards; result adds hovered {id, label, tag} for an element; " +
                 "elements are the interactive ones in the viewport (modal ones first, at most 120; disabled and covered ones are kept and flagged); click_at and type_text accept element: '<id>' from the tab's latest look " +
                 "(clicks its current visible centre after a hit-test; ok false with '<label> is disabled' or '<label> is covered by <x>'; a vanished element falls back to value 'x,y' when given; the result adds clicked {id, label, tag}; type_text clicks it first). " +
                 "Read-only verbs return without settling; action verbs wait until the page is quiet (no DOM change for 100 ms, at most 800 ms). " +
@@ -1289,9 +1302,9 @@ internal class TabActions(
             """{"type":"object","properties":{""" +
                 """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list)."},""" +
                 """"action":{"type":"object","properties":{""" +
-                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text","locate_text","look","cu_end","dialog_answer"]},""" +
+                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide","page_text","locate_text","look","cu_end","dialog_answer","hover_at"]},""" +
                 """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit, download; optional for keypress (defaults to the focused element)."},""" +
-                """"element":{"type":"string","description":"click_at and type_text: a mark id such as m12 from the tab's latest look; clicks that element's current visible centre."},"ensure_visible":{"type":"boolean","default":false,"description":"screenshot only: when the page reports itself hidden, select its tab first (not for popup windows)."},"hide_overlay":{"type":"boolean","default":false,"description":"screenshot only: remove the pointer overlay while capturing (default: leave it)."},"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1100); look: JSON options string (optional); click_at (required unless action.element is given): 'x,y' CSS px in the viewport (the fallback when element is gone); type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right; locate_text (required): phrase; dialog_answer (required): 'ok' | 'cancel' | 'ok:<text>' (text answers a prompt)."}""" +
+                """"element":{"type":"string","description":"click_at, type_text and hover_at: a mark id such as m12 from the tab's latest look; clicks that element's current visible centre."},"ensure_visible":{"type":"boolean","default":false,"description":"screenshot only: when the page reports itself hidden, select its tab first (not for popup windows)."},"hide_overlay":{"type":"boolean","default":false,"description":"screenshot only: remove the pointer overlay while capturing (default: leave it)."},"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1100); look: JSON options string (optional); click_at (required unless action.element is given): 'x,y' CSS px in the viewport (the fallback when element is gone); type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right; locate_text (required): phrase; dialog_answer (required): 'ok' | 'cancel' | 'ok:<text>' (text answers a prompt)."}""" +
                 """},"required":["type"]},""" +
                 """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."},""" +
                 """"allow_sensitive":{"type":"boolean","default":false,"description":"input and type_text: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."},"snap":{"type":"object","properties":{"box":{"type":"string","description":"left,top,right,bottom in viewport CSS px: where the target is believed to be."}},"required":["box"],"description":"click_at only: snap a near-miss onto the interactive element the box overlaps most. Accepted inside action or at top level."},"pointer":{"type":"object","properties":{"label":{"type":"string","description":"Text on the cursor pill, e.g. 'Jev · Research'."},"color":{"type":"string","description":"Hex color, e.g. #6D28D9."}},"description":"Show an agent cursor that glides to the action point first. Absent = no overlay."}""" +

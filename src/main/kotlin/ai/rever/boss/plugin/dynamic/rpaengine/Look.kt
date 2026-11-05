@@ -77,6 +77,8 @@ internal data class LookElement(
     @SerialName("href_host") val hrefHost: String? = null,
     /** The frame path ("0", "0.1") of an element inside an iframe; absent for the top document. */
     val frame: String? = null,
+    /** True on the element that has keyboard focus (in its frame, and that frame is the focused one); absent otherwise. */
+    val focused: Boolean? = null,
 )
 
 @Serializable
@@ -87,6 +89,8 @@ internal data class LookResult(
     @SerialName("page_text") val pageText: String? = null,
     val popups: List<PopupInfo>? = null,
     val dialog: DialogInfo? = null,
+    /** Every child frame seen: its url, matched iframe, and why it is not in the look (null when it is). */
+    @SerialName("frames_debug") val framesDebug: List<FrameDebug>? = null,
 )
 
 /** What the page script hands back per element; [xp] is the stable path kept for re-resolution and never returned. */
@@ -106,6 +110,8 @@ internal data class RawLookElement(
     val xp: String? = null,
     /** Inside its document's open modal. */
     val mod: Boolean = false,
+    /** Its document's activeElement. */
+    val focused: Boolean = false,
 )
 
 private val MARK_ID = Regex("m[0-9]{1,4}")
@@ -130,22 +136,32 @@ internal class MarkRef(val xpath: String?, val label: String, val tag: String, v
 private val NO_TEXT_TYPES = "{button:1,submit:1,reset:1,image:1,file:1,checkbox:1,radio:1,range:1,color:1,hidden:1}"
 
 /** JS shared by the elements and mark scripts. Expects [OBSERVE_HELPERS_JS], [OBSERVE_DOM_JS] and [MODAL_JS] in scope. */
-private const val MARK_COMMON_JS: String =
+private const val MARK_COMMON_JS: String = SHADOW_JS +
     "function visRect(r) { var l = Math.max(r.left, 0), t = Math.max(r.top, 0), rr = Math.min(r.right, VW), b = Math.min(r.bottom, VH); " +
         "return (rr > l && b > t) ? { l: l, t: t, r: rr, b: b } : null; } " +
-        "function topAt(x, y) { var l = document.elementsFromPoint ? document.elementsFromPoint(x, y) : [document.elementFromPoint(x, y)]; " +
-        "for (var q = 0; q < l.length; q++) { if (l[q] && !mOvl(l[q])) { return l[q]; } } return null; } " +
-        "function blocks(el, t) { if (!t || t === el || el.contains(t)) { return false; } " +
-        "var lab = t.closest ? t.closest('label') : null; return !(lab && lab.contains(el)); } " +
+        // The top node at a point, descending into open shadow roots (the document only answers with the host).
+        "function firstOf(l) { for (var q = 0; q < l.length; q++) { if (l[q] && !mOvl(l[q])) { return l[q]; } } return null; } " +
+        "function topAt(x, y) { var t = firstOf(document.elementsFromPoint ? document.elementsFromPoint(x, y) : [document.elementFromPoint(x, y)]); " +
+        "for (var d = 0; t && t.shadowRoot && d < 8; d++) { var s = t.shadowRoot; " +
+        "var inner = firstOf(s.elementsFromPoint ? s.elementsFromPoint(x, y) : (s.elementFromPoint ? [s.elementFromPoint(x, y)] : [])); " +
+        "if (!inner || inner === t) { break; } t = inner; } return t; } " +
+        "function blocks(el, t) { if (!t || t === el || ccontains(el, t)) { return false; } " +
+        "var lab = t.closest ? t.closest('label') : null; return !(lab && ccontains(lab, el)); } " +
         "function roleOf(el, tag, type) { var explicit = norm(el.getAttribute('role')).split(' ')[0]; " +
         "var ce = el.isContentEditable === true && tag !== 'input' && tag !== 'textarea'; " +
         "return explicit || (ce ? 'textbox' : implicitRole(tag, type)) || tag; } " +
         "function typeOf(el, tag) { return (tag === 'input' || tag === 'button') ? (el.getAttribute('type') || (tag === 'button' ? 'submit' : 'text')).toLowerCase() : null; } " +
         "function labelNow(el) { var tag = el.tagName.toLowerCase(), type = typeOf(el, tag); " +
         "return (labelOf(el, tag, roleOf(el, tag, type), type) || '').slice(0, 80); } " +
-        "function xpathOf(el) { var parts = []; for (var n = el; n && n.nodeType === 1; n = n.parentNode) { var i = 1; " +
+        // Inside an open shadow root: the host's path, '/#shadow', then the path from the root.
+        "function xpathOf(el) { var parts = [], n = el; for (; n && n.nodeType === 1; n = n.parentNode) { var i = 1; " +
         "for (var s = n.previousSibling; s; s = s.previousSibling) { if (s.nodeType === 1 && s.nodeName === n.nodeName) { i++; } } " +
-        "parts.unshift(xpathStep(n.namespaceURI, n.localName, n.nodeName, i)); } return '/' + parts.join('/'); } "
+        "parts.unshift(xpathStep(n.namespaceURI, n.localName, n.nodeName, i)); } var p = '/' + parts.join('/'); " +
+        "return (n && n.nodeType === 11 && n.host) ? xpathOf(n.host) + '/#shadow' + p : p; } " +
+        "function byXp(xp) { var segs = String(xp).split('/#shadow'), n = document.evaluate(segs[0], document, null, 9, null).singleNodeValue; " +
+        "for (var g = 1; n && g < segs.length; g++) { if (!n.shadowRoot) { return null; } n = n.shadowRoot; var st = segs[g].split('/'); " +
+        "for (var j = 1; n && j < st.length; j++) { var mm = /^([a-z0-9-]+)\\[(\\d+)\\]$/.exec(st[j]); if (!mm) { return null; } " +
+        "var c = n.children || [], k = 0, hit = null; for (var q = 0; q < c.length; q++) { if (c[q].localName === mm[1] && ++k === +mm[2]) { hit = c[q]; break; } } n = hit; } } return n; } "
 
 /**
  * The in-viewport interactive elements, modal ones first, at most [max], as a JSON array string (null on failure).
@@ -165,12 +181,13 @@ internal fun lookElementsScript(max: Int = LOOK_MAX_ELEMENTS): String =
         "for (var s = a.previousElementSibling; s; s = s.previousElementSibling) { " +
         "if (/^H[1-6]$/.test(s.tagName) || s.getAttribute('role') === 'heading') { var ht = norm(s.innerText || s.textContent); if (ht) { return ht.slice(0, $LABEL_MAX); } } } } " +
         "return ''; } " +
-        "var all = document.querySelectorAll(SEL), mod = [], rest = []; " +
+        "var all = deepAll(SEL), mod = [], rest = []; " +
         "for (var i = 0; i < all.length; i++) { var el0 = all[i]; if (mOvl(el0)) { continue; } var r0 = el0.getBoundingClientRect(); " +
-        "if (!hasSize(r0) || !visRect(r0)) { continue; } ((modal && modal.el.contains(el0)) ? mod : rest).push(el0); } " +
+        "if (!hasSize(r0) || !visRect(r0)) { continue; } ((modal && ccontains(modal.el, el0)) ? mod : rest).push(el0); } " +
         "var picked = []; function take(list) { for (var j = 0; j < list.length && picked.length < MAX; j++) { if (styledVisible(list[j])) { picked.push(list[j]); } } } " +
         "take(mod); take(rest); " +
         "var M = (typeof Map === 'function') ? new Map() : null, O = {}; var out = []; " +
+        "var AE = document.activeElement; while (AE && AE.shadowRoot && AE.shadowRoot.activeElement) { AE = AE.shadowRoot.activeElement; } " +
         "for (var k = 0; k < picked.length; k++) { var el = picked[k], id = 'm' + (k + 1); " +
         "var tag = el.tagName.toLowerCase(), type = typeOf(el, tag), role = roleOf(el, tag, type), label = labelNow(el); " +
         "var ce = el.isContentEditable === true && tag !== 'input' && tag !== 'textarea'; " +
@@ -187,7 +204,7 @@ internal fun lookElementsScript(max: Int = LOOK_MAX_ELEMENTS): String =
         "if (M) { M.set(id, el); } else { O[id] = el; } " +
         "out.push({ id: id, role: role, tag: tag, label: label, value_kind: vk, x: Math.round(vr.l), y: Math.round(vr.t), " +
         "w: Math.round(vr.r - vr.l), h: Math.round(vr.b - vr.t), disabled: disabled(el), covered: blocks(el, topAt(cx, cy)), " +
-        "context: ctxOf(el, label), editable: editable, href_host: host, xp: xpathOf(el), mod: !!(modal && modal.el.contains(el)) }); } " +
+        "context: ctxOf(el, label), editable: editable, href_host: host, xp: xpathOf(el), mod: !!(modal && ccontains(modal.el, el)), focused: !!AE && el === AE }); } " +
         "window.__rpaMarks = M || O; " +
         "return JSON.stringify(out); } catch (e) { return null; } })()"
 
@@ -213,22 +230,28 @@ internal fun lookScript(opts: LookOptions, child: Boolean = false): String {
  * window.frames index, name, src (about:srcdoc for srcdoc frames) and title/aria-label. Never reads into the frame.
  */
 internal fun framesListScript(): String =
-    "(function () { /*rpa-frames*/ try { var fl = document.querySelectorAll('iframe,frame'); if (!fl.length) { return '[]'; } " +
+    "(function () { /*rpa-frames*/ try { " +
         OBSERVE_HELPERS_JS + OBSERVE_DOM_JS + MODAL_JS + MARK_COMMON_JS +
+        "var fl = deepAll('iframe,frame'); if (!fl.length) { return '[]'; } " +
         "var modal = findModal(), out = [], grids = 0; " +
         "for (var i = 0; i < fl.length && i < $FRAME_LIST_MAX; i++) { var el = fl[i], r = el.getBoundingClientRect(), cs = window.getComputedStyle(el); " +
         "var pl = parseFloat(cs.paddingLeft) || 0, pt = parseFloat(cs.paddingTop) || 0, pr = parseFloat(cs.paddingRight) || 0, pb = parseFloat(cs.paddingBottom) || 0; " +
-        "var x = r.left + (el.clientLeft || 0) + pl, y = r.top + (el.clientTop || 0) + pt; " +
-        "var w = Math.max(0, (el.clientWidth || 0) - pl - pr), h = Math.max(0, (el.clientHeight || 0) - pt - pb); " +
-        "var shown = w > 1 && h > 1 && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse' && !(el.closest && el.closest('[hidden]')); " +
+        // A transformed iframe (a modal's zoom animation) is drawn scaled: rect / layout size is the scale.
+        "var sx = (el.offsetWidth > 0 && r.width > 0) ? r.width / el.offsetWidth : 1, sy = (el.offsetHeight > 0 && r.height > 0) ? r.height / el.offsetHeight : 1; " +
+        "var x = r.left + ((el.clientLeft || 0) + pl) * sx, y = r.top + ((el.clientTop || 0) + pt) * sy; " +
+        "var lw = Math.max(0, (el.clientWidth || 0) - pl - pr), lh = Math.max(0, (el.clientHeight || 0) - pt - pb), w = lw * sx, h = lh * sy; " +
+        "var why = cs.display === 'none' ? 'display:none' : (cs.visibility === 'hidden' || cs.visibility === 'collapse') ? 'visibility:' + cs.visibility : " +
+        "(el.closest && el.closest('[hidden]')) ? 'hidden attribute' : !(w > 1 && h > 1) ? 'zero size' : null; " +
+        "var shown = why === null; " +
         "var vr = shown ? visRect({ left: x, top: y, right: x + w, bottom: y + h }) : null, cov = null; " +
         "if (vr && grids++ < 12) { cov = ''; for (var gy = 0; gy < 4; gy++) { for (var gx = 0; gx < 4; gx++) { " +
-        "var t = topAt(vr.l + (gx + 0.5) * (vr.r - vr.l) / 4, vr.t + (gy + 0.5) * (vr.b - vr.t) / 4); cov += (t && t !== el && !el.contains(t)) ? '1' : '0'; } } } " +
+        "var t = topAt(vr.l + (gx + 0.5) * (vr.r - vr.l) / 4, vr.t + (gy + 0.5) * (vr.b - vr.t) / 4); cov += (t && t !== el && !ccontains(el, t)) ? '1' : '0'; } } } " +
         "var fi = -1; try { for (var k = 0; k < window.frames.length; k++) { if (window.frames[k] === el.contentWindow) { fi = k; break; } } } catch (e1) {} " +
         "var src = el.hasAttribute('srcdoc') ? 'about:srcdoc' : String(el.src || 'about:blank'); " +
         "out.push({ i: i, fi: fi, name: el.getAttribute('name') || '', src: src, x: x, y: y, w: w, h: h, shown: shown, " +
-        "vis: vr ? [vr.l, vr.t, vr.r, vr.b] : null, cov: cov, mod: !!(modal && modal.el.contains(el)), " +
-        "lab: norm(el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 80) }); } " +
+        "vis: vr ? [vr.l, vr.t, vr.r, vr.b] : null, cov: cov, mod: !!(modal && ccontains(modal.el, el)), " +
+        "lab: norm(el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 80), " +
+        "lw: lw, lh: lh, sx: sx, sy: sy, why: why, act: el === document.activeElement }); } " +
         "return JSON.stringify(out); } catch (e) { return null; } })()"
 
 /**
@@ -244,17 +267,18 @@ internal fun framedScript(payload: String): String =
  */
 internal fun frameHitScript(idx: Int, px: Int, py: Int): String =
     "(function () { /*rpa-frame-hit*/ try { " + OBSERVE_HELPERS_JS + OBSERVE_DOM_JS + MODAL_JS + MARK_COMMON_JS +
-        "var el = document.querySelectorAll('iframe,frame')[$idx]; if (!el) { return JSON.stringify({ state: 'gone' }); } " +
+        "var el = deepAll('iframe,frame')[$idx]; if (!el) { return JSON.stringify({ state: 'gone' }); } " +
         "function at() { var r = el.getBoundingClientRect(), cs = window.getComputedStyle(el); " +
-        "return [r.left + (el.clientLeft || 0) + (parseFloat(cs.paddingLeft) || 0) + $px, r.top + (el.clientTop || 0) + (parseFloat(cs.paddingTop) || 0) + $py]; } " +
+        "var sx = (el.offsetWidth > 0 && r.width > 0) ? r.width / el.offsetWidth : 1, sy = (el.offsetHeight > 0 && r.height > 0) ? r.height / el.offsetHeight : 1; " +
+        "return [r.left + ((el.clientLeft || 0) + (parseFloat(cs.paddingLeft) || 0) + $px) * sx, r.top + ((el.clientTop || 0) + (parseFloat(cs.paddingTop) || 0) + $py) * sy]; } " +
         "function inside(p) { return p[0] >= 0 && p[0] < VW && p[1] >= 0 && p[1] < VH; } " +
         "var p = at(); " +
         "if (!inside(p)) { try { el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' }); } catch (e1) {} p = at(); } " +
         "if (!inside(p)) { try { window.scrollBy((p[0] < 0 || p[0] >= VW) ? p[0] - VW / 2 : 0, (p[1] < 0 || p[1] >= VH) ? p[1] - VH / 2 : 0); } catch (e2) {} p = at(); } " +
         "if (!inside(p)) { return JSON.stringify({ state: 'gone' }); } " +
         "var x = Math.round(p[0]), y = Math.round(p[1]), t = topAt(x, y); " +
-        "if (t && t !== el && !el.contains(t)) { var modal = findModal(), cover; " +
-        "if (modal && modal.el.contains(t) && !modal.el.contains(el)) { cover = modal.label || modal.role || 'dialog'; } " +
+        "if (t && t !== el && !ccontains(el, t)) { var modal = findModal(), cover; " +
+        "if (modal && ccontains(modal.el, t) && !ccontains(modal.el, el)) { cover = modal.label || modal.role || 'dialog'; } " +
         "else { cover = labelNow(t) || norm(t.getAttribute('aria-label')) || t.tagName.toLowerCase(); } " +
         "return JSON.stringify({ state: 'covered', cover: cover }); } " +
         "return JSON.stringify({ state: 'ok', x: x, y: y }); } catch (e) { return null; } })()"
@@ -280,8 +304,8 @@ internal data class MarkAnswer(
 private fun markFindJs(id: String, mark: MarkRef): String =
     "var ID = ${id.asJsString()}, XP = ${(mark.xpath ?: "").asJsString()}, LAB = ${mark.label.asJsString()}, TAG = ${mark.tag.asJsString()}; " +
         "var m = window.__rpaMarks, el = m ? (m.get ? m.get(ID) : m[ID]) : null; " +
-        "if (el && !(el.tagName && el.tagName.toLowerCase() === TAG && document.documentElement.contains(el))) { el = null; } " +
-        "if (!el && XP) { try { var n = document.evaluate(XP, document, null, 9, null).singleNodeValue; " +
+        "if (el && !(el.tagName && el.tagName.toLowerCase() === TAG && (el.isConnected === undefined ? document.documentElement.contains(el) : el.isConnected))) { el = null; } " +
+        "if (!el && XP) { try { var n = byXp(XP); " +
         "if (n && n.tagName.toLowerCase() === TAG && labelNow(n) === LAB) { el = n; } } catch (e0) {} } "
 
 internal fun markScript(id: String, mark: MarkRef): String =
@@ -298,7 +322,7 @@ internal fun markScript(id: String, mark: MarkRef): String =
         "var t = topAt(px, py); if (i === 0) { first = t; } " +
         "if (!blocks(el, t)) { return JSON.stringify({ state: 'ok', x: px, y: py, label: label, tag: TAG }); } } " +
         "var modal = findModal(), cover; " +
-        "if (modal && first && modal.el.contains(first) && !modal.el.contains(el)) { cover = modal.label || modal.role || 'dialog'; } " +
+        "if (modal && first && ccontains(modal.el, first) && !ccontains(modal.el, el)) { cover = modal.label || modal.role || 'dialog'; } " +
         "else { cover = first ? (labelNow(first) || norm(first.getAttribute('aria-label')) || first.tagName.toLowerCase()) : 'another element'; } " +
         "return JSON.stringify({ state: 'covered', label: label, tag: TAG, cover: cover }); " +
         "} catch (e) { return null; } })()"
@@ -320,7 +344,7 @@ internal fun markFocusScript(id: String, mark: MarkRef): String =
         "var tag = el.tagName.toLowerCase(), role = el.getAttribute('role'); " +
         "var can = tag === 'textarea' || tag === 'select' || (tag === 'input' && ['button','submit','reset','image','checkbox','radio','file','range','color','hidden'].indexOf((el.getAttribute('type') || 'text').toLowerCase()) === -1) || " +
         "el.isContentEditable === true || role === 'textbox' || role === 'searchbox' || role === 'combobox' || (tag === 'label' && !!el.control); " +
-        "var f = !!a && (a === el || el.contains(a) || (tag === 'label' && el.control === a)); " +
+        "var f = !!a && (a === el || ccontains(el, a) || (tag === 'label' && el.control === a)); " +
         "return JSON.stringify({ can: can, f: f }); } catch (e) { return null; } })()"
 
 /** Drops null members (recursively) so optional fields vanish from the result, keeping empty lists and objects. */

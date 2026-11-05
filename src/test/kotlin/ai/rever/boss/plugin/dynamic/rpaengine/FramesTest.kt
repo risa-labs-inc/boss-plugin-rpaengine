@@ -38,17 +38,22 @@ class FramesTest {
     /** One document's answers, keyed by which script came in. Every script is logged as "<doc>:<kind>". */
     private class Doc(val id: String, val log: MutableList<String>) {
         var look: String? = null
+        var lookFn: (() -> String?)? = null
         var framed: (String) -> String? = { null }
         var mark: String? = null
         var hit: String? = null
         var focused: () -> String = { """{"tag":"body","editable":false,"hf":false}""" }
         var len: () -> Any? = { -1 }
+        var value: (String) -> String? = { null }
+        var count: () -> Any? = { 0 }
         var markFocus: () -> String? = { null }
         val scripts = mutableListOf<String>()
 
         fun answer(script: String): Any? {
             val kind = when {
                 script.contains("/*rpa-len*/") -> "len"
+                script.contains("/*rpa-value*/") -> "value"
+                script.contains("/*rpa-count*/") -> "count"
                 script.contains("/*rpa-mark-focus*/") -> "mark-focus"
                 script.contains("/*rpa-look*/") -> "look"
                 script.contains("/*rpa-framed*/") -> "framed"
@@ -62,11 +67,13 @@ class FramesTest {
             synchronized(log) { log += "$id:$kind" }
             scripts += script
             return when (kind) {
-                "look" -> look
+                "look" -> lookFn?.invoke() ?: look
                 "framed" -> framed(script)
                 "mark" -> mark
                 "hit" -> hit
                 "len" -> len()
+                "value" -> value(script)
+                "count" -> count()
                 "mark-focus" -> markFocus()
                 "focused", "focused+select" -> focused()
                 "quiet" -> true
@@ -248,24 +255,28 @@ class FramesTest {
         // 12 rendered siblings: 10 evaluated
         val kids = (0 until 12).map { k -> FakeFrame(Doc("k$k", log).apply { this.framed = framed("https://f$k.test/", "[]") }) }
         val topData = Json.parseToJsonElement(framedJson("https://top.test/", frameList(*(0 until 12).map { iframe(it, 0.0, it * 20.0, 100.0, 20.0, src = "https://f$it.test/") }.toTypedArray()), "")).jsonObject
-        val out = walkFrames(FrameView.top(1000, 800, "https://top.test/"), topData, kids, framedScript("1"))
-        assertEquals(10, out.size); assertEquals(10, log.size)
+        val walk = walkFrames(FrameView.top(1000, 800, "https://top.test/"), topData, kids, framedScript("1"))
+        assertEquals(10, walk.answers.size); assertEquals(10, log.size)
+        assertEquals(listOf("frame budget (10) spent", "frame budget (10) spent"), walk.debug.mapNotNull { it.excludedReason })
         // a chain 5 deep: 3 levels
         log.clear()
         val one = frameList(iframe(0, 10.0, 10.0, 100.0, 100.0))
         val chain = (0 until 5).map { FakeFrame(Doc("c$it", log).apply { this.framed = framed("https://c$it.test/", one) }) }
         for (i in 0 until 4) chain[i].kids += chain[i + 1]
-        val deep = walkFrames(FrameView.top(1000, 800, null), Json.parseToJsonElement(framedJson("https://top.test/", one, "")).jsonObject, listOf(chain[0]), framedScript("1"))
+        val deep = walkFrames(FrameView.top(1000, 800, null), Json.parseToJsonElement(framedJson("https://top.test/", one, "")).jsonObject, listOf(chain[0]), framedScript("1")).answers
         assertEquals(listOf("0", "0.0", "0.0.0"), deep.map { it.view.path })
         assertEquals(30.0, deep.last().view.offX)
-        // hidden iframe: never evaluated; off-screen iframe: evaluated, no clip
+        // hidden iframe: dropped with its reason; off-screen iframe: kept, no clip
         log.clear()
         val hidden = FakeFrame(Doc("hidden", log).apply { this.framed = framed("https://h.test/", "[]") })
         val far = FakeFrame(Doc("far", log).apply { this.framed = framed("https://far.test/", "[]") })
         val list = frameList(iframe(0, 0.0, 0.0, 0.0, 0.0, shown = false, vis = null), iframe(1, 0.0, 3000.0, 300.0, 300.0, vis = null, src = "https://far.test/"))
-        val r = walkFrames(FrameView.top(1000, 800, null), Json.parseToJsonElement(framedJson("https://top.test/", list, "")).jsonObject, listOf(hidden, far), framedScript("1"))
-        assertEquals(listOf("far:framed"), log)
+        val w = walkFrames(FrameView.top(1000, 800, null), Json.parseToJsonElement(framedJson("https://top.test/", list, "")).jsonObject, listOf(hidden, far), framedScript("1"))
+        val r = w.answers
+        assertEquals(listOf("far:framed"), log.filter { it.startsWith("far") }, "a rendered iframe's frame goes first")
         assertEquals("1", r.single().view.path); assertNull(r.single().view.clip)
+        assertEquals(mapOf("0" to "iframe not rendered: zero size or hidden", "1" to "scrolled out of view (text only)"), w.debug.associate { it.path to it.excludedReason })
+        assertEquals("https://h.test/", w.debug.first { it.path == "0" }.url)
     }
 
     @Test
@@ -643,5 +654,364 @@ class FramesTest {
         assertFalse(focusedLengthScript().contains("return el.value") || focusedLengthScript().contains("value+"))
         e.eval("document.activeElement=go;")
         assertEquals(-1, (e.eval(focusedLengthScript()) as Number).toInt())
+    }
+
+    // ---- real-site frames: matching, debug, late frames ------------------------------------------
+
+    @Test
+    fun `a redirected frame among hidden siblings matches its own iframe by size or window frames index, not the first leftover`() {
+        // Zomato-like: ad/analytics frames first, the login iframe's src redirected, and only some children evaluated.
+        val iframes = listOf(
+            iframe(0, 0.0, 0.0, 0.0, 0.0, fi = 0, src = "https://gtm.test/ns", shown = false, vis = null),
+            iframe(1, 0.0, 0.0, 0.0, 0.0, fi = 1, src = "about:blank", shown = false, vis = null),
+            iframe(2, 300.0, 100.0, 380.0, 420.0, fi = 2, src = "https://accounts.zomato.test/oauth2/auth?x=1").copy(lw = 380.0, lh = 420.0),
+        )
+        val bySize = matchFrames(listOf(ChildId(5, "", "https://accounts.zomato.test/login?x=1", 380, 420)), iframes)
+        assertEquals(2, bySize[5]!!.i, "own viewport size equals the iframe's content box")
+        val byIndex = matchFrames(listOf(ChildId(2, "", "https://accounts.zomato.test/login?x=1")), iframes)
+        assertEquals(2, byIndex[2]!!.i, "window.frames index equal to the child's index")
+        // about:blank written later: no URL to go on, the size still matches
+        assertEquals(2, matchFrames(listOf(ChildId(0, "", "about:blank", 380, 420)), iframes.map { if (it.i == 1) it.copy(src = "x") else it })[0]!!.i)
+    }
+
+    @Test
+    fun `look carries frames_debug with url, matched iframe, element counts, and frames that never answered`() {
+        val c = Checkout()
+        val silent = Doc("silent", c.log) // look -> null: timed out or scripts blocked by a sandbox
+        val rig = Rig(listOf(c.payFrame, FakeFrame(silent)), c.top)
+        val dbg = rig.run("""{"type":"look"}""")["look"]!!.jsonObject["frames_debug"]!!.jsonArray.map { it.jsonObject }
+        val byPath = dbg.associateBy { it["path"]!!.jsonPrimitive.content }
+        assertEquals(setOf("0", "0.0", "1"), byPath.keys)
+        assertEquals("http://localhost:8799/iframe-pay-frame.html", byPath["0"]!!["url"]!!.jsonPrimitive.content)
+        assertEquals(2, byPath["0"]!!["elements"]!!.jsonPrimitive.int); assertEquals(1, byPath["0.0"]!!["elements"]!!.jsonPrimitive.int)
+        val m = byPath["0"]!!["matched_iframe"]!!.jsonObject
+        assertEquals("http://localhost:8799/iframe-pay-frame.html", m["src"]!!.jsonPrimitive.content)
+        assertEquals(101, m["rect"]!!.jsonObject["x"]!!.jsonPrimitive.int)
+        assertFalse(byPath["0"]!!.containsKey("excluded_reason"))
+        assertTrue(byPath["1"]!!["excluded_reason"]!!.jsonPrimitive.content.startsWith("no answer within 2 s"))
+        // no frames: no frames_debug
+        val plain = Rig(emptyList(), Doc("top", mutableListOf()).apply { look = c.top.look })
+        assertFalse(plain.run("""{"type":"look"}""")["look"]!!.jsonObject.containsKey("frames_debug"))
+        rig.dir.deleteRecursively(); plain.dir.deleteRecursively(); c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `a new frame that is still empty gets up to 800 ms to populate and one re-read, and the tree is re-walked every look`() {
+        val log = mutableListOf<String>()
+        val top = Doc("top", log)
+        val login = Doc("login", log)
+        val frames = frameList(iframe(0, 300.0, 100.0, 380.0, 420.0, src = "http://localhost:8799/iframe-login-frame.html", lab = "Login"))
+        top.look = lookJson("http://127.0.0.1:8799/iframe-login.html", frames, listOf(el("m1", "Log in", 900, 10, 50, 20, tag = "button")), meta = true)
+        var populated = false
+        login.look = null
+        val emptyLook = lookJson("http://localhost:8799/iframe-login-frame.html", "[]", emptyList())
+        val fullLook = lookJson("http://localhost:8799/iframe-login-frame.html", "[]", listOf(el("m1", "Phone", 20, 60, 200, 30)))
+        var counts = 0
+        login.count = { counts++; if (counts >= 3) { populated = true; 1 } else 0 }
+        val kids = mutableListOf<FakeFrame>()
+        val rig = Rig(kids, top)
+        // first look: no frame yet
+        assertEquals(listOf("Log in"), rig.run("""{"type":"look"}""")["look"]!!.jsonObject["elements"]!!.jsonArray.map { it.jsonObject["label"]!!.jsonPrimitive.content })
+        // the dialog opens: a frame appears after page load, empty at first
+        kids += FakeFrame(login)
+        login.lookFn = { if (populated) fullLook else emptyLook }
+        val t0 = System.currentTimeMillis()
+        val els = rig.run("""{"type":"look"}""")["look"]!!.jsonObject["elements"]!!.jsonArray.map { it.jsonObject }
+        assertTrue(System.currentTimeMillis() - t0 < FRAME_POPULATE_MS + 600)
+        assertEquals(listOf("Log in", "Phone"), els.map { it["label"]!!.jsonPrimitive.content })
+        assertEquals("0", els[1]["frame"]!!.jsonPrimitive.content)
+        assertEquals(2, log.count { it == "login:look" }, "one re-read after it populated")
+        assertEquals(3, counts)
+        // the same frame next time: no waiting even if it is empty again
+        populated = false; log.clear()
+        rig.run("""{"type":"look"}""")
+        assertEquals(1, log.count { it == "login:look" }); assertFalse(log.contains("login:count"))
+        rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `child views and placement apply an iframe's transform scale`() {
+        val top = FrameView.top(1000, 800, null)
+        val v = childView(top, iframe(0, 100.0, 100.0, 200.0, 200.0).copy(sx = 0.5, sy = 0.5), 0, FakeFrame(Doc("a", mutableListOf())), "https://x.test/")
+        val raw = TabJson.decodeFromString(RawLookElement.serializer(), el("m1", "Phone", 40, 60, 100, 20))
+        assertEquals(LookRect(120, 130, 50, 10), placeElements(emptyList(), listOf(v to listOf(raw))).single().element.rect)
+        val nested = childView(v, iframe(0, 10.0, 10.0, 50.0, 50.0), 0, FakeFrame(Doc("b", mutableListOf())), "https://y.test/")
+        assertEquals(105.0, nested.offX); assertEquals(0.5, nested.sx)
+    }
+
+    // ---- type_text self-check -----------------------------------------------------------------
+
+    @Test
+    fun `type_text checks the field holds exactly the text, retypes once when not, and returns the value`() {
+        val c = Checkout()
+        c.top.focused = { addrFocused }
+        c.top.len = { 21 }
+        val text = "12 MG Road, Bengaluru"
+        var reads = 0
+        c.top.value = { s ->
+            reads++
+            val v = if (reads == 1) text.drop(1) else text
+            """{"xp":"/html[1]/body[1]/input[1]","n":${v.length},"h":"${djb2Hex(v)}"${if (s.contains("v: s.slice")) ""","v":"$v"""" else ""}}"""
+        }
+        c.log.clear()
+        val r = c.rig.run("""{"type":"type_text","value":"$text"}""")
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean, r.toString())
+        assertEquals(true, r["retyped"]!!.jsonPrimitive.boolean)
+        assertEquals(true, r["value_ok"]!!.jsonPrimitive.boolean)
+        assertEquals(text, r["value"]!!.jsonPrimitive.content)
+        assertEquals(2, c.log.count { it == "top:focused+select" }, "select-all again before the retype")
+        assertEquals(text.length * 2, c.rig.surface.events.count { it is TabEvent.KeyChar })
+        // right the first time: no retype
+        reads = 1; c.rig.surface.events.clear()
+        val ok = c.rig.run("""{"type":"type_text","value":"$text"}""")
+        assertFalse(ok.containsKey("retyped")); assertEquals(true, ok["value_ok"]!!.jsonPrimitive.boolean)
+        assertEquals(text.length, c.rig.surface.events.count { it is TabEvent.KeyChar })
+        // still wrong after the one retype (a formatting field): value_ok false, no third try
+        c.top.value = { """{"xp":"/html[1]/body[1]/input[1]","n":3,"h":"${djb2Hex("abc")}","v":"abc"}""" }
+        c.rig.surface.events.clear()
+        val bad = c.rig.run("""{"type":"type_text","value":"$text"}""")
+        assertEquals(false, bad["value_ok"]!!.jsonPrimitive.boolean); assertEquals("abc", bad["value"]!!.jsonPrimitive.content)
+        assertEquals(text.length * 2, c.rig.surface.events.count { it is TabEvent.KeyChar })
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `a sensitive field reports value_ok only and its content never leaves the page, and moved focus is not retyped`() {
+        val c = Checkout()
+        c.top.focused = { """{"tag":"input","editable":true,"label":"Password","type":"password","sensitive":true,"hf":true,"xp":"/html[1]/body[1]/input[2]"}""" }
+        c.top.len = { 8 }
+        val scripts = mutableListOf<String>()
+        c.top.value = { s -> scripts += s; """{"xp":"/html[1]/body[1]/input[2]","n":8,"h":"${djb2Hex("hunter22")}"}""" }
+        val r = c.rig.run("""{"type":"type_text","value":"hunter22"}""", ""","allow_sensitive":true""")
+        assertEquals(true, r["value_ok"]!!.jsonPrimitive.boolean); assertFalse(r.containsKey("value"))
+        assertTrue(scripts.isNotEmpty() && scripts.none { it.contains("v: s.slice") || it.contains("hunter22") })
+        // OTP: focus moved to the next box, so the field read is another one: no retype, no verdict
+        val log = mutableListOf<String>()
+        val t = Doc("top", log)
+        val rig = Rig(emptyList(), t)
+        var box = 1
+        t.focused = { """{"tag":"input","editable":true,"label":"Digit $box","type":"text","hf":true,"xp":"/html[1]/body[1]/input[$box]"}""" }
+        rig.surface.onKey = { if (box < 6) box++ }
+        t.value = { """{"xp":"/html[1]/body[1]/input[$box]","n":1,"h":"${djb2Hex("2")}","v":"2"}""" }
+        val otp = rig.run("""{"type":"type_text","value":"424242"}""")
+        assertFalse(otp.containsKey("retyped") || otp.containsKey("value_ok") || otp.containsKey("value"))
+        assertEquals(1, log.count { it.endsWith("+select") })
+        assertEquals(64, focusedValueScript(true).let { if (it.contains("v: s.slice(0, $VALUE_MAX)")) 64 else 0 })
+        rig.dir.deleteRecursively(); c.rig.dir.deleteRecursively()
+    }
+
+    // ---- content_hash state --------------------------------------------------------------------
+
+    @Test
+    fun `content_hash moves with ARIA widget state and with focus, never with a field's content`() {
+        val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        e.eval("""
+            function El(tag,o){this.tagName=tag;this.attrs={};for(var k in o)this[k]=o[k];var d='';this.style={getPropertyValue:function(){return d;},getPropertyPriority:function(){return '';},setProperty:function(n,v){d=v;}};}
+            El.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
+            var sw=new El('BUTTON');sw.attrs={role:'switch','aria-checked':'false','aria-label':'Dark mode'};
+            var a=new El('INPUT',{type:'text',value:'abc'});a.attrs={'aria-label':'Name'};
+            var b=new El('INPUT',{type:'text',value:'xyz'});b.attrs={'aria-label':'City'};
+            var body=new El('BODY');body.innerText='Settings';
+            var document={body:body,documentElement:{},activeElement:body,
+              querySelectorAll:function(q){if(q.indexOf('data-rpa')>=0)return [];if(q.indexOf('aria-checked')>=0)return [sw];if(q.indexOf('[tabindex]')>=0)return [sw,a,b];return [a,b];}};
+            var location={hash:''};
+        """.trimIndent())
+        val js = contentHashScript()
+        val base = e.eval(js) as String
+        e.eval("sw.attrs['aria-checked']='true'")
+        val toggled = e.eval(js) as String
+        assertTrue(base != toggled, "a settings switch click counts")
+        e.eval("document.activeElement=a")
+        val focusA = e.eval(js) as String
+        assertTrue(focusA != toggled, "focusing a field counts")
+        e.eval("document.activeElement=b")
+        assertTrue(e.eval(js) != focusA, "which field has focus counts")
+        e.eval("b.value='zzz'")
+        val same = e.eval(js) as String
+        e.eval("b.value='qqq'")
+        assertEquals(same, e.eval(js), "content of the same length is private")
+        assertFalse(js.replace("el.value.length", "").replace("typeof el.value", "").contains(".value"))
+    }
+
+    @Test
+    fun `frames list script reports transform scale, layout size, and why an iframe is not rendered`() {
+        val e = frameDom()
+        e.eval("A.offsetWidth=400;A.offsetHeight=400;A.rect=[100,50,300,250];")
+        val list = TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(IframeInfo.serializer()), e.eval(framesListScript()) as String)
+        val a = list[0]
+        assertEquals(0.5, a.sx); assertEquals(100.5, a.x); assertEquals(199.0, a.w); assertEquals(398.0, a.lw)
+        assertEquals("display:none", list[1].why); assertNull(a.why)
+        e.eval("C.rect=[0,0,0,0];C.clientWidth=0;")
+        assertEquals("zero size", TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(IframeInfo.serializer()), e.eval(framesListScript()) as String)[2].why)
+        // the hit script maps a child point through the same scale
+        assertEquals(MarkAnswer("ok", 351, 301), TabJson.decodeFromString(MarkAnswer.serializer(), e.eval(frameHitScript(0, 500, 500)) as String))
+    }
+
+    @Test
+    fun `look marks the focused element only through a chain of focused iframes`() {
+        val top = FrameView.top(1000, 800, null)
+        val raw = { s: String -> TabJson.decodeFromString(RawLookElement.serializer(), s) }
+        val inFocus = childView(top, iframe(0, 0.0, 0.0, 400.0, 400.0).copy(act = true), 0, FakeFrame(Doc("a", mutableListOf())), "https://a.test/")
+        val stale = childView(top, iframe(1, 500.0, 0.0, 400.0, 400.0), 1, FakeFrame(Doc("b", mutableListOf())), "https://b.test/")
+        val placed = placeElements(
+            listOf(raw(el("m1", "Search", 0, 500, 100, 20)), raw(el("m2", "Top focused", 200, 500, 100, 20, extra = ""","focused":true"""))),
+            listOf(inFocus to listOf(raw(el("m1", "Phone", 10, 10, 100, 20, extra = ""","focused":true"""))), stale to listOf(raw(el("m1", "Old", 10, 10, 100, 20, extra = ""","focused":true""")))),
+        ).associate { it.element.label to it.element.focused }
+        assertEquals(mapOf("Search" to null, "Top focused" to true, "Phone" to true, "Old" to null), placed)
+        // serialized: focused true appears, absent otherwise
+        val c = Checkout()
+        c.card.look = c.card.look!!.replace("\\\"xp\\\":\\\"/html[1]/body[1]/input[1]\\\"", "\\\"xp\\\":\\\"/html[1]/body[1]/input[1]\\\",\\\"focused\\\":true")
+        c.top.look = c.top.look!!.replace("\\\"act\\\":false", "\\\"act\\\":true")
+        c.pay.look = c.pay.look!!.replace("\\\"act\\\":false", "\\\"act\\\":true")
+        val els = c.rig.run("""{"type":"look"}""")["look"]!!.jsonObject["elements"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf(false, false, false, true), els.map { it["focused"]?.jsonPrimitive?.boolean ?: false })
+        assertFalse(els[0].containsKey("focused"))
+        assertTrue(lookElementsScript().contains("focused: !!AE && el === AE") && framesListScript().contains("act: el === document.activeElement"))
+        c.rig.dir.deleteRecursively()
+    }
+
+    // ---- open shadow roots -------------------------------------------------------------------
+
+    /** The shadow-form fixture: inputs inside crm-field shadow roots, slotted into crm-card whose own shadow root holds Save. */
+    private fun shadowDom(): javax.script.ScriptEngine {
+        val e = NashornScriptEngineFactory().getScriptEngine("--language=es5")
+        e.eval("""
+            var NS='http://www.w3.org/1999/xhtml';
+            var window={innerWidth:1000,innerHeight:800,getComputedStyle:function(e){return {display:'block',visibility:'visible',position:'static',zIndex:'auto'};}};
+            function T(s){this.nodeType=3;this.nodeValue=s;this.parentNode=null;}
+            function walk(n,f){for(var i=0;i<n.kids.length;i++){var c=n.kids[i];f(c);if(c.nodeType===1)walk(c,f);}}
+            function qsa(n,sel){var out=[];walk(n,function(c){if(c.nodeType!==1)return;
+              if(sel==='*'||(sel.indexOf('data-rpa')<0&&sel.indexOf('role=dialog')<0&&sel.indexOf('iframe')<0&&sel.indexOf('aria-checked')<0&&c.inter))out.push(c);});return out;}
+            var proto={add:function(c){c.parentNode=this;c.parentElement=this.nodeType===1?this:null;this.kids.push(c);return c;},
+              querySelectorAll:function(s){return qsa(this,s);},querySelector:function(){return null;}};
+            function E(tag,o){this.nodeType=1;this.tagName=tag.toUpperCase();this.nodeName=this.tagName;this.localName=tag;this.namespaceURI=NS;this.attrs={};this.kids=[];
+              this.parentNode=null;this.parentElement=null;this.rect=[0,0,0,0];this.inter=false;this.ctrl=false;this.innerText='';this.isConnected=true;for(var k in o)this[k]=o[k];}
+            E.prototype=Object.create(proto);
+            Object.defineProperty(E.prototype,'childNodes',{get:function(){return this.kids;}});
+            Object.defineProperty(E.prototype,'children',{get:function(){return this.kids.filter(function(c){return c.nodeType===1;});}});
+            Object.defineProperty(E.prototype,'previousSibling',{get:function(){if(!this.parentNode)return null;var k=this.parentNode.kids,i=k.indexOf(this);return i>0?k[i-1]:null;}});
+            Object.defineProperty(E.prototype,'previousElementSibling',{get:function(){return null;}});
+            Object.defineProperty(E.prototype,'textContent',{get:function(){var s='';walk(this,function(c){if(c.nodeType===3)s+=c.nodeValue;});return s;}});
+            E.prototype.getAttribute=function(n){return this.attrs.hasOwnProperty(n)?this.attrs[n]:null;};
+            E.prototype.hasAttribute=function(n){return this.attrs.hasOwnProperty(n);};
+            E.prototype.getBoundingClientRect=function(){var r=this.rect;return {left:r[0],top:r[1],right:r[2],bottom:r[3],width:r[2]-r[0],height:r[3]-r[1]};};
+            E.prototype.matches=function(s){if(s===':disabled')return false;if(s.indexOf('input,textarea')===0||s.indexOf('input,select,textarea')===0)return this.ctrl;
+              if(s.indexOf('data-rpa')>=0||s.indexOf('role=dialog')>=0||s.indexOf('iframe')>=0||s.indexOf('aria-checked')>=0)return false;return this.inter;};
+            E.prototype.closest=function(){return null;};
+            E.prototype.contains=function(o){for(var n=o;n;n=n.parentNode)if(n===this)return true;return false;};
+            function Root(host){this.nodeType=11;this.host=host;this.kids=[];this.activeElement=null;host.shadowRoot=this;this.at=function(){return [];};}
+            Root.prototype=Object.create(proto);
+            Object.defineProperty(Root.prototype,'children',{get:function(){return this.kids.filter(function(c){return c.nodeType===1;});}});
+            Root.prototype.elementsFromPoint=function(x,y){return this.at(x,y);};
+            function inside(el,x,y){var r=el.rect;return x>=r[0]&&x<=r[2]&&y>=r[1]&&y<=r[3];}
+            var html=new E('html'),body=html.add(new E('body',{innerText:'New contact'}));
+            body.add(new E('h1',{innerText:'New contact'})).add(new T('New contact'));
+            var card=body.add(new E('crm-card',{rect:[0,80,400,360]}));
+            function field(label,y){var h=card.add(new E('crm-field',{rect:[10,y,300,y+40]}));var r=new Root(h);
+              var l=r.add(new E('label',{innerText:label}));l.add(new T(label));
+              var i=r.add(new E('input',{rect:[20,y+10,220,y+30],inter:true,ctrl:true,value:''}));i.attrs={id:'i'};i.labels=[l];
+              r.at=function(x,y2){return inside(i,x,y2)?[i]:[h];};return i;}
+            var name=field('Full name',100),email=field('Email',160);
+            var cr=new Root(card);var div=cr.add(new E('div',{innerText:'Save contact'}));
+            div.add(new E('slot',{assignedElements:function(){return card.kids;}}));
+            var save=div.add(new E('button',{rect:[20,300,140,330],inter:true,innerText:'Save contact'}));save.attrs={id:'save'};save.add(new T('Save contact'));
+            cr.at=function(x,y){if(inside(save,x,y))return [save];var f=card.kids.filter(function(h){return inside(h,x,y);});return f.length?[f[0]]:[div];};
+            var banner=null;
+            var location={hash:''};
+            var document={documentElement:html,body:body,baseURI:'https://a.test/',activeElement:body,
+              querySelectorAll:function(s){return qsa(html,s);},getElementById:function(){return null;},elementFromPoint:function(){return null;},
+              elementsFromPoint:function(x,y){if(banner&&inside(banner,x,y))return [banner];var f=card.kids.filter(function(h){return inside(h,x,y);});if(f.length)return [f[0],card];return inside(card,x,y)?[card]:[body];},
+              evaluate:function(xp){var m={'/html[1]/body[1]/crm-card[1]/crm-field[1]':card.kids[0],'/html[1]/body[1]/crm-card[1]/crm-field[2]':card.kids[1],'/html[1]/body[1]/crm-card[1]':card};return {singleNodeValue:m[xp]||null};},
+              createTreeWalker:function(root){var l=[];walk(root,function(c){if(c.nodeType===3)l.push(c);});var i=0;return {nextNode:function(){return l[i++]||null;}};}};
+            T.prototype=null;
+        """.trimIndent())
+        // text nodes need a parentElement for the locate script
+        e.eval("""(function fix(n){for(var i=0;i<n.kids.length;i++){var c=n.kids[i];if(c.nodeType===3){c.parentElement=n.nodeType===1?n:null;}else{fix(c);if(c.shadowRoot)fix(c.shadowRoot);}}})(html);""")
+        return e
+    }
+
+    @Test
+    fun `look elements, marks, covered checks and focus reach into open shadow roots`() {
+        val e = shadowDom()
+        val els = TabJson.decodeFromString(kotlinx.serialization.builtins.ListSerializer(RawLookElement.serializer()), e.eval(lookElementsScript()) as String)
+        assertEquals(listOf("Full name", "Email", "Save contact"), els.map { it.label })
+        assertEquals(listOf(false, false, false), els.map { it.covered }, "the document answers with the host; the shadow root says what is on top")
+        assertEquals("/html[1]/body[1]/crm-card[1]/crm-field[1]/#shadow/input[1]", els[0].xp)
+        assertEquals("/html[1]/body[1]/crm-card[1]/#shadow/div[1]/button[1]", els[2].xp)
+        // re-resolution by the shadow path when the kept node is gone
+        e.eval("window.__rpaMarks=null;")
+        val m = TabJson.decodeFromString(MarkAnswer.serializer(), e.eval(markScript("m1", MarkRef(els[0].xp, "Full name", "input"))) as String)
+        assertEquals(MarkAnswer("ok", 120, 120, "Full name", "input"), m)
+        assertEquals("ok", TabJson.decodeFromString(MarkAnswer.serializer(), e.eval(markScript("m3", MarkRef(els[2].xp, "Save contact", "button"))) as String).state)
+        // something in the light DOM on top of the shadow button: covered
+        e.eval("banner=new E('div',{rect:[0,290,400,340]});banner.attrs={'aria-label':'Cookie banner'};")
+        val c = TabJson.decodeFromString(MarkAnswer.serializer(), e.eval(markScript("m3", MarkRef(els[2].xp, "Save contact", "button"))) as String)
+        assertEquals("covered", c.state); assertEquals("Cookie banner", c.cover)
+        // focused walks down through shadowRoot.activeElement, with a shadow-aware path
+        e.eval("document.activeElement=card.kids[1];card.kids[1].shadowRoot.activeElement=email;")
+        val f = e.eval(focusedScript(false)) as String
+        assertEquals("Email", TabJson.decodeFromString(FocusedInfo.serializer(), f).label)
+        assertEquals("/html[1]/body[1]/crm-card[1]/crm-field[2]/#shadow/input[1]", TabJson.decodeFromString(FocusExtra.serializer(), f).xp)
+        assertEquals(MarkFocus(can = true, f = true), TabJson.decodeFromString(MarkFocus.serializer(), e.eval(markFocusScript("m2", MarkRef(els[1].xp, "Email", "input"))) as String))
+        // the snap script finds the shadow input under the host and does not move
+        assertFalse(TabJson.decodeFromString(SnapAnswer.serializer(), e.eval(snapScript(120, 120, SnapBox(100.0, 100.0, 140.0, 140.0))) as String).moved)
+    }
+
+    @Test
+    fun `page_text, locate_text and content_hash read open shadow roots`() {
+        val e = shadowDom()
+        val text = e.eval(pageTextScript(1000)) as String
+        assertTrue(text.startsWith("New contact") && text.contains("Save contact") && text.contains("Full name") && text.contains("Email"), text)
+        val loc = TabJson.decodeFromString(LocatedInfo.serializer(), e.eval(locateTextScript("Save contact")) as String)
+        assertTrue(loc.found && loc.inView)
+        assertEquals(LocatedRect(20, 300, 120, 30), loc.rect)
+        val h0 = e.eval(contentHashScript()) as String
+        e.eval("name.value='Asha'")
+        assertTrue(h0 != e.eval(contentHashScript()), "typing into a shadow input moves the hash")
+        val h1 = e.eval(contentHashScript()) as String
+        e.eval("document.activeElement=card.kids[0];card.kids[0].shadowRoot.activeElement=name;")
+        assertTrue(h1 != e.eval(contentHashScript()), "focusing a shadow input moves the hash")
+    }
+
+    // ---- hover_at ------------------------------------------------------------------------------
+
+    @Test
+    fun `hover_at moves the real mouse there after the glide, quiet-waits, and the next look moves nothing`() {
+        val c = Checkout()
+        c.log.clear()
+        val r = c.rig.run("""{"type":"hover_at","value":"120,40"}""", ""","pointer":{"label":"Jev"}""")
+        assertTrue(r["ok"]!!.jsonPrimitive.boolean, r.toString())
+        assertEquals(listOf<TabEvent>(TabEvent.Move(120, 40)), c.rig.surface.events)
+        val glide = c.top.scripts.indexOfFirst { it.contains("__rpa_pointer") && it.contains("root.style.transform") }
+        assertTrue(glide >= 0)
+        val log = c.log
+        assertTrue(log.indexOf("ev:Move") < log.indexOf("top:quiet") && log.indexOf("ev:Move") > 0, log.toString())
+        assertFalse(log.contains("focus"), "a hover does not take focus")
+        // no ripple for a hover
+        assertFalse(c.top.scripts[glide].contains("animate("))
+        // what opened stays open: look, screenshot and page_text dispatch no input
+        c.rig.run("""{"type":"look"}"""); c.rig.run("""{"type":"screenshot"}"""); c.rig.run("""{"type":"page_text"}""")
+        assertEquals(1, c.rig.surface.events.size)
+        // by element, inside a frame: resolved there, mapped to the top point
+        c.card.mark = """{"state":"ok","x":185,"y":15,"label":"1234 1234 1234 1234","tag":"input"}"""
+        c.pay.hit = """{"state":"ok","x":202,"y":55}"""
+        c.top.hit = """{"state":"ok","x":303,"y":256}"""
+        val h = c.rig.run("""{"type":"hover_at","element":"m4"}""")
+        assertEquals(TabEvent.Move(303, 256), c.rig.surface.events.last())
+        assertEquals("m4", h["hovered"]!!.jsonObject["id"]!!.jsonPrimitive.content)
+        assertFalse(c.rig.surface.events.any { it is TabEvent.Press || it is TabEvent.Release })
+        c.rig.dir.deleteRecursively()
+    }
+
+    @Test
+    fun `hover_at needs a point or an element, and element stays limited to pointing verbs`() {
+        val step = { a: String -> """{"tab_id":"t","action":$a}""" }
+        assertEquals("m3", parseStepArgs(step("""{"type":"hover_at","element":"m3"}""")).element)
+        assertEquals("5,6", parseStepArgs(step("""{"type":"hover_at","value":"5,6"}""")).action.value)
+        for (bad in listOf("""{"type":"hover_at"}""", """{"type":"hover_at","value":"x"}""", """{"type":"key","value":"Enter","element":"m1"}""")) {
+            val ex = runCatching { parseStepArgs(step(bad)) }.exceptionOrNull()
+            assertTrue(ex is TabToolException && ex.code == TabErrorCodes.INVALID_INPUT, bad)
+        }
+        assertTrue(CuTypes.HOVER_AT in STEP_ALLOWED_TYPES && TabActions.STEP_SCHEMA.contains("\"hover_at\""))
     }
 }
