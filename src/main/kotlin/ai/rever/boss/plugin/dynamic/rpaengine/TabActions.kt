@@ -61,6 +61,8 @@ internal data class StepArgs(
     val action: RpaActionConfig,
     val highlightMs: Int,
     val allowSensitive: Boolean = false,
+    /** Show an agent pointer at the action point (see [PointerSpec]); null = no overlay. */
+    val pointer: PointerSpec? = null,
 )
 
 internal const val OBSERVE_DEFAULT_MAX = 80
@@ -72,11 +74,11 @@ internal const val STEP_MAX_WAIT_MS = 10_000L
 internal val STEP_ALLOWED_TYPES = setOf(
     ActionTypes.CLICK, ActionTypes.INPUT, ActionTypes.SELECT, ActionTypes.KEYPRESS,
     ActionTypes.SUBMIT, ActionTypes.SCROLL, ActionTypes.NAVIGATE, ActionTypes.WAIT, ActionTypes.DOWNLOAD,
-)
+) + CuTypes.ALL
 
 /** Plan verbs rpa_step refuses by name; anything else outside [STEP_ALLOWED_TYPES] is refused as unknown. */
 internal val STEP_REFUSED_TYPES = setOf(
-    ActionTypes.RUN_SCRIPT, ActionTypes.SCREENSHOT, ActionTypes.SWITCH_FRAME, ActionTypes.ASSERT,
+    ActionTypes.RUN_SCRIPT, ActionTypes.SWITCH_FRAME, ActionTypes.ASSERT,
 )
 
 private val STEP_SELECTOR_TYPES = setOf(SelectorTypes.ID, SelectorTypes.CSS, SelectorTypes.XPATH, SelectorTypes.TEXT)
@@ -126,6 +128,7 @@ internal fun parseStepArgs(raw: String): StepArgs {
     val tabId = o.requiredString("tab_id")
     val highlight = o.optionalInt("highlight_ms", STEP_DEFAULT_HIGHLIGHT_MS, 0..STEP_MAX_HIGHLIGHT_MS)
     val allowSensitive = o.optionalBoolean("allow_sensitive")
+    val pointer = parsePointer(o["pointer"])
     val action = o["action"] as? JsonObject ?: invalid("'action' is required and must be an object")
     val type = (action["type"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.trim()?.lowercase()
         ?: invalid("'action.type' is required and must be a string")
@@ -166,13 +169,34 @@ internal fun parseStepArgs(raw: String): StepArgs {
             val ms = value.trim().toLongOrNull()
             if (ms == null || ms !in 0..STEP_MAX_WAIT_MS) invalid("'wait' value must be milliseconds between 0 and $STEP_MAX_WAIT_MS")
         }
+        CuTypes.SCREENSHOT -> if (value != null && value.trim().toIntOrNull()?.takeIf { it in SHOT_MIN_SIDE..SHOT_MAX_SIDE_LIMIT } == null) {
+            invalid("'screenshot' value must be a max side in px between $SHOT_MIN_SIDE and $SHOT_MAX_SIDE_LIMIT")
+        }
+        CuTypes.CLICK_AT -> if (parsePoint(value) == null) invalid("'click_at' requires action.value 'x,y' (CSS px in the viewport)")
+        CuTypes.TYPE_TEXT -> if (value == null) invalid("'type_text' requires action.value (the text to type)")
+        CuTypes.KEY -> if (TabKeys.parse(value) == null) invalid("'key' requires action.value, a key name like Enter, Escape, Tab, ArrowDown or ctrl+a")
+        CuTypes.SCROLL_BY -> if (parseScrollDelta(value) == null) invalid("'scroll_by' requires action.value 'dy' or 'dx,dy' (integer px)")
     }
     return StepArgs(
         tabId,
         RpaActionConfig(name = "rpa_step", type = type, selector = selector, value = value),
         highlight,
         allowSensitive,
+        pointer,
     )
+}
+
+private fun parsePointer(el: kotlinx.serialization.json.JsonElement?): PointerSpec? {
+    if (el == null || el is JsonNull) return null
+    val o = el as? JsonObject ?: invalid("'pointer' must be an object like {\"label\": \"Jev\", \"color\": \"#6D28D9\"}")
+    fun str(key: String): String? = when (val v = o[key]) {
+        null, is JsonNull -> null
+        is JsonPrimitive -> v.takeIf { it.isString }?.content ?: invalid("'pointer.$key' must be a string")
+        else -> invalid("'pointer.$key' must be a string")
+    }
+    val label = str("label")?.replace(Regex("\\s+"), " ")?.trim()?.takeIf { it.isNotEmpty() } ?: POINTER_DEFAULT_LABEL
+    val color = str("color")?.trim()?.also { if (!isHexColor(it)) invalid("'pointer.color' must be a hex color like #6D28D9") } ?: POINTER_DEFAULT_COLOR
+    return PointerSpec(label.take(POINTER_LABEL_MAX), color)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -221,6 +245,10 @@ internal data class StepResult(
     @SerialName("duration_ms") val durationMs: Long,
     /** Set only by a successful `download`. */
     val download: DownloadInfo? = null,
+    /** Set only by a successful `screenshot`. */
+    val screenshot: ScreenshotInfo? = null,
+    /** Set by `focused`, and by `type_text` (the field after typing). */
+    val focused: FocusedInfo? = null,
 )
 
 @Serializable
@@ -234,6 +262,12 @@ internal data class DownloadInfo(
     @SerialName("save_verified") val saveVerified: Boolean = false,
     val note: String,
 )
+
+/** The result as JSON; the computer-use fields appear only when set, so older verbs keep their exact shape. */
+internal fun stepResultJson(result: StepResult): String {
+    val o = TabJson.encodeToJsonElement(StepResult.serializer(), result) as JsonObject
+    return JsonObject(o.filterNot { (k, v) -> (k == "screenshot" || k == "focused") && v is JsonNull }).toString()
+}
 
 internal fun downloadNote(method: String, bytes: Long?): String =
     if (method == DOWNLOAD_METHOD_BLOB && bytes != null) {
@@ -800,6 +834,7 @@ internal suspend inline fun <T> orNullUnlessCancelled(block: () -> T): T? =
 internal class TabActions(
     private val downloadTimeoutMs: Long = DOWNLOAD_TIMEOUT_MS,
     private val busyTabIds: () -> Set<String> = { emptySet() },
+    private val computerUse: ComputerUse = ComputerUse(),
     private val activeTabsProvider: () -> ActiveTabsProvider?,
 ) {
 
@@ -871,7 +906,7 @@ internal class TabActions(
             refuseIfEngineRunning(args.tabId)
             runStep(browser, args)
         }
-        McpToolResult(TabJson.encodeToString(StepResult.serializer(), result))
+        McpToolResult(stepResultJson(result))
     } catch (e: TabToolException) {
         e.toResult()
     } catch (e: CancellationException) {
@@ -893,16 +928,23 @@ internal class TabActions(
     private suspend fun runStep(browser: BrowserIntegration, args: StepArgs): StepResult {
         val started = Clock.System.now().toEpochMilliseconds()
         val before = currentUrl(browser)
-        val hook = if (args.highlightMs > 0) highlightHook(args.highlightMs) else null
+        val action = args.action
+        val highlight = if (args.highlightMs > 0) highlightHook(args.highlightMs) else null
+        val glide = args.pointer?.let { computerUse.pointerHook(args.tabId, it, ripple = action.type == ActionTypes.CLICK) }
+        val hook: ElementHook? = if (glide == null) highlight else { b, locate -> glide(b, locate); highlight?.invoke(b, locate) }
         // execute() already maps script errors and thrown exceptions to (false, reason).
         // input without the opt-in is guarded in the typing script itself; a guard that throws fails
         // the step without typing.
         val guard = if (args.action.type == ActionTypes.INPUT && !args.allowSensitive) SENSITIVE_GUARD_JS else null
+        var cu: CuOutcome? = null
         val (ok, error, download) =
-            if (args.action.type == ActionTypes.DOWNLOAD) {
-                download(browser, args.action.selector, hook)
-            } else {
-                runner.execute(browser, args.action, hook, guard).let { Triple(it.first, it.second, null) }
+            when (action.type) {
+                in CuTypes.ALL -> {
+                    cu = computerUse.run(browser, args.tabId, action, args.pointer, args.allowSensitive)
+                    Triple(cu.ok, cu.error, null)
+                }
+                ActionTypes.DOWNLOAD -> download(browser, action.selector, hook)
+                else -> runner.execute(browser, action, hook, guard).let { Triple(it.first, it.second, null) }
             }
         if (guard != null && error == GUARD_REFUSED) {
             throw TabToolException(
@@ -921,6 +963,8 @@ internal class TabActions(
             navigated = isNavigation(before, after),
             durationMs = Clock.System.now().toEpochMilliseconds() - started,
             download = download,
+            screenshot = cu?.screenshot,
+            focused = cu?.focused,
         )
     }
 
@@ -1042,7 +1086,16 @@ internal class TabActions(
                 "outlined first (highlight_ms, 0 to disable). Returns ok/error plus the URL before and after; " +
                 "navigated ignores a fragment-only change. input into a field rpa_observe flags sensitive is " +
                 "refused unless allow_sensitive is true. A tab an RPA Engine run is driving is refused (TAB_BUSY). " +
-                "run_script, screenshot, switch_frame and assert are refused."
+                "run_script, switch_frame and assert are refused. " +
+                "Computer-use verbs act on what is on screen, in viewport CSS px, with real browser input: " +
+                "screenshot (value: max side px, default 1568) saves a JPEG and returns screenshot " +
+                "{path, width, height, css_width, css_height, dpr} (the pointer overlay is hidden in it); " +
+                "click_at (value 'x,y'); type_text (value: text; selects the focused field's content first, replaces it; " +
+                "on a <select> it type-aheads the option); key (value: Enter, Escape, Tab, ArrowDown, ctrl+a, ...); " +
+                "scroll_by (value 'dy' or 'dx,dy' px, wheel at the viewport centre); focused (read-only: returns focused " +
+                "{tag, editable, label, type, options, sensitive}, never a value); pointer_hide (removes the overlay). " +
+                "Optional top-level pointer {label, color} shows a labelled agent cursor that glides to the action point " +
+                "(the element centre for selector actions) and ripples on click; it works in any tab and stays until pointer_hide."
 
         const val OBSERVE_SCHEMA =
             """{"type":"object","properties":{""" +
@@ -1054,12 +1107,12 @@ internal class TabActions(
             """{"type":"object","properties":{""" +
                 """"tab_id":{"type":"string","description":"Browser tab id (from tabs_list)."},""" +
                 """"action":{"type":"object","properties":{""" +
-                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download"]},""" +
+                """"type":{"type":"string","enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide"]},""" +
                 """"selector":{"type":"object","properties":{"type":{"type":"string","enum":["id","css","xpath","text"]},"value":{"type":"string"}},"required":["type","value"],"description":"Required for click, input, select, submit, download; optional for keypress (defaults to the focused element)."},""" +
-                """"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000)."}""" +
+                """"value":{"type":"string","description":"input: text to type (empty or absent clears the field); select (required): option value or label; keypress: key name (default Enter); navigate: http(s)/about URL; scroll: 'y' or 'x,y'; wait: milliseconds (max 10000); screenshot: max side px (280-4096, default 1568); click_at (required): 'x,y' CSS px in the viewport; type_text (required): text typed with real key events into the focused element; key (required): Enter|Escape|Tab|ArrowDown|ctrl+a|...; scroll_by (required): 'dy' or 'dx,dy' px, positive = down/right."}""" +
                 """},"required":["type"]},""" +
                 """"highlight_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600,"description":"How long to outline the target element before acting; 0 disables."},""" +
-                """"allow_sensitive":{"type":"boolean","default":false,"description":"input only: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."}""" +
+                """"allow_sensitive":{"type":"boolean","default":false,"description":"input and type_text: allow typing into a password, payment or one-time-code field. Without it such an input is refused with INVALID_INPUT."},"pointer":{"type":"object","properties":{"label":{"type":"string","description":"Text on the cursor pill, e.g. 'Jev · Research'."},"color":{"type":"string","description":"Hex color, e.g. #6D28D9."}},"description":"Show an agent cursor that glides to the action point first. Absent = no overlay."}""" +
                 """},"required":["tab_id","action"]}"""
     }
 }

@@ -37,7 +37,7 @@ class TabActionArgsTest {
 
     @Test
     fun `every refused verb is UNSUPPORTED_ACTION, not INVALID_INPUT`() {
-        listOf("run_script", "screenshot", "switch_frame", "assert").forEach { t ->
+        listOf("run_script", "switch_frame", "assert").forEach { t ->
             assertEquals(
                 TabErrorCodes.UNSUPPORTED_ACTION,
                 code { parseStepArgs("""{"tab_id":"t","action":{"type":"$t","selector":{"type":"css","value":"a"},"value":"x"}}""") },
@@ -82,7 +82,7 @@ class TabActionArgsTest {
 
     @Test
     fun `schema and description offer download`() {
-        assertTrue(TabActions.STEP_SCHEMA.contains(""""enum":["click","input","select","keypress","submit","scroll","navigate","wait","download"]"""))
+        assertTrue(TabActions.STEP_SCHEMA.contains(""""enum":["click","input","select","keypress","submit","scroll","navigate","wait","download","screenshot","click_at","type_text","key","scroll_by","focused","pointer_hide"]"""))
         assertTrue(TabActions.STEP_SCHEMA.contains("Required for click, input, select, submit, download;"))
         assertTrue(TabActions.STEP_DESCRIPTION.contains("download (rpa_step only, not a plan verb)"))
         assertTrue(TabActions.STEP_DESCRIPTION.contains("HTTP 401/403"), "credentials are omitted; say what that costs")

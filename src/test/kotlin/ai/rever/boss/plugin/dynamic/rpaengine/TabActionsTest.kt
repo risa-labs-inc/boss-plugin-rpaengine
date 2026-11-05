@@ -138,14 +138,13 @@ class TabActionsTest {
     fun `step result has the contract shape`() {
         assertEquals(
             """{"ok":false,"error":"No element matched #x","url_before":"a","url_after":"a","navigated":false,"duration_ms":12,"download":null}""",
-            TabJson.encodeToString(StepResult.serializer(), StepResult(false, "No element matched #x", "a", "a", false, 12)),
+            stepResultJson(StepResult(false, "No element matched #x", "a", "a", false, 12)),
         )
         assertEquals(
             """{"ok":true,"error":null,"url_before":"a","url_after":"a","navigated":false,"duration_ms":5,""" +
                 """"download":{"url":"https://x.test/a.jpg","file":"a.jpg","bytes":null,"method":"direct",""" +
                 """"save_verified":false,"note":"${downloadNote(DOWNLOAD_METHOD_DIRECT, null)}"}}""",
-            TabJson.encodeToString(
-                StepResult.serializer(),
+            stepResultJson(
                 StepResult(
                     true, null, "a", "a", false, 5,
                     DownloadInfo("https://x.test/a.jpg", "a.jpg", null, DOWNLOAD_METHOD_DIRECT, note = downloadNote(DOWNLOAD_METHOD_DIRECT, null)),
